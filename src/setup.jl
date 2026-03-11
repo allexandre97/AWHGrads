@@ -1,0 +1,156 @@
+# Helper functions extracted from main_alch.jl
+
+function setup_alchemical_awh(
+    pdb_file,
+    solute_indices;
+    is_vacuum=false,
+    logger=nothing,
+    injected_bias=nothing,
+    optimized_params=nothing,
+    param_idxs=nothing,
+    restart_state=nothing,
+    restart_active_idx::Int=1,
+    warm_start::Bool=false
+)
+    sys_raw = System(
+        pdb_file, ff; array_type=AT, nonbonded_method=:none, 
+        loggers=isnothing(logger) ? NamedTuple() : (awh_logger=logger,)  
+    )
+
+    atoms_raw = Molly.from_device(sys_raw.atoms)
+    seeded_atoms = Atom[]
+    
+    # Safely sized seeds strictly above the optimization boundaries to prevent 1/r^12 singularity
+    sigma_seed = FT(0.15)u"nm"
+    epsilon_seed = FT(1e-4)u"kJ/mol"
+    
+    for (i, a) in enumerate(atoms_raw)
+        new_sigma = (ustrip(a.σ) <= FT(1e-6) || ustrip(a.σ) == one(FT)) ? sigma_seed : a.σ
+        new_eps   = ustrip(a.ϵ) <= FT(1e-6) ? epsilon_seed : a.ϵ
+        
+        # INJECT NEW PARAMETERS FOR PHASE 3
+        if !isnothing(optimized_params) && !isnothing(param_idxs)
+            idx_σ_map = param_idxs[1][2]
+            idx_ϵ_map = param_idxs[1][3]
+
+            if idx_σ_map[i] > 0
+                new_sigma = FT(optimized_params[idx_σ_map[i]]) * u"nm"
+            end
+            if idx_ϵ_map[i] > 0
+                new_eps = FT(optimized_params[idx_ϵ_map[i]]) * u"kJ/mol"
+            end
+        end
+        
+        push!(seeded_atoms, Atom(a.index, a.atom_type, a.mass, a.charge, new_sigma, new_eps, a.λ, a.alch_role))
+    end
+    
+    sys_base = System(sys_raw; atoms=Molly.to_device([seeded_atoms...], AT))
+
+    thermostat = VelocityRescaleThermostat(T0, FT(0.1)u"ps")  
+    
+    if is_vacuum
+        integrator = VelocityVerlet(Δt, (thermostat,), 100)  
+    else
+        barostat = CRescaleBarostat(P0, FT(1)u"ps"; n_steps=250)  
+        integrator = VelocityVerlet(Δt, (thermostat, barostat), 100)  
+    end
+
+    if warm_start && !isnothing(restart_state)
+        sys_base = System(
+            sys_base;
+            coords = copy(restart_state.coords),
+            boundary = deepcopy(restart_state.boundary),
+            velocities = copy(restart_state.velocities)
+        )
+    else
+        minim = SteepestDescentMinimizer(step_size=FT(0.01)u"nm", max_steps=1000)
+        simulate!(sys_base, minim)
+        random_velocities!(sys_base, T0)
+    end
+
+    p_inters = sys_base.pairwise_inters 
+    idx_lj   = findfirst(x -> x isa LennardJones, p_inters)  
+    idx_coul = findfirst(x -> x isa Coulomb, p_inters)  
+    
+    lj_0 = p_inters[idx_lj]  
+    cl_0 = p_inters[idx_coul]  
+
+    thermo_states = ThermoState[]  
+
+    lj_sc = LennardJonesSoftCoreBeutler(
+        cutoff = lj_0.cutoff, α = FT(0.85),  
+        use_neighbors = lj_0.use_neighbors, scheduler = Molly.DefaultLambdaScheduler()  
+    )
+
+    coul_sc = CoulombSoftCoreBeutler(
+        cutoff = cl_0.cutoff, α = FT(0.3), coulomb_const = cl_0.coulomb_const,  
+        use_neighbors = cl_0.use_neighbors, scheduler = Molly.DefaultLambdaScheduler()  
+    )
+
+    for λ in lambda_schedule  
+        acopy = Atom[]  
+        for (i, a) in enumerate(seeded_atoms)
+            if a.index ∈ solute_indices 
+                push!(acopy, Atom(a.index, a.atom_type, a.mass, a.charge, a.σ, a.ϵ, FT(λ), Molly.InsertRole))  
+            else
+                push!(acopy, Atom(a.index, a.atom_type, a.mass, a.charge, a.σ, a.ϵ, a.λ, a.alch_role))  
+            end
+        end
+
+        sys_w = System(
+            deepcopy(sys_base);
+            atoms = Molly.to_device([acopy...], AT),  
+            pairwise_inters = (coul_sc, lj_sc),
+            loggers = isnothing(logger) ? NamedTuple() : (awh_logger=logger,)
+        )
+        push!(thermo_states, ThermoState(sys_w, deepcopy(integrator)))  
+    end
+
+    first_state = (warm_start && !isnothing(restart_state)) ? clamp(restart_active_idx, 1, num_lambda_states) : 1
+    awh_state = AWHState(thermo_states; reuse_neighbors=true, first_state=first_state)
+    
+    if !isnothing(injected_bias)  
+        awh_state.f .= injected_bias.f  
+        awh_state.rho .= injected_bias.rho  
+        awh_state.log_rho .= injected_bias.log_rho  
+        awh_state.in_initial_stage = true
+        awh_state.N_bias = FT(100.0) 
+        awh_state.N_eff = zero(FT)
+        empty!(awh_state.visited_windows)
+    end
+
+    awh_sim = AWHSimulation(awh_state; num_md_steps = 10, log_freq=100, well_tempered_factor=Inf)  
+    
+    return awh_sim, sys_base  
+end
+
+##
+function capture_restart_state(awh_sim::AWHSimulation)
+    sys = awh_sim.state.active_sys
+    return (
+        coords = copy(sys.coords),
+        boundary = deepcopy(sys.boundary),
+        velocities = copy(sys.velocities),
+        active_idx = awh_sim.state.active_idx
+    )
+end
+
+##
+function coords_rmsd_nm(coords_a, coords_b)
+    coords_a_cpu = Array(coords_a)
+    coords_b_cpu = Array(coords_b)
+    if length(coords_a_cpu) != length(coords_b_cpu)
+        return FT(NaN)
+    end
+    n_atoms = length(coords_a_cpu)
+    if n_atoms == 0
+        return zero(FT)
+    end
+    sq_dist_sum = zero(FT)
+    for i in 1:n_atoms
+        δ = ustrip.(coords_a_cpu[i] .- coords_b_cpu[i])
+        sq_dist_sum += FT(sum(abs2, δ))
+    end
+    return sqrt(sq_dist_sum / FT(n_atoms))
+end
+

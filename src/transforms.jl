@@ -1,0 +1,9 @@
+# Parameter transforms extracted from main_alch.jl
+
+function map_phi_to_theta(phi_vec, t_min, t_max, p_0, k_sig)
+    return t_min .+ (t_max .- t_min) ./ (FT(1.0) .+ exp.(-k_sig .* (phi_vec .- p_0)))
+end
+
+function get_chain_rule_multiplier(theta_vec, t_min, t_max, k_sig)
+    return k_sig .* (theta_vec .- t_min) .* (FT(1.0) .- (theta_vec .- t_min) ./ (t_max .- t_min))
+end
