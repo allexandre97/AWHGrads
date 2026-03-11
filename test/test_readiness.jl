@@ -53,3 +53,31 @@ end
     )
     @test isempty(AWHGrads.get_awh_active_idx_history(mock_empty))
 end
+
+@testset "phase timing helpers" begin
+    meta_start = AWHGrads.phase_timing_metadata("Stage A Block", "solvent"; md_steps=500)
+    @test meta_start.phase == "Stage A Block"
+    @test meta_start.leg == "solvent"
+    @test meta_start.md_steps == 500
+    @test meta_start.md_ns == AWHGrads.steps_to_ns(500)
+    @test isnothing(meta_start.wall_s)
+    @test isnothing(meta_start.steps_per_s)
+
+    meta_end = AWHGrads.phase_timing_metadata("Stage A Block", "solvent"; md_steps=500, wall_s=2.0)
+    @test meta_end.wall_s == 2.0
+    @test meta_end.steps_per_s == 250.0
+
+    payload = [1, 2, 3]
+    timed_payload = AWHGrads.timed_phase("Test Payload", "vacuum"; md_steps=10) do
+        payload
+    end
+    @test timed_payload.result === payload
+    @test payload == [1, 2, 3]
+    @test timed_payload.timing.phase == "Test Payload"
+    @test timed_payload.timing.leg == "vacuum"
+    @test timed_payload.timing.md_steps == 10
+    @test timed_payload.timing.md_ns == AWHGrads.steps_to_ns(10)
+    @test timed_payload.timing.wall_s !== nothing
+    @test timed_payload.timing.wall_s >= 0.0
+    @test timed_payload.timing.steps_per_s !== nothing
+end

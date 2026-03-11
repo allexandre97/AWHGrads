@@ -1,5 +1,57 @@
 # Readiness and probe helpers extracted from main_alch.jl
 
+function phase_timing_metadata(
+    phase::AbstractString,
+    leg_name::AbstractString;
+    md_steps::Union{Nothing, Int}=nothing,
+    wall_s::Union{Nothing, Real}=nothing,
+)
+    md_ns = isnothing(md_steps) ? nothing : steps_to_ns(md_steps)
+    wall_s_val = isnothing(wall_s) ? nothing : Float64(wall_s)
+    steps_per_s = if isnothing(md_steps) || isnothing(wall_s_val) || wall_s_val <= 0.0
+        nothing
+    else
+        Float64(md_steps) / wall_s_val
+    end
+    return (
+        phase = String(phase),
+        leg = String(leg_name),
+        md_steps = md_steps,
+        md_ns = md_ns,
+        wall_s = wall_s_val,
+        steps_per_s = steps_per_s,
+    )
+end
+
+
+function timed_phase(
+    phase::AbstractString,
+    leg_name::AbstractString,
+    op::Function;
+    md_steps::Union{Nothing, Int}=nothing,
+)
+    start_meta = phase_timing_metadata(phase, leg_name; md_steps=md_steps)
+    if isnothing(start_meta.md_steps)
+        @info "AWH Timing Start: phase=$(start_meta.phase) | leg=$(start_meta.leg)"
+    else
+        @info "AWH Timing Start: phase=$(start_meta.phase) | leg=$(start_meta.leg) | md_steps=$(start_meta.md_steps) | md_ns=$(round(start_meta.md_ns, digits=4))"
+    end
+
+    t0_ns = time_ns()
+    result = op()
+    elapsed_s = (time_ns() - t0_ns) / 1e9
+
+    end_meta = phase_timing_metadata(phase, leg_name; md_steps=md_steps, wall_s=elapsed_s)
+    if isnothing(end_meta.md_steps)
+        @info "AWH Timing End: phase=$(end_meta.phase) | leg=$(end_meta.leg) | wall_s=$(round(end_meta.wall_s, digits=3))"
+    else
+        @info "AWH Timing End: phase=$(end_meta.phase) | leg=$(end_meta.leg) | md_steps=$(end_meta.md_steps) | md_ns=$(round(end_meta.md_ns, digits=4)) | wall_s=$(round(end_meta.wall_s, digits=3)) | steps_per_s=$(round(end_meta.steps_per_s, digits=2))"
+    end
+
+    return (result=result, timing=end_meta)
+end
+
+
 function awh_linear_stage_stats(awh_sim::AWHSimulation, tol::FT; max_lag::Int=10)
     stats = awh_sim.state.stats
     linear_changes = FT[]
@@ -139,6 +191,7 @@ function run_stage_b_probe(
     P0_energy_per_vol::FT=zero(FT)
 ) where {FT <: AbstractFloat}
     if md_steps_probe <= 0
+        @info "Stage B ($(leg_name)) skipped: md_steps_probe <= 0 (md_steps_probe=$md_steps_probe)."
         return (
             ready = false,
             split_ready = false,
@@ -160,11 +213,14 @@ function run_stage_b_probe(
     )
     clear_awh_logger_histories!(probe_sim)
     probe_sim.state.active_sys.loggers.awh_logger.should_log = true
-    simulate!(probe_sim, md_steps_probe)
+    probe_md_timed = timed_phase("Stage B Probe MD", leg_name; md_steps=md_steps_probe) do
+        simulate!(probe_sim, md_steps_probe)
+    end
 
     logger_probe = get_production_logger(probe_sim, "$leg_name probe")
     n_frames = length(logger_probe.active_idx_history)
     if n_frames < 2
+        @info "Stage B ($(leg_name)) early exit: insufficient probe frames (n_frames=$n_frames, required=2) | probe_md_wall_s=$(round(probe_md_timed.timing.wall_s, digits=3)) | probe_md_steps_per_s=$(round(probe_md_timed.timing.steps_per_s, digits=2))"
         return (
             ready = false,
             split_ready = false,
@@ -177,17 +233,25 @@ function run_stage_b_probe(
         )
     end
 
-    nbrs_probe = precompute_neighbors(logger_probe, probe_sim.state.active_sys)
-    u_probe_ref, _ = evaluate_ensemble(
-        logger_probe, nbrs_probe, probe_sim, sys_base,
-        theta_params, param_names, idxs...; compute_gradients=false
-    )
+    nbrs_probe_timed = timed_phase("Stage B Neighbor Precompute", leg_name) do
+        precompute_neighbors(logger_probe, probe_sim.state.active_sys)
+    end
+    nbrs_probe = nbrs_probe_timed.result
+
+    ensemble_eval_timed = timed_phase("Stage B Ensemble Eval", leg_name) do
+        evaluate_ensemble(
+            logger_probe, nbrs_probe, probe_sim, sys_base,
+            theta_params, param_names, idxs...; compute_gradients=false
+        )
+    end
+    u_probe_ref, _ = ensemble_eval_timed.result
 
     bias_data = extract_awh_data(awh_sim)
     awh_bias = bias_data.f .+ bias_data.log_rho
 
     half_1, half_2 = split_half_ranges(n_frames)
     if isempty(half_1) || isempty(half_2)
+        @info "Stage B ($(leg_name)) early exit: split ranges are empty (n_frames=$n_frames) | probe_md_wall_s=$(round(probe_md_timed.timing.wall_s, digits=3)) | nbrs_wall_s=$(round(nbrs_probe_timed.timing.wall_s, digits=3)) | eval_wall_s=$(round(ensemble_eval_timed.timing.wall_s, digits=3))"
         return (
             ready = false,
             split_ready = false,
@@ -200,34 +264,53 @@ function run_stage_b_probe(
         )
     end
 
-    volumes_probe = include_pv ? FT.(ustrip.(logger_probe.volume_history)) : FT[]
-    dG_half_1 = estimate_leg_dg_from_reference(
-        u_probe_ref[half_1, :],
-        logger_probe.active_idx_history[half_1],
-        awh_bias,
-        num_lambda_states,
-        beta;
-        volumes=include_pv ? volumes_probe[half_1] : FT[],
-        P0_energy_per_vol=include_pv ? P0_energy_per_vol : zero(FT)
-    )
-    dG_half_2 = estimate_leg_dg_from_reference(
-        u_probe_ref[half_2, :],
-        logger_probe.active_idx_history[half_2],
-        awh_bias,
-        num_lambda_states,
-        beta;
-        volumes=include_pv ? volumes_probe[half_2] : FT[],
-        P0_energy_per_vol=include_pv ? P0_energy_per_vol : zero(FT)
-    )
+    split_parity_timed = timed_phase("Stage B Split-Parity", leg_name) do
+        volumes_probe = include_pv ? FT.(ustrip.(logger_probe.volume_history)) : FT[]
+        dG_half_1 = estimate_leg_dg_from_reference(
+            u_probe_ref[half_1, :],
+            logger_probe.active_idx_history[half_1],
+            awh_bias,
+            num_lambda_states,
+            beta;
+            volumes=include_pv ? volumes_probe[half_1] : FT[],
+            P0_energy_per_vol=include_pv ? P0_energy_per_vol : zero(FT)
+        )
+        dG_half_2 = estimate_leg_dg_from_reference(
+            u_probe_ref[half_2, :],
+            logger_probe.active_idx_history[half_2],
+            awh_bias,
+            num_lambda_states,
+            beta;
+            volumes=include_pv ? volumes_probe[half_2] : FT[],
+            P0_energy_per_vol=include_pv ? P0_energy_per_vol : zero(FT)
+        )
 
-    split_gap = abs(dG_half_1 - dG_half_2)
-    split_ready = split_gap <= awh_split_tol_kT
+        split_gap = abs(dG_half_1 - dG_half_2)
+        split_ready = split_gap <= awh_split_tol_kT
 
-    F_mbar_profile = include_pv ?
-        compute_full_mbar_profile(u_probe_ref, u_probe_ref, awh_bias, beta; volumes=volumes_probe, P0_energy_per_vol=P0_energy_per_vol) :
-        compute_full_mbar_profile(u_probe_ref, u_probe_ref, awh_bias, beta)
-    parity_gap = compute_parity_gap(F_mbar_profile, awh_bias; ref_idx=1)
-    parity_ready = parity_gap <= awh_parity_tol_kT
+        F_mbar_profile = include_pv ?
+            compute_full_mbar_profile(u_probe_ref, u_probe_ref, awh_bias, beta; volumes=volumes_probe, P0_energy_per_vol=P0_energy_per_vol) :
+            compute_full_mbar_profile(u_probe_ref, u_probe_ref, awh_bias, beta)
+        parity_gap = compute_parity_gap(F_mbar_profile, awh_bias; ref_idx=1)
+        parity_ready = parity_gap <= awh_parity_tol_kT
+
+        return (
+            dG_half_1=dG_half_1,
+            dG_half_2=dG_half_2,
+            split_gap=split_gap,
+            split_ready=split_ready,
+            parity_gap=parity_gap,
+            parity_ready=parity_ready,
+        )
+    end
+
+    split_parity = split_parity_timed.result
+    dG_half_1 = split_parity.dG_half_1
+    dG_half_2 = split_parity.dG_half_2
+    split_gap = split_parity.split_gap
+    split_ready = split_parity.split_ready
+    parity_gap = split_parity.parity_gap
+    parity_ready = split_parity.parity_ready
 
     return (
         ready = split_ready && parity_ready,

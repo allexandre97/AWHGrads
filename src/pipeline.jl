@@ -254,7 +254,9 @@ function run_readiness_loop!(
         end
         rewarm_steps = min(md_steps_rewarm, md_steps_budget)
         println("Running $(uppercasefirst(String(leg.name))) AWH Leg (Initial Rewarm)...")
-        simulate!(awh_leg, rewarm_steps)
+        timed_phase("Initial Rewarm", String(leg.name); md_steps=rewarm_steps) do
+            simulate!(awh_leg, rewarm_steps)
+        end
         spent_steps[leg.name] += rewarm_steps
         runtime.active_bias[leg.name] = extract_awh_data(awh_leg)
     end
@@ -279,7 +281,9 @@ function run_readiness_loop!(
 
             block_steps = min(md_steps_block, remaining_steps)
             println("Running $(uppercasefirst(String(name))) AWH Leg (Stage A Block)...")
-            simulate!(awh_leg, block_steps)
+            timed_phase("Stage A Block", String(name); md_steps=block_steps) do
+                simulate!(awh_leg, block_steps)
+            end
             spent_steps[name] += block_steps
             runtime.active_bias[name] = extract_awh_data(awh_leg)
 
@@ -300,6 +304,8 @@ function run_readiness_loop!(
             end
 
             if stageA_streak[name] >= awh_stageA_stable_blocks
+                probe_steps = probe_steps_by_leg[name]
+                @info "Stage A ($(name)) reached stable streak ($(stageA_streak[name])/$(awh_stageA_stable_blocks)); entering Stage B probe | probe_steps=$probe_steps | probe_ns=$(round(steps_to_ns(probe_steps), digits=4))"
                 stageB_stats_by_leg[name] = StageBStats(run_stage_b_probe(
                     awh_leg,
                     sys_by_leg[name],
