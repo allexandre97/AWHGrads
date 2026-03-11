@@ -1,0 +1,64 @@
+% implementation.tex
+\section{Test System Selection and Theoretical Adaptation}
+
+The solvation free energy of a small organic molecule (e.g., ethanol or methane) in explicit water is an optimal test system.  It is computationally tractable, provides well-documented experimental targets, and rigorously tests the algorithmic framework by requiring the simultaneous optimization across multiple independent thermodynamic cycles.  The theoretical framework must be adapted to accommodate multiple AWH legs.  Solvation free energy is defined by the difference between the alchemical transformation in vacuum and in solvent: 
+\begin{equation}
+    \Delta G_{\text{solv}}(\theta) = \Delta G_{\text{vac}}(\theta) - \Delta G_{\text{water}}(\theta)
+\end{equation}
+where $\Delta G_{i}(\theta) = F_{\lambda=1, i}(\theta) - F_{\lambda=0, i}(\theta)$ for $i \in \{\text{vac}, \text{water}\}$.  The loss error $\mathcal{E}(\theta)$ becomes: 
+\begin{equation}
+    \mathcal{E}(\theta) = \left[ \Delta G_{\text{vac}}(\theta) - \Delta G_{\text{water}}(\theta) \right] - \widetilde{\Delta G}_{\text{exp}}
+\end{equation}
+
+By linearity of the derivative, the gradient of the loss $\nabla_\theta \mathcal{L}$ partitions into the contributions from the two independent extended ensembles:
+\begin{equation}
+    \nabla_\theta \mathcal{L} = \frac{d\mathcal{L}}{d\mathcal{E}} \left[ \nabla_\theta \Delta G_{\text{vac}}(\theta) - \nabla_\theta \Delta G_{\text{water}}(\theta) \right]
+\end{equation}
+
+Each term $\nabla_\theta \Delta G_{i}(\theta)$ is evaluated using the estimator derived for a single AWH leg (Equation 16 of the original formulation), evaluated over its respective reference trajectory. Similarly, because the vacuum and solvent simulations are statistically independent, the joint Fisher Information Matrix (FIM) for the natural gradient update is the block-diagonal sum (or simply the direct sum in the parameter space) of the empirical FIMs evaluated for each leg. 
+
+\section{Implementation Outline}
+
+The implementation requires extending Molly's existing AWH and autodiff capabilities. The project is divided into four sequential milestones. 
+
+\subsection{Milestone 1: Phase 1 (Data Collection) Infrastructure}
+Molly currently supports AWH simulations, but offline reweighting requires exporting the extended ensemble state tightly coupled to the coordinates. 
+\begin{enumerate}
+    \item \textbf{AWH State Logger:} Implement a custom logger (e.g., \texttt{AWHEnsembleLogger}) that records the active $\lambda$ state index, coordinates, box volume (for NPT), and potential energy at specified intervals during the production run (after AWH bias has converged). 
+    \item \textbf{Bias Extraction:} Create utility functions to extract and serialize the converged $F_\lambda$ array, $\rho_\lambda$ array, and the \texttt{AWHStats} from an \texttt{AWHSimulation} object. 
+    \item \textbf{Test Script:} Expand the provided alchemical script to run both the vacuum and solvent legs to convergence, fix the bias, and dump $M$ frames of the extended ensemble to disk. 
+\end{enumerate}
+
+\subsection{Milestone 2: Phase 2 (Offline Optimization) Engine}
+This phase is the core computational component, requiring integration with \texttt{Enzyme.jl} to compute parameter gradients over the stored frames. 
+\begin{enumerate}
+    \item \textbf{Energy and Gradient Evaluation:} Implement a function that wraps \texttt{Molly.inject\_gradients}.  For a given frame $k$ (containing $\mathbf{x}_k$ and $\lambda_k$), this function must rebuild the \texttt{System} with the specific Hamiltonian for $\lambda_k$ using the active parameters $\theta_n$, and use \texttt{Enzyme.autodiff} to evaluate $u_k^{(n)}$ and $\mathbf{s}_k^{(n)} = \nabla_\theta u_k^{(n)}$. 
+    \item \textbf{Reweighting and ESS:} Implement the discrete trajectory reweighting logic.  Compute the unnormalized weights $W_k^{(n)}$, normalize them, and calculate the Effective Sample Size (ESS). 
+    \item \textbf{FIM and Target Gradient Assembly:} 
+    \begin{itemize}
+        \item Compute the empirical expectation of the gradients $\overline{\mathbf{s}}^{(n)}$ and assemble the empirical FIM $\mathcal{I}(\theta_n)$ using the covariance of $\mathbf{s}_k^{(n)}$. 
+        \item Compute the endpoint gradients (at $\lambda=0$ and $\lambda=1$) to evaluate $\nabla_\theta F_{\lambda}$ for each leg using the global MBAR reweighting estimator over all $M$ frames.
+        \item Combine the vacuum and solvent contributions to evaluate $\nabla_\theta \mathcal{L}$. 
+    \end{itemize}
+    \item \textbf{Linear System Solver and Line Search:} 
+    \begin{itemize}
+        \item Execute an eigendecomposition on the empirical FIM to compute a truncated pseudoinverse, circumventing conditioning failures.
+        \item Calculate the natural gradient update direction $\mathbf{d}_n$ and dynamically scale it to strictly bound the KL divergence of the step.
+        \item Perform a backtracking line search: initialize a step scalar $\alpha=1.0$ and iteratively halve it until the proposed step $\theta_{n+1} = \theta_n - \alpha \mathbf{d}_n$ maintains an ESS above the safety threshold.
+    \end{itemize}
+\end{enumerate}
+
+\subsection{Milestone 3: Phase 3 (Resimulation) Infrastructure}
+When the ESS collapse triggers an exit from Phase 2, the current force field $\theta_n$ has diverged outside the trust region of the original simulation. 
+\begin{enumerate}
+    \item \textbf{AWH State Injection:} Modify the \texttt{AWHState} constructor or provide a mutation function to allow initialization with a pre-computed $F_\lambda$ profile. 
+    \item \textbf{Stage Override:} Ensure that when a pre-computed bias is injected, the \texttt{AWHSimulation} is strictly initialized in the linear/production stage (\texttt{in\_initial\_stage = false}), freezing the fictitious sample size $N$ appropriately. 
+\end{enumerate}
+
+\subsection{Milestone 4: Pipeline Orchestration and Validation}
+Combine the three phases into an automated loop. 
+\begin{enumerate}
+    \item \textbf{Master Loop Script:} Write the orchestrator that manages the transition between Phase 1, Phase 2, and Phase 3 based on the ESS threshold trigger. 
+    \item \textbf{Parameter Bounds and Projections:} Implement physical constraints on the optimizer (e.g., ensuring LJ $\sigma > 0$ and $\epsilon > 0$) using parameter transformations (e.g., optimizing $\ln \sigma$ instead of $\sigma$ in a latent $\phi$-space).
+    \item \textbf{Validation Run:} Execute the full pipeline on the ethanol solvation system, targeting an artificial experimental $\Delta G$ to observe parameter convergence and trajectory re-generation behavior. 
+\end{enumerate}
