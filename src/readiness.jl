@@ -52,6 +52,16 @@ function timed_phase(
 end
 
 
+function timed_phase(
+    op::Function,
+    phase::AbstractString,
+    leg_name::AbstractString;
+    md_steps::Union{Nothing, Int}=nothing,
+)
+    return timed_phase(phase, leg_name, op; md_steps=md_steps)
+end
+
+
 function awh_linear_stage_stats(awh_sim::AWHSimulation, tol::FT; max_lag::Int=10)
     stats = awh_sim.state.stats
     linear_changes = FT[]
