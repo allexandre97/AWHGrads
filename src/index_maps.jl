@@ -1,6 +1,6 @@
 # Index-map builders extracted from main_alch.jl
 
-function build_index_maps(sys)  
+function build_index_maps(sys, processed_atom_types::Dict{String, Int})  
     n_atoms = length(sys.atoms)  
     idx_mass   = zeros(Int, n_atoms)  
     idx_σ      = zeros(Int, n_atoms)  

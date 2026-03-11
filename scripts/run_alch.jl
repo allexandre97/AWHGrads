@@ -1,3 +1,4 @@
 #!/usr/bin/env julia
 
-include(joinpath(@__DIR__, "..", "main_alch.jl"))
+include(joinpath(@__DIR__, "..", "src", "AWHGrads.jl"))
+AWHGrads.run_pipeline()

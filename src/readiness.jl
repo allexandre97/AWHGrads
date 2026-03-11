@@ -24,6 +24,7 @@ function estimate_leg_dg_from_reference(
     energies::Matrix{FT},
     active_lambda_idx::Vector{Int},
     awh_bias::Vector{FT},
+    num_lambda_states::Int,
     beta::FT;
     volumes::Vector{FT}=FT[],
     P0_energy_per_vol::FT=zero(FT)
@@ -93,7 +94,7 @@ function evaluate_stage_a_readiness(
     min_round_trips::Int,
     endpoint_min_fraction::FT,
     low_idx::Int=1,
-    high_idx::Int=num_lambda_states
+    high_idx::Int
 ) where {FT <: AbstractFloat}
     df_ready, df_mean, linear_neff = awh_linear_stage_stats(awh_sim, awh_tol; max_lag=tail_lag)
     neff_ready = !awh_sim.state.in_initial_stage && linear_neff >= FT(min_linear_neff)
@@ -128,6 +129,7 @@ function run_stage_b_probe(
     theta_params::Vector{FT},
     param_names::Vector{String},
     idxs,
+    num_lambda_states::Int,
     beta::FT,
     awh_split_tol_kT::FT,
     awh_parity_tol_kT::FT;
@@ -202,6 +204,7 @@ function run_stage_b_probe(
         u_probe_ref[half_1, :],
         logger_probe.active_idx_history[half_1],
         awh_bias,
+        num_lambda_states,
         beta;
         volumes=include_pv ? volumes_probe[half_1] : FT[],
         P0_energy_per_vol=include_pv ? P0_energy_per_vol : zero(FT)
@@ -210,6 +213,7 @@ function run_stage_b_probe(
         u_probe_ref[half_2, :],
         logger_probe.active_idx_history[half_2],
         awh_bias,
+        num_lambda_states,
         beta;
         volumes=include_pv ? volumes_probe[half_2] : FT[],
         P0_energy_per_vol=include_pv ? P0_energy_per_vol : zero(FT)
@@ -235,4 +239,3 @@ function run_stage_b_probe(
         dG_half_2 = dG_half_2
     )
 end
-
