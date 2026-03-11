@@ -155,7 +155,8 @@ function run_stage_b_probe(
         deepcopy(awh_sim.state);
         num_md_steps=awh_sim.n_md_steps,
         update_freq=typemax(Int),
-        well_tempered_factor=Inf
+        well_tempered_factor=Inf,
+        coverage_type=:physical
     )
     clear_awh_logger_histories!(probe_sim)
     probe_sim.state.active_sys.loggers.awh_logger.should_log = true

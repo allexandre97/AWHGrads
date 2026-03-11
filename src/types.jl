@@ -1,21 +1,66 @@
+Base.@kwdef struct ForceFieldConfig
+    force_field_dir::Union{Nothing, String} = nothing
+    xml_files::Vector{String} = ["tip3p_standard.xml", "gaff.xml", "ethanol.xml"]
+end
+
+Base.@kwdef struct ThermodynamicLegConfig
+    name::Symbol
+    pdb::String
+    coefficient::Float64 = 1.0
+    is_vacuum::Bool = false
+    include_pv::Bool = false
+    probe_time = Float32(0.5)u"ns"
+end
+
+Base.@kwdef struct ThermodynamicCycleConfig
+    legs::Vector{ThermodynamicLegConfig} = ThermodynamicLegConfig[]
+    include_standard_state_correction::Bool = true
+    target_dG_kcal_mol::Float64 = -5.01
+end
+
+Base.@kwdef struct ParameterBoundsConfig
+    sigma_hydrogen_min::Float64 = 0.1
+    sigma_hydrogen_max::Float64 = 0.4
+    sigma_heavy_min::Float64 = 0.2
+    sigma_heavy_max::Float64 = 0.5
+    epsilon_hydrogen_min::Float64 = 0.0
+    epsilon_hydrogen_max::Float64 = 0.5
+    epsilon_heavy_min::Float64 = 0.0
+    epsilon_heavy_max::Float64 = 1.5
+    sigma_floor::Float64 = 0.15
+    epsilon_floor::Float64 = 1e-4
+    reference_clamp_eps::Float64 = 1e-4
+end
+
 Base.@kwdef struct SimulationConfig
     device_id::Int = 1
     FT::DataType = Float32
     AT::Any = CuArray
+
     Δt = Float32(1)u"fs"
     T0 = Float32(310)u"K"
     P0 = Float32(1)u"bar"
     lambda_schedule = Float32.(range(1.0, stop=0.0, length=21))
+
     awh_budget_time = Float32(20)u"ns"
     awh_block_time = Float32(1.0)u"ns"
-    awh_probe_time_solv = Float32(0.75)u"ns"
-    awh_probe_time_vac = Float32(0.25)u"ns"
     md_time_production = Float32(0.1)u"ns"
     production_log_interval::Int = 100
+
     solute_idx = 1:9
+
+    # Backward-compatible defaults for a 2-leg hydration cycle.
     pdb_solv::String = "ethanol_solv.pdb"
     pdb_vac::String = "ethanol_vac.pdb"
+    awh_probe_time_solv = Float32(0.75)u"ns"
+    awh_probe_time_vac = Float32(0.25)u"ns"
     dG_exp_kcal_mol::Float64 = -5.01
+
+    # New user-facing configuration for non-hardcoded systems/cycles.
+    force_field::ForceFieldConfig = ForceFieldConfig()
+    cycle::Union{Nothing, ThermodynamicCycleConfig} = nothing
+    parameter_reference_leg::Union{Nothing, Symbol} = nothing
+    parameter_bounds::ParameterBoundsConfig = ParameterBoundsConfig()
 end
 
 Base.@kwdef struct OptimizationConfig
@@ -47,19 +92,32 @@ Base.@kwdef struct OptimizationConfig
 end
 
 Base.@kwdef mutable struct RuntimeState
+    active_bias::Dict{Symbol, Any} = Dict{Symbol, Any}()
+    restart_cache::Dict{Symbol, Any} = Dict{Symbol, Any}()
+
+    # Backward-compatible aliases for the default two-leg cycle.
     active_bias_solv::Any = nothing
     active_bias_vac::Any = nothing
     restart_cache_solv::Any = nothing
     restart_cache_vac::Any = nothing
+
     phi_active::Any = nothing
     theta_active::Any = nothing
 end
 
 Base.@kwdef mutable struct LegArtifacts
+    name::Symbol = :unknown
+    coefficient::Any = 0.0
+    include_pv::Bool = false
+    p0_energy_per_vol::Any = 0.0
+
     awh_prod::Any = nothing
     logger_prod::Any = nothing
     neighbors::Any = nothing
     u_ref::Any = nothing
+    sys_base::Any = nothing
+    active_bias::Any = nothing
+    idxs::Any = nothing
 end
 
 Base.@kwdef struct StageAStats

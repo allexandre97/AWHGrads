@@ -10,7 +10,9 @@ function setup_alchemical_awh(
     param_idxs=nothing,
     restart_state=nothing,
     restart_active_idx::Int=1,
-    warm_start::Bool=false
+    warm_start::Bool=false,
+    sigma_seed=nothing,
+    epsilon_seed=nothing,
 )
     sys_raw = System(
         pdb_file, ff; array_type=AT, nonbonded_method=:none, 
@@ -21,12 +23,12 @@ function setup_alchemical_awh(
     seeded_atoms = Atom[]
     
     # Safely sized seeds strictly above the optimization boundaries to prevent 1/r^12 singularity
-    sigma_seed = FT(0.15)u"nm"
-    epsilon_seed = FT(1e-4)u"kJ/mol"
+    sigma_seed_local = isnothing(sigma_seed) ? FT(0.15)u"nm" : sigma_seed
+    epsilon_seed_local = isnothing(epsilon_seed) ? FT(1e-4)u"kJ/mol" : epsilon_seed
     
     for (i, a) in enumerate(atoms_raw)
-        new_sigma = (ustrip(a.σ) <= FT(1e-6) || ustrip(a.σ) == one(FT)) ? sigma_seed : a.σ
-        new_eps   = ustrip(a.ϵ) <= FT(1e-6) ? epsilon_seed : a.ϵ
+        new_sigma = (ustrip(a.σ) <= FT(1e-6) || ustrip(a.σ) == one(FT)) ? sigma_seed_local : a.σ
+        new_eps   = ustrip(a.ϵ) <= FT(1e-6) ? epsilon_seed_local : a.ϵ
         
         # INJECT NEW PARAMETERS FOR PHASE 3
         if !isnothing(optimized_params) && !isnothing(param_idxs)
@@ -119,7 +121,7 @@ function setup_alchemical_awh(
         empty!(awh_state.visited_windows)
     end
 
-    awh_sim = AWHSimulation(awh_state; num_md_steps = 10, log_freq=100, well_tempered_factor=Inf)  
+    awh_sim = AWHSimulation(awh_state; num_md_steps = 10, log_freq=100, well_tempered_factor=Inf, coverage_type=:physical)  
     
     return awh_sim, sys_base  
 end
@@ -153,4 +155,3 @@ function coords_rmsd_nm(coords_a, coords_b)
     end
     return sqrt(sq_dist_sum / FT(n_atoms))
 end
-

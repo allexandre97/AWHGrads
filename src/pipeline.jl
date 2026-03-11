@@ -1,471 +1,613 @@
-function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), opt_cfg::OptimizationConfig=default_optimization_config())
-    apply_simulation_config!(sim_cfg)
-    FT = sim_cfg.FT
-    runtime = RuntimeState()
+function sync_runtime_aliases!(runtime::RuntimeState)
+    runtime.active_bias_solv = get(runtime.active_bias, :solvent, nothing)
+    runtime.active_bias_vac = get(runtime.active_bias, :vacuum, nothing)
+    runtime.restart_cache_solv = get(runtime.restart_cache, :solvent, nothing)
+    runtime.restart_cache_vac = get(runtime.restart_cache, :vacuum, nothing)
+    return runtime
+end
 
-    # Evaluate Standard State Correction (Gas to 1M Liquid)
+
+time_to_steps_floor(duration) = Int(floor(uconvert(unit(Δt), duration) / Δt))
+time_to_steps_round(duration) = max(1, Int(round(uconvert(unit(Δt), duration) / Δt)))
+
+
+function compute_standard_state_correction(cycle_cfg::ThermodynamicCycleConfig, ::Type{FT}) where {FT <: AbstractFloat}
+    if !cycle_cfg.include_standard_state_correction
+        return zero(FT)
+    end
     V_gas = ustrip(u"nm^3", Unitful.k * T0 / P0)
     V_std = ustrip(u"nm^3", 1.0u"L" / (1.0u"mol" * Unitful.Na))
-    dG_std_corr = FT(log(V_gas / V_std))
+    return FT(log(V_gas / V_std))
+end
 
-awh_budget_time = sim_cfg.awh_budget_time
-awh_block_time = sim_cfg.awh_block_time
-awh_probe_time_solv = sim_cfg.awh_probe_time_solv
-awh_probe_time_vac = sim_cfg.awh_probe_time_vac
-md_time_production = sim_cfg.md_time_production
 
-md_steps_budget = Int(floor(uconvert(unit(Δt), awh_budget_time) / Δt))
-md_steps_block = max(1, Int(round(uconvert(unit(Δt), awh_block_time) / Δt)))
-md_steps_probe_solv = max(1, Int(round(uconvert(unit(Δt), awh_probe_time_solv) / Δt)))
-md_steps_probe_vac = max(1, Int(round(uconvert(unit(Δt), awh_probe_time_vac) / Δt)))
-md_steps_prod = Int(floor(uconvert(unit(Δt), md_time_production) / Δt))
-solute_idx = sim_cfg.solute_idx
+function initialize_parameter_state(
+    sim_cfg::SimulationConfig,
+    opt_cfg::OptimizationConfig,
+    cycle_cfg::ThermodynamicCycleConfig,
+)
+    FT = sim_cfg.FT
+    bounds_cfg = sim_cfg.parameter_bounds
+    solute_idx = sim_cfg.solute_idx
 
-production_log_interval = sim_cfg.production_log_interval
-awh_convergence_tol = opt_cfg.awh_convergence_tol
-rewarm_fraction = opt_cfg.rewarm_fraction
-md_steps_rewarm = max(1, Int(round(md_steps_budget * rewarm_fraction)))
-md_steps_rewarm = min(md_steps_rewarm, md_steps_budget)
+    ref_leg = resolve_parameter_reference_leg(sim_cfg, cycle_cfg)
+    sys_ref = System(ref_leg.pdb, ff; array_type=AT, nonbonded_method=:none)
+    atoms_cpu = Molly.from_device(sys_ref.atoms)
 
-T_coord = typeof(FT(1.0)u"nm")
-T_vol = typeof(FT(1.0)u"nm^3")
-T_en = typeof(FT(1.0)u"kJ * mol^-1")
+    theta_ref = Vector{FT}()
+    param_names = String[]
+    param_kind = Symbol[]
+    param_is_hydrogen = Bool[]
+    processed_atom_types = Dict{String, Int}()
+    solute_param_indices = Int[]
+    solvent_param_indices = Int[]
 
-max_macro_epochs = opt_cfg.max_macro_epochs
-restart_rmsd_tol_nm = opt_cfg.restart_rmsd_tol_nm
-awh_min_linear_neff = opt_cfg.awh_min_linear_neff
-awh_split_tol_kT = opt_cfg.awh_split_tol_kT
-awh_parity_tol_kT = opt_cfg.awh_parity_tol_kT
-awh_tail_lag = opt_cfg.awh_tail_lag
-awh_min_round_trips = opt_cfg.awh_min_round_trips
-awh_endpoint_min_fraction = opt_cfg.awh_endpoint_min_fraction
-awh_stageA_stable_blocks = opt_cfg.awh_stageA_stable_blocks
+    sigma_floor = FT(bounds_cfg.sigma_floor)
+    epsilon_floor = FT(bounds_cfg.epsilon_floor)
+    clamp_eps = FT(bounds_cfg.reference_clamp_eps)
 
-runtime.active_bias_solv = nothing
-runtime.active_bias_vac = nothing
-runtime.restart_cache_solv = nothing
-runtime.restart_cache_vac = nothing
+    for idx in eachindex(atoms_cpu)
+        atom = atoms_cpu[idx]
+        atype = String(sys_ref.atoms_data[idx].atom_type)
+        if haskey(processed_atom_types, atype)
+            continue
+        end
 
-# ==============================================================================
-# --- INITIALIZE PARAMETER MAPPINGS (RUNS ONCE) ---
-# ==============================================================================
-theta_ref    = Vector{FT}()
-phi_active   = Vector{FT}()
-theta_active = Vector{FT}()
-param_names  = Vector{String}()  
+        is_hydrogen = startswith(lowercase(atype), "h")
 
-sys_dummy = System(sim_cfg.pdb_solv, ff; array_type=AT, nonbonded_method=:none)
-processed_atom_types = Dict{String, Int}()  
-atoms_cpu = Molly.from_device(sys_dummy.atoms)  
-
-solute_param_indices = Int[]
-solvent_param_indices = Int[]
-
-for idx in eachindex(atoms_cpu)  
-    atom  = atoms_cpu[idx]  
-    atype = String(sys_dummy.atoms_data[idx].atom_type)  
-    
-    if !haskey(processed_atom_types, atype)  
         sigma_raw = FT(ustrip(atom.σ))
         if sigma_raw <= FT(1e-6) || sigma_raw == one(FT)
-            sigma_raw = FT(0.15)
+            sigma_raw = sigma_floor
         end
-        
         push!(theta_ref, sigma_raw)
-        push!(param_names, "atom_$(atype)_σ")  
-        sigma_idx = length(theta_ref)  
-        
+        push!(param_names, "atom_$(atype)_σ")
+        push!(param_kind, :sigma)
+        push!(param_is_hydrogen, is_hydrogen)
+        sigma_idx = length(theta_ref)
+
         epsilon_raw = FT(ustrip(atom.ϵ))
         if epsilon_raw <= FT(1e-6)
-            epsilon_raw = FT(1e-4)
+            epsilon_raw = epsilon_floor
         end
-        
         push!(theta_ref, epsilon_raw)
-        push!(param_names, "atom_$(atype)_ϵ") 
+        push!(param_names, "atom_$(atype)_ϵ")
+        push!(param_kind, :epsilon)
+        push!(param_is_hydrogen, is_hydrogen)
         epsilon_idx = length(theta_ref)
 
-        processed_atom_types[atype] = sigma_idx  
-
+        processed_atom_types[atype] = sigma_idx
         if idx ∈ solute_idx
             push!(solute_param_indices, sigma_idx, epsilon_idx)
         else
             push!(solvent_param_indices, sigma_idx, epsilon_idx)
         end
-    end  
-end  
+    end
 
-trainable_param_indices = opt_cfg.optimize_solvent ? collect(eachindex(theta_ref)) : copy(solute_param_indices)
-trainable_param_names = String[]
-for idx in trainable_param_indices
-    push!(trainable_param_names, param_names[idx])
-end
-trainable_position_map = Dict{Int, Int}()
-for (i_local, i_global) in enumerate(trainable_param_indices)
-    trainable_position_map[i_global] = i_local
-end
-theta_min = zeros(FT, length(theta_ref))
-theta_max = zeros(FT, length(theta_ref))
-phi_0     = zeros(FT, length(theta_ref))
+    trainable_param_indices = opt_cfg.optimize_solvent ? collect(eachindex(theta_ref)) : copy(solute_param_indices)
+    trainable_param_names = [param_names[idx] for idx in trainable_param_indices]
+    trainable_position_map = Dict{Int, Int}()
+    for (i_local, i_global) in enumerate(trainable_param_indices)
+        trainable_position_map[i_global] = i_local
+    end
 
-for i in 1:length(theta_ref)
-    p_name = param_names[i]
-    
-    atype_str = split(p_name, "_")[2]
-    is_hydrogen = startswith(lowercase(atype_str), "h")
-    
-    if occursin("σ", p_name)
-        if is_hydrogen
-            theta_min[i] = FT(0.1)
-            theta_max[i] = FT(0.4)
+    theta_min = zeros(FT, length(theta_ref))
+    theta_max = zeros(FT, length(theta_ref))
+    phi_0 = zeros(FT, length(theta_ref))
+
+    for i in eachindex(theta_ref)
+        if param_kind[i] == :sigma
+            if param_is_hydrogen[i]
+                theta_min[i] = FT(bounds_cfg.sigma_hydrogen_min)
+                theta_max[i] = FT(bounds_cfg.sigma_hydrogen_max)
+            else
+                theta_min[i] = FT(bounds_cfg.sigma_heavy_min)
+                theta_max[i] = FT(bounds_cfg.sigma_heavy_max)
+            end
         else
-            theta_min[i] = FT(0.2)
-            theta_max[i] = FT(0.5)
+            if param_is_hydrogen[i]
+                theta_min[i] = FT(bounds_cfg.epsilon_hydrogen_min)
+                theta_max[i] = FT(bounds_cfg.epsilon_hydrogen_max)
+            else
+                theta_min[i] = FT(bounds_cfg.epsilon_heavy_min)
+                theta_max[i] = FT(bounds_cfg.epsilon_heavy_max)
+            end
         end
-    elseif occursin("ϵ", p_name)
-        if is_hydrogen
-            theta_min[i] = FT(0.0)
-            theta_max[i] = FT(0.5)
-        else
-            theta_min[i] = FT(0.0)
-            theta_max[i] = FT(1.5)
-        end
+
+        val_ref = clamp(theta_ref[i], theta_min[i] + clamp_eps, theta_max[i] - clamp_eps)
+        val = (theta_max[i] - val_ref) / (val_ref - theta_min[i])
+        phi_0[i] = (FT(1.0) / opt_cfg.k_sigmoid) * log(val)
     end
-    
-    val_ref = clamp(theta_ref[i], theta_min[i] + FT(1e-4), theta_max[i] - FT(1e-4))
-    val = (theta_max[i] - val_ref) / (val_ref - theta_min[i])
-    phi_0[i] = (FT(1.0) / opt_cfg.k_sigmoid) * log(val)
+
+    phi_active = zeros(FT, length(theta_ref))
+    theta_active = map_phi_to_theta(phi_active, theta_min, theta_max, phi_0, opt_cfg.k_sigmoid)
+
+    idxs_by_leg = Dict{Symbol, Any}()
+    for leg in cycle_cfg.legs
+        sys_leg = leg.name == ref_leg.name ? sys_ref : System(leg.pdb, ff; array_type=AT, nonbonded_method=:none)
+        idxs_by_leg[leg.name] = build_index_maps(sys_leg, processed_atom_types)
+    end
+
+    return (
+        phi_active=phi_active,
+        theta_active=theta_active,
+        param_names=param_names,
+        trainable_param_names=trainable_param_names,
+        trainable_param_indices=trainable_param_indices,
+        trainable_position_map=trainable_position_map,
+        solute_param_indices=solute_param_indices,
+        solvent_param_indices=solvent_param_indices,
+        theta_min=theta_min,
+        theta_max=theta_max,
+        phi_0=phi_0,
+        idxs_by_leg=idxs_by_leg,
+    )
 end
 
-phi_active = zeros(FT, length(theta_ref))
-theta_active = map_phi_to_theta(phi_active, theta_min, theta_max, phi_0, opt_cfg.k_sigmoid)
 
-idxs_solv = build_index_maps(sys_dummy, processed_atom_types)
-idxs_vac = build_index_maps(System(sim_cfg.pdb_vac, ff; array_type=AT, nonbonded_method=:none), processed_atom_types)
+function setup_macro_legs(
+    cycle_cfg::ThermodynamicCycleConfig,
+    sim_cfg::SimulationConfig,
+    runtime::RuntimeState,
+    theta_active::Vector{FT},
+    idxs_by_leg::Dict{Symbol, Any},
+    T_coord,
+    T_vol,
+    T_en,
+    macro_epoch::Int,
+    restart_rmsd_tol_nm::FT,
+) where {FT <: AbstractFloat}
+    awh_by_leg = Dict{Symbol, Any}()
+    sys_by_leg = Dict{Symbol, Any}()
+    bounds_cfg = sim_cfg.parameter_bounds
+    sigma_seed = FT(bounds_cfg.sigma_floor)u"nm"
+    epsilon_seed = FT(bounds_cfg.epsilon_floor)u"kJ/mol"
 
-# ==============================================================================
-# --- MAIN PIPELINE ORCHESTRATION ---
-# ==============================================================================
+    for leg in cycle_cfg.legs
+        warm_start = macro_epoch > 1 && haskey(runtime.restart_cache, leg.name) && !isnothing(runtime.restart_cache[leg.name])
+        restart_state = warm_start ? runtime.restart_cache[leg.name] : nothing
 
-for macro_epoch in 1:max_macro_epochs
-    println("\n>>> STARTING MACRO EPOCH $macro_epoch <<<")  
+        logger = AWHEnsembleLogger(T_coord, T_vol, T_en, sim_cfg.production_log_interval)
+        awh_leg, sys_leg = setup_alchemical_awh(
+            leg.pdb,
+            sim_cfg.solute_idx;
+            is_vacuum=leg.is_vacuum,
+            logger=logger,
+            injected_bias=get(runtime.active_bias, leg.name, nothing),
+            optimized_params=theta_active,
+            param_idxs=idxs_by_leg[leg.name],
+            restart_state=restart_state,
+            restart_active_idx=warm_start ? restart_state.active_idx : 1,
+            warm_start=warm_start,
+            sigma_seed=sigma_seed,
+            epsilon_seed=epsilon_seed,
+        )
+        awh_by_leg[leg.name] = awh_leg
+        sys_by_leg[leg.name] = sys_leg
 
-    warm_start_solv = macro_epoch > 1 && !isnothing(runtime.restart_cache_solv)
-    warm_start_vac  = macro_epoch > 1 && !isnothing(runtime.restart_cache_vac)
-
-    logger_solv = AWHEnsembleLogger(T_coord, T_vol, T_en, production_log_interval)
-    awh_solv, sys_solv = setup_alchemical_awh(
-        sim_cfg.pdb_solv,
-        solute_idx;
-        is_vacuum=false,
-        logger=logger_solv,
-        injected_bias=runtime.active_bias_solv,
-        optimized_params=theta_active,
-        param_idxs=idxs_solv,
-        restart_state=warm_start_solv ? runtime.restart_cache_solv : nothing,
-        restart_active_idx=warm_start_solv ? runtime.restart_cache_solv.active_idx : 1,
-        warm_start=warm_start_solv
-    )
-
-    logger_vac = AWHEnsembleLogger(T_coord, T_vol, T_en, production_log_interval)
-    awh_vac, sys_vac = setup_alchemical_awh(
-        sim_cfg.pdb_vac,
-        solute_idx;
-        is_vacuum=true,
-        logger=logger_vac,
-        injected_bias=runtime.active_bias_vac,
-        optimized_params=theta_active,
-        param_idxs=idxs_vac,
-        restart_state=warm_start_vac ? runtime.restart_cache_vac : nothing,
-        restart_active_idx=warm_start_vac ? runtime.restart_cache_vac.active_idx : 1,
-        warm_start=warm_start_vac
-    )
-
-    if warm_start_solv
-        restart_rmsd = coords_rmsd_nm(runtime.restart_cache_solv.coords, awh_solv.state.active_sys.coords)
-        prev_vol = FT(ustrip(volume(runtime.restart_cache_solv.boundary)))
-        new_vol = FT(ustrip(volume(awh_solv.state.active_sys.boundary)))
-        idx_match = runtime.restart_cache_solv.active_idx == awh_solv.state.active_idx
-        @info "Macro Start (Solvent): warm_start=true | λ_prev=$(runtime.restart_cache_solv.active_idx) | λ_new=$(awh_solv.state.active_idx) | idx_match=$idx_match | restart_rmsd_nm=$(round(restart_rmsd, digits=6)) | volume_ratio=$(round(new_vol / prev_vol, digits=6))"
-        if restart_rmsd > restart_rmsd_tol_nm
-            @info "  [!] Solvent restart RMSD above tolerance ($(restart_rmsd_tol_nm) nm)."
+        leg_label = uppercasefirst(String(leg.name))
+        if warm_start
+            restart_rmsd = coords_rmsd_nm(restart_state.coords, awh_leg.state.active_sys.coords)
+            idx_match = restart_state.active_idx == awh_leg.state.active_idx
+            if leg.is_vacuum
+                @info "Macro Start ($leg_label): warm_start=true | λ_prev=$(restart_state.active_idx) | λ_new=$(awh_leg.state.active_idx) | idx_match=$idx_match | restart_rmsd_nm=$(round(restart_rmsd, digits=6))"
+            else
+                prev_vol = FT(ustrip(volume(restart_state.boundary)))
+                new_vol = FT(ustrip(volume(awh_leg.state.active_sys.boundary)))
+                @info "Macro Start ($leg_label): warm_start=true | λ_prev=$(restart_state.active_idx) | λ_new=$(awh_leg.state.active_idx) | idx_match=$idx_match | restart_rmsd_nm=$(round(restart_rmsd, digits=6)) | volume_ratio=$(round(new_vol / prev_vol, digits=6))"
+            end
+            if restart_rmsd > restart_rmsd_tol_nm
+                @info "  [!] $leg_label restart RMSD above tolerance ($(restart_rmsd_tol_nm) nm)."
+            end
+        else
+            @info "Macro Start ($leg_label): warm_start=false (cold-start from PDB)."
         end
-    else
-        @info "Macro Start (Solvent): warm_start=false (cold-start from PDB)."
     end
 
-    if warm_start_vac
-        restart_rmsd = coords_rmsd_nm(runtime.restart_cache_vac.coords, awh_vac.state.active_sys.coords)
-        idx_match = runtime.restart_cache_vac.active_idx == awh_vac.state.active_idx
-        @info "Macro Start (Vacuum): warm_start=true | λ_prev=$(runtime.restart_cache_vac.active_idx) | λ_new=$(awh_vac.state.active_idx) | idx_match=$idx_match | restart_rmsd_nm=$(round(restart_rmsd, digits=6))"
-        if restart_rmsd > restart_rmsd_tol_nm
-            @info "  [!] Vacuum restart RMSD above tolerance ($(restart_rmsd_tol_nm) nm)."
-        end
-    else
-        @info "Macro Start (Vacuum): warm_start=false (cold-start from PDB)."
-    end
+    return awh_by_leg, sys_by_leg
+end
 
-    e_unit = sys_solv.energy_units  
-    beta_val = FT(1.0 / ustrip(uconvert(e_unit, Unitful.R * T0)))  
-    P0_energy_per_vol = FT(ustrip(uconvert(e_unit, P0 * FT(1.0)u"nm^3" * Unitful.Na)))
-    
-    dG_exp_physical = FT(sim_cfg.dG_exp_kcal_mol) * FT(4.184)
-    dG_exp = dG_exp_physical * beta_val   
+
+function run_readiness_loop!(
+    cycle_cfg::ThermodynamicCycleConfig,
+    awh_by_leg::Dict{Symbol, Any},
+    sys_by_leg::Dict{Symbol, Any},
+    idxs_by_leg::Dict{Symbol, Any},
+    runtime::RuntimeState,
+    theta_active::Vector{FT},
+    param_names::Vector{String},
+    md_steps_budget::Int,
+    md_steps_block::Int,
+    md_steps_rewarm::Int,
+    probe_steps_by_leg::Dict{Symbol, Int},
+    awh_budget_time,
+    awh_convergence_tol::FT,
+    awh_min_linear_neff::Int,
+    awh_split_tol_kT::FT,
+    awh_parity_tol_kT::FT,
+    awh_tail_lag::Int,
+    awh_min_round_trips::Int,
+    awh_endpoint_min_fraction::FT,
+    awh_stageA_stable_blocks::Int,
+    beta_val::FT,
+    p0_energy_per_vol::FT,
+) where {FT <: AbstractFloat}
+    stageA_default = StageAStats(df_mean=FT(Inf), linear_neff=zero(FT))
+    stageB_default = StageBStats(split_gap=FT(Inf), parity_gap=FT(Inf), dG_half_1=FT(NaN), dG_half_2=FT(NaN))
+
+    stageA_stats_by_leg = Dict{Symbol, StageAStats}(leg.name => stageA_default for leg in cycle_cfg.legs)
+    stageB_stats_by_leg = Dict{Symbol, StageBStats}(leg.name => stageB_default for leg in cycle_cfg.legs)
+    stageA_streak = Dict{Symbol, Int}(leg.name => 0 for leg in cycle_cfg.legs)
+    spent_steps = Dict{Symbol, Int}(leg.name => 0 for leg in cycle_cfg.legs)
+    leg_status = Dict{Symbol, Symbol}(leg.name => :active for leg in cycle_cfg.legs)
+    split_gap_by_leg = Dict{Symbol, FT}(leg.name => FT(Inf) for leg in cycle_cfg.legs)
+    parity_gap_by_leg = Dict{Symbol, FT}(leg.name => FT(Inf) for leg in cycle_cfg.legs)
+
+    for leg in cycle_cfg.legs
+        runtime.active_bias[leg.name] = extract_awh_data(awh_by_leg[leg.name])
+    end
+    sync_runtime_aliases!(runtime)
+
+    for leg in cycle_cfg.legs
+        awh_leg = awh_by_leg[leg.name]
+        if !awh_leg.state.in_initial_stage
+            continue
+        end
+        rewarm_steps = min(md_steps_rewarm, md_steps_budget)
+        println("Running $(uppercasefirst(String(leg.name))) AWH Leg (Initial Rewarm)...")
+        simulate!(awh_leg, rewarm_steps)
+        spent_steps[leg.name] += rewarm_steps
+        runtime.active_bias[leg.name] = extract_awh_data(awh_leg)
+    end
+    sync_runtime_aliases!(runtime)
 
     awh_ready = false
     awh_readiness_reason = :not_checked
-    split_gap = FT(Inf)
-    split_gap_solv = FT(Inf)
-    split_gap_vac = FT(Inf)
-    parity_gap_solv = FT(Inf)
-    parity_gap_vac = FT(Inf)
-
-    local awh_solv_prod
-    local awh_vac_prod
-    local logger_solv_prod
-    local logger_vac_prod
-    local nbrs_solv
-    local nbrs_vac
-    local u_solv_ref
-    local u_vac_ref
-
-    stageA_stats_default = StageAStats(df_mean=FT(Inf), linear_neff=zero(FT))
-    stageB_stats_default = StageBStats(split_gap=FT(Inf), parity_gap=FT(Inf), dG_half_1=FT(NaN), dG_half_2=FT(NaN))
-
-    stageA_stats_solv = stageA_stats_default
-    stageA_stats_vac = stageA_stats_default
-    stageB_stats_solv = stageB_stats_default
-    stageB_stats_vac = stageB_stats_default
-
-    stageA_streak_solv = 0
-    stageA_streak_vac = 0
-    spent_steps_solv = 0
-    spent_steps_vac = 0
-    leg_status_solv = :active
-    leg_status_vac = :active
-
-    runtime.active_bias_solv = extract_awh_data(awh_solv)
-    runtime.active_bias_vac = extract_awh_data(awh_vac)
-
-    if awh_solv.state.in_initial_stage
-        rewarm_steps = min(md_steps_rewarm, md_steps_budget)
-        println("Running Solvated AWH Leg (Initial Rewarm)...")
-        simulate!(awh_solv, rewarm_steps)
-        spent_steps_solv += rewarm_steps
-        runtime.active_bias_solv = extract_awh_data(awh_solv)
-    end
-
-    if awh_vac.state.in_initial_stage
-        rewarm_steps = min(md_steps_rewarm, md_steps_budget)
-        println("Running Vacuum AWH Leg (Initial Rewarm)...")
-        simulate!(awh_vac, rewarm_steps)
-        spent_steps_vac += rewarm_steps
-        runtime.active_bias_vac = extract_awh_data(awh_vac)
-    end
 
     while true
-        if leg_status_solv == :active
-            remaining_steps_solv = md_steps_budget - spent_steps_solv
-            if remaining_steps_solv <= 0
-                leg_status_solv = :budget_exhausted
-            else
-                block_steps = min(md_steps_block, remaining_steps_solv)
-                println("Running Solvated AWH Leg (Stage A Block)...")
-                simulate!(awh_solv, block_steps)
-                spent_steps_solv += block_steps
-                runtime.active_bias_solv = extract_awh_data(awh_solv)
+        for leg in cycle_cfg.legs
+            name = leg.name
+            if leg_status[name] != :active
+                continue
+            end
 
-                stageA_stats_solv = StageAStats(evaluate_stage_a_readiness(
-                    awh_solv, awh_convergence_tol;
-                    tail_lag=awh_tail_lag,
-                    min_linear_neff=awh_min_linear_neff,
-                    min_round_trips=awh_min_round_trips,
-                    endpoint_min_fraction=awh_endpoint_min_fraction,
-                    high_idx=num_lambda_states,
+            awh_leg = awh_by_leg[name]
+            remaining_steps = md_steps_budget - spent_steps[name]
+            if remaining_steps <= 0
+                leg_status[name] = :budget_exhausted
+                continue
+            end
+
+            block_steps = min(md_steps_block, remaining_steps)
+            println("Running $(uppercasefirst(String(name))) AWH Leg (Stage A Block)...")
+            simulate!(awh_leg, block_steps)
+            spent_steps[name] += block_steps
+            runtime.active_bias[name] = extract_awh_data(awh_leg)
+
+            stageA_stats_by_leg[name] = StageAStats(evaluate_stage_a_readiness(
+                awh_leg,
+                awh_convergence_tol;
+                tail_lag=awh_tail_lag,
+                min_linear_neff=awh_min_linear_neff,
+                min_round_trips=awh_min_round_trips,
+                endpoint_min_fraction=awh_endpoint_min_fraction,
+                high_idx=num_lambda_states,
+            ))
+
+            if stageA_stats_by_leg[name].ready
+                stageA_streak[name] += 1
+            else
+                stageA_streak[name] = 0
+            end
+
+            if stageA_streak[name] >= awh_stageA_stable_blocks
+                stageB_stats_by_leg[name] = StageBStats(run_stage_b_probe(
+                    awh_leg,
+                    sys_by_leg[name],
+                    theta_active,
+                    param_names,
+                    idxs_by_leg[name],
+                    num_lambda_states,
+                    beta_val,
+                    awh_split_tol_kT,
+                    awh_parity_tol_kT;
+                    md_steps_probe=probe_steps_by_leg[name],
+                    leg_name=String(name),
+                    include_pv=leg.include_pv,
+                    P0_energy_per_vol=leg.include_pv ? p0_energy_per_vol : zero(FT),
                 ))
 
-                if stageA_stats_solv.ready
-                    stageA_streak_solv += 1
+                split_gap_by_leg[name] = stageB_stats_by_leg[name].split_gap
+                parity_gap_by_leg[name] = stageB_stats_by_leg[name].parity_gap
+                if stageB_stats_by_leg[name].ready
+                    leg_status[name] = :ready_frozen
+                    @info "$(uppercasefirst(String(name))) leg frozen after passing Stage B (split_gap=$(round(split_gap_by_leg[name], digits=4)) kT, parity_gap=$(round(parity_gap_by_leg[name], digits=4)) kT)."
                 else
-                    stageA_streak_solv = 0
+                    stageA_streak[name] = 0
                 end
+            end
 
-                if stageA_streak_solv >= awh_stageA_stable_blocks
-                    stageB_stats_solv = StageBStats(run_stage_b_probe(
-                        awh_solv, sys_solv, theta_active, param_names, idxs_solv, num_lambda_states,
-                        beta_val, awh_split_tol_kT, awh_parity_tol_kT;
-                        md_steps_probe=md_steps_probe_solv,
-                        leg_name="solvent",
-                        include_pv=true,
-                        P0_energy_per_vol=P0_energy_per_vol
-                    ))
-                    split_gap_solv = stageB_stats_solv.split_gap
-                    parity_gap_solv = stageB_stats_solv.parity_gap
-                    if stageB_stats_solv.ready
-                        leg_status_solv = :ready_frozen
-                        @info "Solvent leg frozen after passing Stage B (split_gap=$(round(split_gap_solv, digits=4)) kT, parity_gap=$(round(parity_gap_solv, digits=4)) kT)."
-                    else
-                        stageA_streak_solv = 0
-                    end
-                end
-
-                if leg_status_solv == :active && spent_steps_solv >= md_steps_budget
-                    leg_status_solv = :budget_exhausted
-                end
+            if leg_status[name] == :active && spent_steps[name] >= md_steps_budget
+                leg_status[name] = :budget_exhausted
             end
         end
 
-        if leg_status_vac == :active
-            remaining_steps_vac = md_steps_budget - spent_steps_vac
-            if remaining_steps_vac <= 0
-                leg_status_vac = :budget_exhausted
-            else
-                block_steps = min(md_steps_block, remaining_steps_vac)
-                println("Running Vacuum AWH Leg (Stage A Block)...")
-                simulate!(awh_vac, block_steps)
-                spent_steps_vac += block_steps
-                runtime.active_bias_vac = extract_awh_data(awh_vac)
+        sync_runtime_aliases!(runtime)
 
-                stageA_stats_vac = StageAStats(evaluate_stage_a_readiness(
-                    awh_vac, awh_convergence_tol;
-                    tail_lag=awh_tail_lag,
-                    min_linear_neff=awh_min_linear_neff,
-                    min_round_trips=awh_min_round_trips,
-                    endpoint_min_fraction=awh_endpoint_min_fraction,
-                    high_idx=num_lambda_states,
-                ))
+        status_msg = join(["$(leg.name)=$(leg_status[leg.name])" for leg in cycle_cfg.legs], " ")
+        spent_msg = join(
+            [
+                "$(leg.name)=$(round(steps_to_ns(spent_steps[leg.name]), digits=2))/$(round(ustrip(u"ns", awh_budget_time), digits=2))"
+                for leg in cycle_cfg.legs
+            ],
+            " | ",
+        )
+        @info "AWH Block Status: $status_msg | spent_ns: $spent_msg"
 
-                if stageA_stats_vac.ready
-                    stageA_streak_vac += 1
-                else
-                    stageA_streak_vac = 0
-                end
+        for leg in cycle_cfg.legs
+            name = leg.name
+            statsA = stageA_stats_by_leg[name]
+            @info "  Stage A ($(name)): df=$(round(statsA.df_mean, digits=6)) (ok=$(statsA.df_ready)) | neff=$(round(statsA.linear_neff, digits=1)) (ok=$(statsA.neff_ready)) | rt=$(statsA.round_trips) (ok=$(statsA.round_trip_ready)) | endpt=($(round(statsA.endpoint_low, digits=3)), $(round(statsA.endpoint_high, digits=3))) (ok=$(statsA.endpoint_ready)) | streak=$(stageA_streak[name])"
 
-                if stageA_streak_vac >= awh_stageA_stable_blocks
-                    stageB_stats_vac = StageBStats(run_stage_b_probe(
-                        awh_vac, sys_vac, theta_active, param_names, idxs_vac, num_lambda_states,
-                        beta_val, awh_split_tol_kT, awh_parity_tol_kT;
-                        md_steps_probe=md_steps_probe_vac,
-                        leg_name="vacuum",
-                        include_pv=false
-                    ))
-                    split_gap_vac = stageB_stats_vac.split_gap
-                    parity_gap_vac = stageB_stats_vac.parity_gap
-                    if stageB_stats_vac.ready
-                        leg_status_vac = :ready_frozen
-                        @info "Vacuum leg frozen after passing Stage B (split_gap=$(round(split_gap_vac, digits=4)) kT, parity_gap=$(round(parity_gap_vac, digits=4)) kT)."
-                    else
-                        stageA_streak_vac = 0
-                    end
-                end
-
-                if leg_status_vac == :active && spent_steps_vac >= md_steps_budget
-                    leg_status_vac = :budget_exhausted
-                end
+            statsB = stageB_stats_by_leg[name]
+            if statsB.n_frames > 0
+                @info "  Stage B ($(name)): split_gap=$(round(statsB.split_gap, digits=4)) kT (ok=$(statsB.split_ready)) | parity_gap=$(round(statsB.parity_gap, digits=4)) kT (ok=$(statsB.parity_ready)) | frames=$(statsB.n_frames)"
             end
         end
 
-        @info "AWH Block Status: solv=$(leg_status_solv) vac=$(leg_status_vac) | spent_ns_solv=$(round(steps_to_ns(spent_steps_solv), digits=2))/$(round(ustrip(u"ns", awh_budget_time), digits=2)) | spent_ns_vac=$(round(steps_to_ns(spent_steps_vac), digits=2))/$(round(ustrip(u"ns", awh_budget_time), digits=2))"
-        @info "  Stage A (Solv): df=$(round(stageA_stats_solv.df_mean, digits=6)) (ok=$(stageA_stats_solv.df_ready)) | neff=$(round(stageA_stats_solv.linear_neff, digits=1)) (ok=$(stageA_stats_solv.neff_ready)) | rt=$(stageA_stats_solv.round_trips) (ok=$(stageA_stats_solv.round_trip_ready)) | endpt=($(round(stageA_stats_solv.endpoint_low, digits=3)), $(round(stageA_stats_solv.endpoint_high, digits=3))) (ok=$(stageA_stats_solv.endpoint_ready)) | streak=$stageA_streak_solv"
-        @info "  Stage A (Vac):  df=$(round(stageA_stats_vac.df_mean, digits=6)) (ok=$(stageA_stats_vac.df_ready)) | neff=$(round(stageA_stats_vac.linear_neff, digits=1)) (ok=$(stageA_stats_vac.neff_ready)) | rt=$(stageA_stats_vac.round_trips) (ok=$(stageA_stats_vac.round_trip_ready)) | endpt=($(round(stageA_stats_vac.endpoint_low, digits=3)), $(round(stageA_stats_vac.endpoint_high, digits=3))) (ok=$(stageA_stats_vac.endpoint_ready)) | streak=$stageA_streak_vac"
-        if stageB_stats_solv.n_frames > 0
-            @info "  Stage B (Solv): split_gap=$(round(stageB_stats_solv.split_gap, digits=4)) kT (ok=$(stageB_stats_solv.split_ready)) | parity_gap=$(round(stageB_stats_solv.parity_gap, digits=4)) kT (ok=$(stageB_stats_solv.parity_ready)) | frames=$(stageB_stats_solv.n_frames)"
-        end
-        if stageB_stats_vac.n_frames > 0
-            @info "  Stage B (Vac):  split_gap=$(round(stageB_stats_vac.split_gap, digits=4)) kT (ok=$(stageB_stats_vac.split_ready)) | parity_gap=$(round(stageB_stats_vac.parity_gap, digits=4)) kT (ok=$(stageB_stats_vac.parity_ready)) | frames=$(stageB_stats_vac.n_frames)"
-        end
-
-        if leg_status_solv == :ready_frozen && leg_status_vac == :ready_frozen
+        all_ready = all(leg_status[leg.name] == :ready_frozen for leg in cycle_cfg.legs)
+        if all_ready
             awh_ready = true
             awh_readiness_reason = :ready
             break
         end
 
-        if leg_status_solv == :budget_exhausted || leg_status_vac == :budget_exhausted
+        any_budget_exhausted = any(leg_status[leg.name] == :budget_exhausted for leg in cycle_cfg.legs)
+        if any_budget_exhausted
             awh_ready = false
             awh_readiness_reason = :awh_not_ready_budget
             break
         end
     end
 
-    if !awh_ready
-        @info "Macro $macro_epoch skipped: strict AWH readiness failed ($awh_readiness_reason). Status=(solv=$leg_status_solv, vac=$leg_status_vac), StageA df=(solv=$(round(stageA_stats_solv.df_mean, digits=6)), vac=$(round(stageA_stats_vac.df_mean, digits=6))), neff=(solv=$(round(stageA_stats_solv.linear_neff, digits=1)), vac=$(round(stageA_stats_vac.linear_neff, digits=1))), rt=(solv=$(stageA_stats_solv.round_trips), vac=$(stageA_stats_vac.round_trips)), parity=(solv=$(round(parity_gap_solv, digits=4)), vac=$(round(parity_gap_vac, digits=4))) kT"
-        continue
-    end
+    return (
+        awh_ready=awh_ready,
+        awh_readiness_reason=awh_readiness_reason,
+        stageA_stats_by_leg=stageA_stats_by_leg,
+        stageB_stats_by_leg=stageB_stats_by_leg,
+        split_gap_by_leg=split_gap_by_leg,
+        parity_gap_by_leg=parity_gap_by_leg,
+        leg_status=leg_status,
+    )
+end
 
-    split_gap = max(split_gap_solv, split_gap_vac)
-    runtime.active_bias_solv = extract_awh_data(awh_solv)
-    runtime.active_bias_vac = extract_awh_data(awh_vac)
+
+function collect_production_artifacts!(
+    cycle_cfg::ThermodynamicCycleConfig,
+    awh_by_leg::Dict{Symbol, Any},
+    sys_by_leg::Dict{Symbol, Any},
+    idxs_by_leg::Dict{Symbol, Any},
+    runtime::RuntimeState,
+    theta_active::Vector{FT},
+    param_names::Vector{String},
+    md_steps_prod::Int,
+    p0_energy_per_vol::FT,
+) where {FT <: AbstractFloat}
+    for leg in cycle_cfg.legs
+        runtime.active_bias[leg.name] = extract_awh_data(awh_by_leg[leg.name])
+    end
+    sync_runtime_aliases!(runtime)
 
     println("Running Production Runs (Extended Ensemble) [Readiness-Passed Dataset]...")
-    clear_awh_logger_histories!(awh_solv)
-    clear_awh_logger_histories!(awh_vac)
+    for leg in cycle_cfg.legs
+        clear_awh_logger_histories!(awh_by_leg[leg.name])
+    end
 
-    awh_solv_prod = AWHSimulation(awh_solv.state; num_md_steps=awh_solv.n_md_steps, update_freq=typemax(Int), well_tempered_factor=Inf)
-    awh_solv_prod.state.active_sys.loggers.awh_logger.should_log = true
-    simulate!(awh_solv_prod, md_steps_prod)
+    artifacts = LegArtifacts[]
+    for leg in cycle_cfg.legs
+        name = leg.name
+        awh_prod = AWHSimulation(
+            awh_by_leg[name].state;
+            num_md_steps=awh_by_leg[name].n_md_steps,
+            update_freq=typemax(Int),
+            well_tempered_factor=Inf,
+            coverage_type=:physical
+        )
+        awh_prod.state.active_sys.loggers.awh_logger.should_log = true
+        simulate!(awh_prod, md_steps_prod)
 
-    awh_vac_prod = AWHSimulation(awh_vac.state; num_md_steps=awh_vac.n_md_steps, update_freq=typemax(Int), well_tempered_factor=Inf)
-    awh_vac_prod.state.active_sys.loggers.awh_logger.should_log = true
-    simulate!(awh_vac_prod, md_steps_prod)
+        runtime.restart_cache[name] = capture_restart_state(awh_prod)
 
-    runtime.restart_cache_solv = capture_restart_state(awh_solv_prod)
-    runtime.restart_cache_vac  = capture_restart_state(awh_vac_prod)
-    @info "Captured restart state for next macro epoch: λ_solv=$(runtime.restart_cache_solv.active_idx) | λ_vac=$(runtime.restart_cache_vac.active_idx)"
+        logger_prod = get_production_logger(awh_prod, String(name))
+        neighbors = precompute_neighbors(logger_prod, awh_prod.state.active_sys)
+        u_ref, _ = evaluate_ensemble(
+            logger_prod,
+            neighbors,
+            awh_prod,
+            sys_by_leg[name],
+            theta_active,
+            param_names,
+            idxs_by_leg[name]...;
+            compute_gradients=false,
+        )
 
-    logger_solv_prod = get_production_logger(awh_solv_prod, "solvent")
-    logger_vac_prod  = get_production_logger(awh_vac_prod, "vacuum")
+        push!(artifacts, LegArtifacts(
+            name=name,
+            coefficient=FT(leg.coefficient),
+            include_pv=leg.include_pv,
+            p0_energy_per_vol=leg.include_pv ? p0_energy_per_vol : zero(FT),
+            awh_prod=awh_prod,
+            logger_prod=logger_prod,
+            neighbors=neighbors,
+            u_ref=u_ref,
+            sys_base=sys_by_leg[name],
+            active_bias=runtime.active_bias[name],
+            idxs=idxs_by_leg[name],
+        ))
+    end
 
-    nbrs_solv = precompute_neighbors(logger_solv_prod, awh_solv_prod.state.active_sys)
-    nbrs_vac  = precompute_neighbors(logger_vac_prod, awh_vac_prod.state.active_sys)
-
-    u_solv_ref, _ = evaluate_ensemble(
-        logger_solv_prod, nbrs_solv, awh_solv_prod, sys_solv,
-        theta_active, param_names, idxs_solv...; compute_gradients=false
-    )
-    u_vac_ref, _  = evaluate_ensemble(
-        logger_vac_prod, nbrs_vac, awh_vac_prod, sys_vac,
-        theta_active, param_names, idxs_vac...; compute_gradients=false
-    )
-    GC.gc()
-
-    opt_result = run_optimization_phase!(
-        phi_active,
-        theta_active,
-        runtime.active_bias_solv,
-        runtime.active_bias_vac,
-        logger_solv_prod,
-        logger_vac_prod,
-        nbrs_solv,
-        nbrs_vac,
-        awh_solv_prod,
-        awh_vac_prod,
-        sys_solv,
-        sys_vac,
-        u_solv_ref,
-        u_vac_ref,
-        param_names,
-        trainable_param_names,
-        trainable_param_indices,
-        trainable_position_map,
-        solute_param_indices,
-        solvent_param_indices,
-        idxs_solv,
-        idxs_vac,
-        theta_min,
-        theta_max,
-        phi_0,
-        beta_val,
-        dG_std_corr,
-        dG_exp,
-        P0_energy_per_vol,
-        opt_cfg,
-    )
-
-    @info "Macro $macro_epoch Residual Summary: Start = $(round(opt_result.macro_start_residual, digits=3)) | Best = $(round(opt_result.best_macro_residual, digits=3)) (Epoch $(opt_result.best_macro_epoch)) | End = $(round(opt_result.macro_end_residual, digits=3)) | Exit = $(opt_result.phase2_exit_reason) | AWH split-gap(max) = $(round(split_gap, digits=4)) kT | Parity gaps = (solv=$(round(parity_gap_solv, digits=4)), vac=$(round(parity_gap_vac, digits=4))) kT"
-
+    sync_runtime_aliases!(runtime)
+    return artifacts
 end
+
+
+function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), opt_cfg::OptimizationConfig=default_optimization_config())
+    apply_simulation_config!(sim_cfg)
+    FT = sim_cfg.FT
+    cycle_cfg = validate_cycle_config(resolved_cycle_config(sim_cfg))
+    runtime = RuntimeState()
+
+    dG_std_corr = compute_standard_state_correction(cycle_cfg, FT)
+
+    md_steps_budget = time_to_steps_floor(sim_cfg.awh_budget_time)
+    md_steps_block = time_to_steps_round(sim_cfg.awh_block_time)
+    md_steps_prod = time_to_steps_floor(sim_cfg.md_time_production)
+    md_steps_rewarm = min(
+        max(1, Int(round(md_steps_budget * opt_cfg.rewarm_fraction))),
+        md_steps_budget,
+    )
+
+    probe_steps_by_leg = Dict{Symbol, Int}()
+    for leg in cycle_cfg.legs
+        probe_steps_by_leg[leg.name] = time_to_steps_round(leg.probe_time)
+    end
+
+    T_coord = typeof(FT(1.0)u"nm")
+    T_vol = typeof(FT(1.0)u"nm^3")
+    T_en = typeof(FT(1.0)u"kJ * mol^-1")
+
+    pstate = initialize_parameter_state(sim_cfg, opt_cfg, cycle_cfg)
+    phi_active = pstate.phi_active
+    theta_active = pstate.theta_active
+    param_names = pstate.param_names
+    trainable_param_names = pstate.trainable_param_names
+    trainable_param_indices = pstate.trainable_param_indices
+    trainable_position_map = pstate.trainable_position_map
+    solute_param_indices = pstate.solute_param_indices
+    solvent_param_indices = pstate.solvent_param_indices
+    theta_min = pstate.theta_min
+    theta_max = pstate.theta_max
+    phi_0 = pstate.phi_0
+    idxs_by_leg = pstate.idxs_by_leg
+
+    for macro_epoch in 1:opt_cfg.max_macro_epochs
+        println("\n>>> STARTING MACRO EPOCH $macro_epoch <<<")
+
+        awh_by_leg, sys_by_leg = setup_macro_legs(
+            cycle_cfg,
+            sim_cfg,
+            runtime,
+            theta_active,
+            idxs_by_leg,
+            T_coord,
+            T_vol,
+            T_en,
+            macro_epoch,
+            opt_cfg.restart_rmsd_tol_nm,
+        )
+
+        first_leg = first(cycle_cfg.legs)
+        e_unit = sys_by_leg[first_leg.name].energy_units
+        beta_val = FT(1.0 / ustrip(uconvert(e_unit, Unitful.R * T0)))
+        p0_energy_per_vol = FT(ustrip(uconvert(e_unit, P0 * FT(1.0)u"nm^3" * Unitful.Na)))
+
+        dG_exp_physical = FT(cycle_cfg.target_dG_kcal_mol) * FT(4.184)
+        dG_exp = dG_exp_physical * beta_val
+
+        readiness_result = run_readiness_loop!(
+            cycle_cfg,
+            awh_by_leg,
+            sys_by_leg,
+            idxs_by_leg,
+            runtime,
+            theta_active,
+            param_names,
+            md_steps_budget,
+            md_steps_block,
+            md_steps_rewarm,
+            probe_steps_by_leg,
+            sim_cfg.awh_budget_time,
+            opt_cfg.awh_convergence_tol,
+            opt_cfg.awh_min_linear_neff,
+            opt_cfg.awh_split_tol_kT,
+            opt_cfg.awh_parity_tol_kT,
+            opt_cfg.awh_tail_lag,
+            opt_cfg.awh_min_round_trips,
+            opt_cfg.awh_endpoint_min_fraction,
+            opt_cfg.awh_stageA_stable_blocks,
+            beta_val,
+            p0_energy_per_vol,
+        )
+
+        if !readiness_result.awh_ready
+            stageA_summary = join(
+                [
+                    "$(leg.name)=df:$(round(readiness_result.stageA_stats_by_leg[leg.name].df_mean, digits=6)) neff:$(round(readiness_result.stageA_stats_by_leg[leg.name].linear_neff, digits=1)) rt:$(readiness_result.stageA_stats_by_leg[leg.name].round_trips)"
+                    for leg in cycle_cfg.legs
+                ],
+                " | ",
+            )
+            parity_summary = join(
+                [
+                    "$(leg.name)=$(round(readiness_result.parity_gap_by_leg[leg.name], digits=4))"
+                    for leg in cycle_cfg.legs
+                ],
+                ", ",
+            )
+            status_summary = join(
+                ["$(leg.name)=$(readiness_result.leg_status[leg.name])" for leg in cycle_cfg.legs],
+                " ",
+            )
+            @info "Macro $macro_epoch skipped: strict AWH readiness failed ($(readiness_result.awh_readiness_reason)). Status=[$status_summary] | StageA=[$stageA_summary] | Parity gaps=[$parity_summary] kT"
+            continue
+        end
+
+        leg_artifacts = collect_production_artifacts!(
+            cycle_cfg,
+            awh_by_leg,
+            sys_by_leg,
+            idxs_by_leg,
+            runtime,
+            theta_active,
+            param_names,
+            md_steps_prod,
+            p0_energy_per_vol,
+        )
+
+        GC.gc()
+
+        opt_result = run_optimization_phase!(
+            phi_active,
+            theta_active,
+            leg_artifacts,
+            param_names,
+            trainable_param_names,
+            trainable_param_indices,
+            trainable_position_map,
+            solute_param_indices,
+            solvent_param_indices,
+            theta_min,
+            theta_max,
+            phi_0,
+            beta_val,
+            dG_std_corr,
+            dG_exp,
+            opt_cfg,
+        )
+
+        split_gap_max = maximum(values(readiness_result.split_gap_by_leg))
+        parity_summary = join(
+            [
+                "$(leg.name)=$(round(readiness_result.parity_gap_by_leg[leg.name], digits=4))"
+                for leg in cycle_cfg.legs
+            ],
+            ", ",
+        )
+
+        @info "Macro $macro_epoch Residual Summary: Start = $(round(opt_result.macro_start_residual, digits=3)) | Best = $(round(opt_result.best_macro_residual, digits=3)) (Epoch $(opt_result.best_macro_epoch)) | End = $(round(opt_result.macro_end_residual, digits=3)) | Exit = $(opt_result.phase2_exit_reason) | AWH split-gap(max) = $(round(split_gap_max, digits=4)) kT | Parity gaps = [$parity_summary] kT"
+    end
 
     runtime.phi_active = phi_active
     runtime.theta_active = theta_active
+    sync_runtime_aliases!(runtime)
     return runtime
 end
