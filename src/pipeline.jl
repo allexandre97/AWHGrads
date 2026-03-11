@@ -346,7 +346,7 @@ function run_readiness_loop!(
         for leg in cycle_cfg.legs
             name = leg.name
             statsA = stageA_stats_by_leg[name]
-            @info "  Stage A ($(name)): df=$(round(statsA.df_mean, digits=6)) (ok=$(statsA.df_ready)) | neff=$(round(statsA.linear_neff, digits=1)) (ok=$(statsA.neff_ready)) | rt=$(statsA.round_trips) (ok=$(statsA.round_trip_ready)) | endpt=($(round(statsA.endpoint_low, digits=3)), $(round(statsA.endpoint_high, digits=3))) (ok=$(statsA.endpoint_ready)) | streak=$(stageA_streak[name])"
+            @info "  Stage A ($(name)): df=$(round(statsA.df_mean, digits=6)) (ok=$(statsA.df_ready)) | neff=$(round(statsA.linear_neff, digits=1)) (ok=$(statsA.neff_ready)) | rt=$(statsA.round_trips) (ok=$(statsA.round_trip_ready)) | endpt=($(round(statsA.endpoint_low, digits=3)), $(round(statsA.endpoint_high, digits=3))) (ok=$(statsA.endpoint_ready)) | n_hist=$(statsA.n_hist) | streak=$(stageA_streak[name])"
 
             statsB = stageB_stats_by_leg[name]
             if statsB.n_frames > 0

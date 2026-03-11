@@ -53,17 +53,39 @@ function clear_awh_logger_histories!(awh_sim::AWHSimulation)
     return nothing
 end
 
-function get_awh_active_idx_history(awh_sim::AWHSimulation)
-    logger_main = awh_sim.state.active_sys.loggers.awh_logger
-    if !isempty(logger_main.active_idx_history)
-        return copy(logger_main.active_idx_history)
+function get_awh_active_idx_history(awh_sim)
+    if !hasproperty(awh_sim, :state)
+        return Int[]
     end
+
+    state = awh_sim.state
+
+    # Prefer Molly's lightweight AWH stats index stream for Stage A readiness.
+    stats_idx_field = Symbol("active_\u03bb")
+    if hasproperty(state, :stats) && hasproperty(state.stats, stats_idx_field)
+        idx_history_stats = Int.(getproperty(state.stats, stats_idx_field))
+        if !isempty(idx_history_stats)
+            return idx_history_stats
+        end
+    end
+
+    # Fallback to explicit logger histories.
+    if hasproperty(state, :active_sys) &&
+       hasproperty(state.active_sys, :loggers) &&
+       hasproperty(state.active_sys.loggers, :awh_logger)
+        logger_main = state.active_sys.loggers.awh_logger
+        if !isempty(logger_main.active_idx_history)
+            return copy(logger_main.active_idx_history)
+        end
+    end
+
     idx_history = Int[]
-    for state_loggers in awh_sim.state.state_loggers
-        if hasproperty(state_loggers, :awh_logger)
-            append!(idx_history, state_loggers.awh_logger.active_idx_history)
+    if hasproperty(state, :state_loggers)
+        for state_loggers in state.state_loggers
+            if hasproperty(state_loggers, :awh_logger)
+                append!(idx_history, state_loggers.awh_logger.active_idx_history)
+            end
         end
     end
     return idx_history
 end
-
