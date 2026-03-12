@@ -4,30 +4,11 @@
 #
 base_sim = AWHGrads.default_simulation_config()
 base_opt = AWHGrads.default_optimization_config()
-lambda_schedule = Float32.(range(1.0, stop=0.0, length=21))
 
-custom_cycle = AWHGrads.ThermodynamicCycleConfig(
-    legs=[
-        AWHGrads.ThermodynamicLegConfig(
-            name=:solvent,
-            pdb="ethanol_solv.pdb",
-            coefficient=1.0,
-            is_vacuum=false,
-            include_pv=true,
-            probe_time=base_sim.awh_probe_time_solv,
-        ),
-        AWHGrads.ThermodynamicLegConfig(
-            name=:vacuum,
-            pdb="ethanol_vac.pdb",
-            coefficient=-1.0,
-            is_vacuum=true,
-            include_pv=false,
-            probe_time=base_sim.awh_probe_time_vac,
-        ),
-    ],
-    include_standard_state_correction=true,
-    target_dG_kcal_mol=-5.01,
-)
+# Vacuum keeps the legacy global λ schedule. The solvent leg uses the staged
+# default path defined on the cycle itself.
+lambda_schedule = Float32.(range(1.0, stop=0.0, length=21))
+custom_cycle = AWHGrads.default_cycle_config(; target_dG_kcal_mol=-5.01, FT=base_sim.FT)
 
 sim_cfg = AWHGrads.simulation_config_with(
     base_sim;

@@ -13,31 +13,10 @@ include(joinpath(@__DIR__, "..", "src", "AWHGrads.jl"))
 base_sim = AWHGrads.default_simulation_config()
 base_opt = AWHGrads.default_optimization_config()
 
-# Explicit lambda window schedule (same as current default: 21 windows from 1.0 to 0.0).
+# Explicit global lambda window schedule used by the vacuum leg and as the
+# fallback for any leg that does not provide its own schedule.
 lambda_schedule = Float32.(range(1.0, stop=0.0, length=21))
-
-cycle_cfg = AWHGrads.ThermodynamicCycleConfig(
-    legs=[
-        AWHGrads.ThermodynamicLegConfig(
-            name=:solvent,
-            pdb="ethanol_solv.pdb",
-            coefficient=1.0,
-            is_vacuum=false,
-            include_pv=true,
-            probe_time=base_sim.awh_probe_time_solv,
-        ),
-        AWHGrads.ThermodynamicLegConfig(
-            name=:vacuum,
-            pdb="ethanol_vac.pdb",
-            coefficient=-1.0,
-            is_vacuum=true,
-            include_pv=false,
-            probe_time=base_sim.awh_probe_time_vac,
-        ),
-    ],
-    include_standard_state_correction=true,
-    target_dG_kcal_mol=base_sim.dG_exp_kcal_mol,
-)
+cycle_cfg = AWHGrads.default_cycle_config(; target_dG_kcal_mol=base_sim.dG_exp_kcal_mol, FT=base_sim.FT)
 
 sim_cfg = AWHGrads.simulation_config_with(
     base_sim;

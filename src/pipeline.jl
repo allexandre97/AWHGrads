@@ -175,6 +175,7 @@ Create or warm-start the AWH simulations for the current macro epoch.
 function setup_macro_legs(
     cycle_cfg::ThermodynamicCycleConfig,
     sim_cfg::SimulationConfig,
+    state_schedules_by_leg::Dict{Symbol, <:ResolvedLegStateSchedule},
     runtime::RuntimeState,
     theta_active::Vector{FT},
     idxs_by_leg::Dict{Symbol, Any},
@@ -193,14 +194,17 @@ function setup_macro_legs(
     for leg in cycle_cfg.legs
         warm_start = macro_epoch > 1 && haskey(runtime.restart_cache, leg.name) && !isnothing(runtime.restart_cache[leg.name])
         restart_state = warm_start ? runtime.restart_cache[leg.name] : nothing
+        state_schedule = state_schedules_by_leg[leg.name]
 
         logger = AWHEnsembleLogger(T_coord, T_vol, T_en, sim_cfg.production_log_interval)
         awh_leg, sys_leg = setup_alchemical_awh(
             leg.pdb,
             sim_cfg.solute_idx;
-            lambda_values=sim_cfg.lambda_schedule,
+            coulomb_lambda_values=state_schedule.coulomb,
+            lj_lambda_values=state_schedule.lj,
             awh_control=sim_cfg.awh_control,
             is_vacuum=leg.is_vacuum,
+            ensemble=leg.ensemble,
             logger=logger,
             injected_bias=get(runtime.active_bias, leg.name, nothing),
             optimized_params=theta_active,
@@ -246,6 +250,7 @@ Stage B probe and freeze, or one of them exhausts its AWH budget.
 """
 function run_readiness_loop!(
     cycle_cfg::ThermodynamicCycleConfig,
+    state_schedules_by_leg::Dict{Symbol, <:ResolvedLegStateSchedule},
     awh_by_leg::Dict{Symbol, Any},
     sys_by_leg::Dict{Symbol, Any},
     idxs_by_leg::Dict{Symbol, Any},
@@ -275,7 +280,7 @@ function run_readiness_loop!(
     beta_val::FT,
     p0_energy_per_vol::FT,
 ) where {FT <: AbstractFloat}
-    stageA_default = StageAStats(df_mean=FT(Inf), lambda_ess=one(FT), linear_neff=zero(FT))
+    stageA_default = StageAStats(df_mean=FT(Inf), lambda_ess=one(FT), tau_int_est=zero(FT), linear_neff=zero(FT))
     stageB_default = StageBStats(split_gap=FT(Inf), parity_gap=FT(Inf), dG_half_1=FT(NaN), dG_half_2=FT(NaN))
 
     stageA_stats_by_leg = Dict{Symbol, StageAStats}(leg.name => stageA_default for leg in cycle_cfg.legs)
@@ -319,6 +324,7 @@ function run_readiness_loop!(
             end
 
             awh_leg = awh_by_leg[name]
+            state_schedule = state_schedules_by_leg[name]
             remaining_steps = md_steps_budget - spent_steps[name]
             if remaining_steps <= 0
                 leg_status[name] = :budget_exhausted
@@ -341,7 +347,8 @@ function run_readiness_loop!(
                 min_linear_neff=awh_min_linear_neff,
                 min_round_trips=awh_min_round_trips,
                 endpoint_min_fraction=awh_endpoint_min_fraction,
-                high_idx=num_lambda_states,
+                low_idx=state_schedule.coupled_state_idx,
+                high_idx=state_schedule.decoupled_state_idx,
             ))
 
             if stageA_stats_by_leg[name].ready
@@ -363,7 +370,8 @@ function run_readiness_loop!(
                         theta_active,
                         param_names,
                         idxs_by_leg[name],
-                        num_lambda_states,
+                        state_schedule.coupled_state_idx,
+                        state_schedule.decoupled_state_idx,
                         beta_val,
                         awh_split_tol_kT,
                         awh_parity_tol_kT;
@@ -416,7 +424,7 @@ function run_readiness_loop!(
         for leg in cycle_cfg.legs
             name = leg.name
             statsA = stageA_stats_by_leg[name]
-            @info "  Stage A ($(name)): df=$(round(statsA.df_mean, digits=6)) (ok=$(statsA.df_ready)) | ess=$(round(statsA.lambda_ess, digits=1)) (ok=$(statsA.lambda_ess_ready)) | rt=$(statsA.round_trips) (ok=$(statsA.round_trip_ready)) | endpt=($(round(statsA.endpoint_low, digits=3)), $(round(statsA.endpoint_high, digits=3))) (ok=$(statsA.endpoint_ready)) | n_hist=$(statsA.n_hist) | streak=$(stageA_streak[name]) | cooldown=$(stageB_cooldown[name])"
+            @info "  Stage A ($(name)): df=$(round(statsA.df_mean, digits=6)) (ok=$(statsA.df_ready)) | ess=$(round(statsA.lambda_ess, digits=1)) (ok=$(statsA.lambda_ess_ready)) | lin_neff=$(round(statsA.linear_neff, digits=1)) (ok=$(statsA.neff_ready)) | tau_int_est=$(round(statsA.tau_int_est, digits=2)) | rt=$(statsA.round_trips) (ok=$(statsA.round_trip_ready)) | endpt=($(round(statsA.endpoint_low, digits=3)), $(round(statsA.endpoint_high, digits=3))) (ok=$(statsA.endpoint_ready)) | n_hist=$(statsA.n_hist) | streak=$(stageA_streak[name]) | cooldown=$(stageB_cooldown[name])"
 
             statsB = stageB_stats_by_leg[name]
             if statsB.n_frames > 0
@@ -461,6 +469,7 @@ the optimization phase.
 """
 function collect_production_artifacts!(
     cycle_cfg::ThermodynamicCycleConfig,
+    state_schedules_by_leg::Dict{Symbol, <:ResolvedLegStateSchedule},
     awh_by_leg::Dict{Symbol, Any},
     sys_by_leg::Dict{Symbol, Any},
     idxs_by_leg::Dict{Symbol, Any},
@@ -514,6 +523,9 @@ function collect_production_artifacts!(
             coefficient=FT(leg.coefficient),
             include_pv=leg.include_pv,
             p0_energy_per_vol=leg.include_pv ? p0_energy_per_vol : zero(FT),
+            n_states=length(state_schedules_by_leg[name].coulomb),
+            coupled_state_idx=state_schedules_by_leg[name].coupled_state_idx,
+            decoupled_state_idx=state_schedules_by_leg[name].decoupled_state_idx,
             awh_prod=awh_prod,
             logger_prod=logger_prod,
             neighbors=neighbors,
@@ -545,7 +557,15 @@ and restart snapshots from the last macro epoch.
 function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), opt_cfg::OptimizationConfig=default_optimization_config())
     apply_simulation_config!(sim_cfg)
     FT = sim_cfg.FT
-    cycle_cfg = validate_cycle_config(resolved_cycle_config(sim_cfg))
+    cycle_cfg = validate_cycle_config(
+        resolved_cycle_config(sim_cfg);
+        default_lambda_schedule=sim_cfg.lambda_schedule,
+        FT=FT,
+    )
+    state_schedules_by_leg = Dict{Symbol, ResolvedLegStateSchedule{FT}}(
+        leg.name => resolve_leg_state_schedule(leg, sim_cfg.lambda_schedule, FT)
+        for leg in cycle_cfg.legs
+    )
     runtime = RuntimeState()
 
     dG_std_corr = compute_standard_state_correction(cycle_cfg, FT)
@@ -599,6 +619,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
         awh_by_leg, sys_by_leg = setup_macro_legs(
             cycle_cfg,
             sim_cfg,
+            state_schedules_by_leg,
             runtime,
             theta_active,
             idxs_by_leg,
@@ -619,6 +640,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
 
         readiness_result = run_readiness_loop!(
             cycle_cfg,
+            state_schedules_by_leg,
             awh_by_leg,
             sys_by_leg,
             idxs_by_leg,
@@ -674,6 +696,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
 
         leg_artifacts = collect_production_artifacts!(
             cycle_cfg,
+            state_schedules_by_leg,
             awh_by_leg,
             sys_by_leg,
             idxs_by_leg,

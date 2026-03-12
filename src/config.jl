@@ -1,10 +1,26 @@
 """
-    default_cycle_config(; target_dG_kcal_mol=-5.01)
+    default_solvent_leg_schedules(FT=Float32)
+
+Return the staged solvent-leg Coulomb/LJ schedules used by the default
+hydration cycle.
+"""
+function default_solvent_leg_schedules(::Type{FT}=Float32) where {FT <: AbstractFloat}
+    charge_stage = collect(FT.(range(one(FT), stop=zero(FT), length=11)))
+    lj_stage = reverse(FT.(collect(range(zero(FT), stop=one(FT), length=21)) .^ 2))[2:end]
+    return (
+        coulomb_lambda_schedule = vcat(charge_stage, zeros(FT, length(lj_stage))),
+        lj_lambda_schedule = vcat(ones(FT, length(charge_stage)), lj_stage),
+    )
+end
+
+"""
+    default_cycle_config(; target_dG_kcal_mol=-5.01, FT=Float32)
 
 Return the built-in two-leg ethanol hydration cycle used by the example
 scripts.
 """
-function default_cycle_config(; target_dG_kcal_mol::Real=-5.01)
+function default_cycle_config(; target_dG_kcal_mol::Real=-5.01, FT::DataType=Float32)
+    solvent_schedule = default_solvent_leg_schedules(FT)
     legs = [
         ThermodynamicLegConfig(
             name=:solvent,
@@ -12,7 +28,10 @@ function default_cycle_config(; target_dG_kcal_mol::Real=-5.01)
             coefficient=1.0,
             is_vacuum=false,
             include_pv=true,
-            probe_time=Float32(1.5)u"ns",
+            probe_time=FT(1.5)u"ns",
+            coulomb_lambda_schedule=solvent_schedule.coulomb_lambda_schedule,
+            lj_lambda_schedule=solvent_schedule.lj_lambda_schedule,
+            ensemble=:npt,
         ),
         ThermodynamicLegConfig(
             name=:vacuum,
@@ -20,7 +39,7 @@ function default_cycle_config(; target_dG_kcal_mol::Real=-5.01)
             coefficient=-1.0,
             is_vacuum=true,
             include_pv=false,
-            probe_time=Float32(0.25)u"ns",
+            probe_time=FT(0.25)u"ns",
         ),
     ]
     return ThermodynamicCycleConfig(
@@ -115,6 +134,7 @@ function resolved_cycle_config(sim_cfg::SimulationConfig)
         return sim_cfg.cycle
     end
 
+    solvent_schedule = default_solvent_leg_schedules(sim_cfg.FT)
     return ThermodynamicCycleConfig(
         legs=[
             ThermodynamicLegConfig(
@@ -124,6 +144,9 @@ function resolved_cycle_config(sim_cfg::SimulationConfig)
                 is_vacuum=false,
                 include_pv=true,
                 probe_time=sim_cfg.awh_probe_time_solv,
+                coulomb_lambda_schedule=solvent_schedule.coulomb_lambda_schedule,
+                lj_lambda_schedule=solvent_schedule.lj_lambda_schedule,
+                ensemble=:npt,
             ),
             ThermodynamicLegConfig(
                 name=:vacuum,
@@ -139,12 +162,121 @@ function resolved_cycle_config(sim_cfg::SimulationConfig)
     )
 end
 
+function resolve_force_field_path(xml_file::String, ff_dir::AbstractString)
+    if isabspath(xml_file)
+        return xml_file
+    end
+
+    repo_root = normpath(joinpath(@__DIR__, ".."))
+    default_ff_dir = joinpath(dirname(pathof(Molly)), "..", "data", "force_fields")
+    candidates = unique([
+        joinpath(ff_dir, xml_file),
+        joinpath(default_ff_dir, xml_file),
+        joinpath(repo_root, xml_file),
+        joinpath(repo_root, "data", "force_fields", xml_file),
+        joinpath(repo_root, "..", "AWH", xml_file),
+    ])
+    for candidate in candidates
+        if isfile(candidate)
+            return candidate
+        end
+    end
+    return first(candidates)
+end
+
+function _validate_leg_ensemble(leg::ThermodynamicLegConfig)
+    if !(leg.ensemble in (:npt, :nvt))
+        throw(ArgumentError("Leg $(leg.name) has unsupported ensemble=$(leg.ensemble). Supported values are :npt and :nvt."))
+    end
+    if !leg.is_vacuum && leg.ensemble == :nvt && leg.include_pv
+        throw(ArgumentError("Leg $(leg.name) cannot set include_pv=true when ensemble=:nvt."))
+    end
+    return nothing
+end
+
+function _validate_leg_schedule_values(values::Vector{FT}, label::String, leg_name::Symbol) where {FT <: AbstractFloat}
+    if length(values) < 2
+        throw(ArgumentError("Leg $(leg_name) $(label) must contain at least two states."))
+    end
+    if any(v -> !isfinite(v), values)
+        throw(ArgumentError("Leg $(leg_name) $(label) contains non-finite values."))
+    end
+    if any(v -> v < zero(FT) || v > one(FT), values)
+        throw(ArgumentError("Leg $(leg_name) $(label) must lie in [0, 1]."))
+    end
+    return nothing
+end
+
+"""
+    resolve_leg_state_schedule(leg, default_lambda_schedule, FT=Float32)
+
+Resolve a leg's runtime Coulomb/LJ schedules, falling back to the global
+`default_lambda_schedule` when the leg does not override them.
+"""
+function resolve_leg_state_schedule(
+    leg::ThermodynamicLegConfig,
+    default_lambda_schedule,
+    ::Type{FT}=Float32,
+) where {FT <: AbstractFloat}
+    _validate_leg_ensemble(leg)
+    validate_lambda_schedule(default_lambda_schedule)
+
+    if isnothing(leg.coulomb_lambda_schedule) != isnothing(leg.lj_lambda_schedule)
+        throw(ArgumentError("Leg $(leg.name) must set both coulomb_lambda_schedule and lj_lambda_schedule together, or leave both as nothing."))
+    end
+
+    if isnothing(leg.coulomb_lambda_schedule)
+        coulomb_values = FT.(collect(default_lambda_schedule))
+        lj_values = FT.(collect(default_lambda_schedule))
+    else
+        coulomb_values = FT.(collect(leg.coulomb_lambda_schedule))
+        lj_values = FT.(collect(leg.lj_lambda_schedule))
+    end
+
+    if length(coulomb_values) != length(lj_values)
+        throw(ArgumentError("Leg $(leg.name) Coulomb/LJ schedules must have equal length; got $(length(coulomb_values)) and $(length(lj_values))."))
+    end
+
+    _validate_leg_schedule_values(coulomb_values, "coulomb_lambda_schedule", leg.name)
+    _validate_leg_schedule_values(lj_values, "lj_lambda_schedule", leg.name)
+
+    atol = sqrt(eps(FT))
+    coupled_candidates = [
+        idx for idx in eachindex(coulomb_values)
+        if isapprox(coulomb_values[idx], one(FT); atol=atol, rtol=atol) &&
+           isapprox(lj_values[idx], one(FT); atol=atol, rtol=atol)
+    ]
+    decoupled_candidates = [
+        idx for idx in eachindex(coulomb_values)
+        if isapprox(coulomb_values[idx], zero(FT); atol=atol, rtol=atol) &&
+           isapprox(lj_values[idx], zero(FT); atol=atol, rtol=atol)
+    ]
+
+    if length(coupled_candidates) != 1
+        throw(ArgumentError("Leg $(leg.name) must contain exactly one fully coupled state with Coulomb=1 and LJ=1; found $(length(coupled_candidates))."))
+    end
+    if length(decoupled_candidates) != 1
+        throw(ArgumentError("Leg $(leg.name) must contain exactly one fully decoupled state with Coulomb=0 and LJ=0; found $(length(decoupled_candidates))."))
+    end
+
+    return ResolvedLegStateSchedule{FT}(
+        coulomb_values,
+        lj_values,
+        only(coupled_candidates),
+        only(decoupled_candidates),
+    )
+end
+
 """
     validate_cycle_config(cycle_cfg)
 
 Validate a thermodynamic cycle and return it unchanged when it is well-formed.
 """
-function validate_cycle_config(cycle_cfg::ThermodynamicCycleConfig)
+function validate_cycle_config(
+    cycle_cfg::ThermodynamicCycleConfig;
+    default_lambda_schedule=nothing,
+    FT::DataType=Float32,
+)
     if isempty(cycle_cfg.legs)
         throw(ArgumentError("Thermodynamic cycle must define at least one leg."))
     end
@@ -155,6 +287,10 @@ function validate_cycle_config(cycle_cfg::ThermodynamicCycleConfig)
             throw(ArgumentError("Thermodynamic cycle contains duplicate leg name: $(leg.name)."))
         end
         push!(seen, leg.name)
+        _validate_leg_ensemble(leg)
+        if !isnothing(default_lambda_schedule)
+            resolve_leg_state_schedule(leg, default_lambda_schedule, FT)
+        end
     end
 
     return cycle_cfg
@@ -193,11 +329,7 @@ function resolve_force_field_paths(sim_cfg::SimulationConfig)
 
     paths = String[]
     for xml_file in ff_cfg.xml_files
-        if isabspath(xml_file)
-            push!(paths, xml_file)
-        else
-            push!(paths, joinpath(ff_dir, xml_file))
-        end
+        push!(paths, resolve_force_field_path(xml_file, ff_dir))
     end
 
     return paths

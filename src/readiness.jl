@@ -145,8 +145,8 @@ end
 
 """
     estimate_leg_dg_from_reference(energies, active_lambda_idx, awh_bias,
-                                   num_lambda_states, beta; volumes=FT[],
-                                   P0_energy_per_vol=zero(FT))
+                                   coupled_state_idx, decoupled_state_idx, beta;
+                                   volumes=FT[], P0_energy_per_vol=zero(FT))
 
 Estimate a leg free energy as the difference between the two endpoint free
 energies reconstructed from the reference ensemble.
@@ -155,7 +155,8 @@ function estimate_leg_dg_from_reference(
     energies::Matrix{FT},
     active_lambda_idx::Vector{Int},
     awh_bias::Vector{FT},
-    num_lambda_states::Int,
+    coupled_state_idx::Int,
+    decoupled_state_idx::Int,
     beta::FT;
     volumes::Vector{FT}=FT[],
     P0_energy_per_vol::FT=zero(FT)
@@ -163,11 +164,11 @@ function estimate_leg_dg_from_reference(
     dummy_names = String[]
     dummy_grads = Dict{String, Matrix{FT}}()
     _, F_1 = compute_global_endpoint_gradients(
-        dummy_names, dummy_grads, energies, energies, active_lambda_idx, 1,
+        dummy_names, dummy_grads, energies, energies, active_lambda_idx, coupled_state_idx,
         beta, awh_bias, volumes, P0_energy_per_vol; compute_gradients=false
     )
     _, F_0 = compute_global_endpoint_gradients(
-        dummy_names, dummy_grads, energies, energies, active_lambda_idx, num_lambda_states,
+        dummy_names, dummy_grads, energies, energies, active_lambda_idx, decoupled_state_idx,
         beta, awh_bias, volumes, P0_energy_per_vol; compute_gradients=false
     )
     return F_1 - F_0
@@ -348,6 +349,7 @@ function evaluate_stage_a_readiness(
     # a flat bias alone is not enough if λ exploration is still poor.
     idx_history = get_awh_active_idx_history(awh_sim)
     lambda_ess = estimate_lambda_history_ess(idx_history, FT)
+    tau_int_est = isempty(idx_history) ? zero(FT) : FT(length(idx_history)) / lambda_ess
     lambda_ess_ready = lambda_ess >= FT(min_lambda_ess)
     round_trips = count_full_round_trips(idx_history, low_idx, high_idx)
     round_trip_ready = round_trips >= min_round_trips
@@ -361,6 +363,7 @@ function evaluate_stage_a_readiness(
         df_ready = df_ready,
         df_mean = df_mean,
         lambda_ess = lambda_ess,
+        tau_int_est = tau_int_est,
         lambda_ess_ready = lambda_ess_ready,
         linear_neff = linear_neff,
         neff_ready = neff_ready,
@@ -376,7 +379,7 @@ end
 
 """
     run_stage_b_probe(awh_sim, sys_base, theta_params, param_names, idxs,
-                      num_lambda_states, beta, awh_split_tol_kT,
+                      coupled_state_idx, decoupled_state_idx, beta, awh_split_tol_kT,
                       awh_parity_tol_kT; kwargs...)
 
 Clone the current leg, run a short probe trajectory, and test whether the probe
@@ -388,7 +391,8 @@ function run_stage_b_probe(
     theta_params::Vector{FT},
     param_names::Vector{String},
     idxs,
-    num_lambda_states::Int,
+    coupled_state_idx::Int,
+    decoupled_state_idx::Int,
     beta::FT,
     awh_split_tol_kT::FT,
     awh_parity_tol_kT::FT;
@@ -513,7 +517,8 @@ function run_stage_b_probe(
             u_probe_ref[half_1, :],
             logger_probe.active_idx_history[half_1],
             awh_bias,
-            num_lambda_states,
+            coupled_state_idx,
+            decoupled_state_idx,
             beta;
             volumes=include_pv ? volumes_probe[half_1] : FT[],
             P0_energy_per_vol=include_pv ? P0_energy_per_vol : zero(FT)
@@ -522,7 +527,8 @@ function run_stage_b_probe(
             u_probe_ref[half_2, :],
             logger_probe.active_idx_history[half_2],
             awh_bias,
-            num_lambda_states,
+            coupled_state_idx,
+            decoupled_state_idx,
             beta;
             volumes=include_pv ? volumes_probe[half_2] : FT[],
             P0_energy_per_vol=include_pv ? P0_energy_per_vol : zero(FT)
@@ -534,7 +540,7 @@ function run_stage_b_probe(
         F_mbar_profile = include_pv ?
             compute_full_mbar_profile(u_probe_ref, u_probe_ref, awh_bias, beta; volumes=volumes_probe, P0_energy_per_vol=P0_energy_per_vol) :
             compute_full_mbar_profile(u_probe_ref, u_probe_ref, awh_bias, beta)
-        parity_gap = compute_parity_gap(F_mbar_profile, awh_bias; ref_idx=1)
+        parity_gap = compute_parity_gap(F_mbar_profile, awh_bias; ref_idx=coupled_state_idx)
         parity_ready = parity_gap <= awh_parity_tol_kT
 
         return (

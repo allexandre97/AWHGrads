@@ -46,6 +46,22 @@ Base.@kwdef struct ThermodynamicLegConfig
     is_vacuum::Bool = false
     include_pv::Bool = false
     probe_time = Float32(0.5)u"ns"
+    coulomb_lambda_schedule::Union{Nothing, Vector{<:Real}} = nothing
+    lj_lambda_schedule::Union{Nothing, Vector{<:Real}} = nothing
+    ensemble::Symbol = :npt
+end
+
+"""
+    ResolvedLegStateSchedule
+
+Concrete per-leg alchemical state schedule used at runtime after applying
+fallbacks and validation.
+"""
+struct ResolvedLegStateSchedule{FT <: AbstractFloat}
+    coulomb::Vector{FT}
+    lj::Vector{FT}
+    coupled_state_idx::Int
+    decoupled_state_idx::Int
 end
 
 """
@@ -202,6 +218,9 @@ Base.@kwdef mutable struct LegArtifacts
     coefficient::Any = 0.0
     include_pv::Bool = false
     p0_energy_per_vol::Any = 0.0
+    n_states::Int = 0
+    coupled_state_idx::Int = 1
+    decoupled_state_idx::Int = 1
 
     awh_prod::Any = nothing
     logger_prod::Any = nothing
@@ -223,6 +242,7 @@ Base.@kwdef struct StageAStats
     df_ready::Bool = false
     df_mean::Any = Inf
     lambda_ess::Any = 1.0
+    tau_int_est::Any = 0.0
     lambda_ess_ready::Bool = false
     linear_neff::Any = 0.0
     neff_ready::Bool = false
@@ -239,6 +259,7 @@ StageAStats(nt::NamedTuple) = StageAStats(
     df_ready = nt.df_ready,
     df_mean = nt.df_mean,
     lambda_ess = nt.lambda_ess,
+    tau_int_est = nt.tau_int_est,
     lambda_ess_ready = nt.lambda_ess_ready,
     linear_neff = nt.linear_neff,
     neff_ready = nt.neff_ready,

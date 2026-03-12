@@ -1,4 +1,5 @@
 using Random
+using Molly
 
 @testset "readiness helpers" begin
     a, b = AWHGrads.split_half_ranges(10)
@@ -146,6 +147,7 @@ end
     @test high_ess_result.ready
     @test high_ess_result.lambda_ess_ready
     @test high_ess_result.lambda_ess >= 300
+    @test high_ess_result.tau_int_est ≈ length(high_ess_history) / high_ess_result.lambda_ess
     @test !high_ess_result.neff_ready
 
     low_ess_history = vcat(fill(1, 250), fill(4, 250), fill(1, 250), fill(4, 250), fill(1, 250))
@@ -162,7 +164,100 @@ end
     @test low_ess_result.df_ready
     @test low_ess_result.neff_ready
     @test !low_ess_result.lambda_ess_ready
+    @test low_ess_result.tau_int_est ≈ length(low_ess_history) / low_ess_result.lambda_ess
     @test !low_ess_result.ready
+end
+
+@testset "leg schedule validation and defaults" begin
+    fallback_schedule = Float32.(range(1.0, stop=0.0, length=21))
+    fallback_leg = AWHGrads.ThermodynamicLegConfig(name=:solvent, pdb="ethanol_solv.pdb")
+    fallback_resolved = AWHGrads.resolve_leg_state_schedule(fallback_leg, fallback_schedule, Float32)
+    @test fallback_resolved.coulomb == fallback_schedule
+    @test fallback_resolved.lj == fallback_schedule
+    @test fallback_resolved.coupled_state_idx == 1
+    @test fallback_resolved.decoupled_state_idx == 21
+
+    missing_pair_leg = AWHGrads.ThermodynamicLegConfig(
+        name=:solvent,
+        pdb="ethanol_solv.pdb",
+        coulomb_lambda_schedule=[1.0, 0.0],
+    )
+    @test_throws ArgumentError AWHGrads.resolve_leg_state_schedule(missing_pair_leg, fallback_schedule, Float32)
+
+    length_mismatch_leg = AWHGrads.ThermodynamicLegConfig(
+        name=:solvent,
+        pdb="ethanol_solv.pdb",
+        coulomb_lambda_schedule=[1.0, 0.5, 0.0],
+        lj_lambda_schedule=[1.0, 0.0],
+    )
+    @test_throws ArgumentError AWHGrads.resolve_leg_state_schedule(length_mismatch_leg, fallback_schedule, Float32)
+
+    out_of_range_leg = AWHGrads.ThermodynamicLegConfig(
+        name=:solvent,
+        pdb="ethanol_solv.pdb",
+        coulomb_lambda_schedule=[1.0, -0.1],
+        lj_lambda_schedule=[1.0, 0.0],
+    )
+    @test_throws ArgumentError AWHGrads.resolve_leg_state_schedule(out_of_range_leg, fallback_schedule, Float32)
+
+    too_short_leg = AWHGrads.ThermodynamicLegConfig(
+        name=:solvent,
+        pdb="ethanol_solv.pdb",
+        coulomb_lambda_schedule=[1.0],
+        lj_lambda_schedule=[1.0],
+    )
+    @test_throws ArgumentError AWHGrads.resolve_leg_state_schedule(too_short_leg, fallback_schedule, Float32)
+
+    cycle_cfg = AWHGrads.default_cycle_config()
+    solvent_leg = only(filter(leg -> leg.name == :solvent, cycle_cfg.legs))
+    vacuum_leg = only(filter(leg -> leg.name == :vacuum, cycle_cfg.legs))
+
+    @test length(solvent_leg.coulomb_lambda_schedule) == 31
+    @test length(solvent_leg.lj_lambda_schedule) == 31
+    @test solvent_leg.coulomb_lambda_schedule[1] ≈ 1.0f0
+    @test solvent_leg.coulomb_lambda_schedule[11] ≈ 0.0f0
+    @test solvent_leg.coulomb_lambda_schedule[end] ≈ 0.0f0
+    @test solvent_leg.lj_lambda_schedule[1] ≈ 1.0f0
+    @test solvent_leg.lj_lambda_schedule[11] ≈ 1.0f0
+    @test solvent_leg.lj_lambda_schedule[end] ≈ 0.0f0
+    @test isnothing(vacuum_leg.coulomb_lambda_schedule)
+    @test isnothing(vacuum_leg.lj_lambda_schedule)
+
+    staged_resolved = AWHGrads.resolve_leg_state_schedule(solvent_leg, fallback_schedule, Float32)
+    @test length(staged_resolved.coulomb) == 31
+    @test length(staged_resolved.lj) == 31
+    @test staged_resolved.coupled_state_idx == 1
+    @test staged_resolved.decoupled_state_idx == 31
+end
+
+@testset "ensemble controls and benchmark configs" begin
+    sim_cfg = AWHGrads.default_simulation_config(FT=Float32, AT=Array)
+    AWHGrads.apply_simulation_config!(sim_cfg)
+
+    nvt_methods = AWHGrads.awh_coupling_methods(false, :nvt)
+    @test length(nvt_methods) == 1
+    @test first(nvt_methods) isa Molly.VelocityRescaleThermostat
+
+    npt_methods = AWHGrads.awh_coupling_methods(false, :npt)
+    @test length(npt_methods) == 2
+    @test any(method -> method isa Molly.CRescaleBarostat, npt_methods)
+
+    vacuum_methods = AWHGrads.awh_coupling_methods(true, :npt)
+    @test length(vacuum_methods) == 1
+    @test first(vacuum_methods) isa Molly.VelocityRescaleThermostat
+
+    baseline_cfg = include(joinpath(@__DIR__, "..", "scripts", "benchmark_config_baseline.jl"))
+    baseline_solvent_leg = only(filter(leg -> leg.name == :solvent, baseline_cfg.sim_cfg.cycle.legs))
+    @test isnothing(baseline_solvent_leg.coulomb_lambda_schedule)
+    @test isnothing(baseline_solvent_leg.lj_lambda_schedule)
+    @test baseline_solvent_leg.include_pv
+
+    nvt_cfg = include(joinpath(@__DIR__, "..", "scripts", "benchmark_config_staged_nvt.jl"))
+    nvt_solvent_leg = only(filter(leg -> leg.name == :solvent, nvt_cfg.sim_cfg.cycle.legs))
+    @test nvt_solvent_leg.ensemble == :nvt
+    @test !nvt_solvent_leg.include_pv
+    @test length(nvt_solvent_leg.coulomb_lambda_schedule) == 31
+    @test length(nvt_solvent_leg.lj_lambda_schedule) == 31
 end
 
 @testset "phase timing helpers" begin
