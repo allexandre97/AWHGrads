@@ -62,7 +62,7 @@ function timed_phase(
 end
 
 
-function awh_linear_stage_stats(awh_sim::AWHSimulation, tol::FT; max_lag::Int=10)
+function awh_linear_stage_stats(awh_sim, tol::FT; max_lag::Int=10)
     stats = awh_sim.state.stats
     linear_changes = FT[]
     for i in eachindex(stats.stage_history)
@@ -81,6 +81,39 @@ function awh_linear_stage_stats(awh_sim::AWHSimulation, tol::FT; max_lag::Int=10
     mean_change = isempty(nonzero_changes) ? zero(FT) : sum(nonzero_changes) / FT(length(nonzero_changes))
     return mean_change <= tol, mean_change, linear_neff
 end
+
+
+function estimate_lambda_history_ess(active_lambda_idx::AbstractVector{<:Real}, ::Type{FT}=Float64) where {FT <: AbstractFloat}
+    n = length(active_lambda_idx)
+    if n <= 1
+        return one(FT)
+    end
+
+    centered = FT.(active_lambda_idx)
+    centered .-= sum(centered) / FT(n)
+    denom = sum(abs2, centered)
+    if !(denom > zero(FT))
+        return one(FT)
+    end
+
+    max_lag = min(div(n, 5), 200)
+    rho_sum = zero(FT)
+    for lag in 1:max_lag
+        numer = zero(FT)
+        @inbounds for i in 1:(n - lag)
+            numer += centered[i] * centered[i + lag]
+        end
+        rho_k = numer / denom
+        if rho_k <= zero(FT)
+            break
+        end
+        rho_sum += rho_k
+    end
+
+    tau_int = one(FT) + FT(2) * rho_sum
+    return max(one(FT), FT(n) / tau_int)
+end
+
 
 function estimate_leg_dg_from_reference(
     energies::Matrix{FT},
@@ -145,6 +178,44 @@ function probe_frame_indices(
 end
 
 
+function discard_leading_probe_frames(frame_idxs::Vector{Int}; discard_fraction::Real=0.0)
+    if isempty(frame_idxs)
+        return Int[]
+    end
+    if !(0.0 <= discard_fraction < 1.0)
+        throw(ArgumentError("discard_fraction must lie in [0, 1)."))
+    end
+
+    n_discard = floor(Int, length(frame_idxs) * discard_fraction)
+    if n_discard <= 0
+        return copy(frame_idxs)
+    end
+    if n_discard >= length(frame_idxs)
+        return Int[]
+    end
+
+    return copy(frame_idxs[(n_discard + 1):end])
+end
+
+
+function select_probe_frame_indices(
+    n_frames::Int;
+    frame_stride::Int=1,
+    min_frames::Int=2,
+    max_frames::Int=0,
+    discard_fraction::Real=0.0,
+)
+    selected_idxs = probe_frame_indices(
+        n_frames;
+        frame_stride=frame_stride,
+        min_frames=min_frames,
+        max_frames=max_frames,
+    )
+    retained_idxs = discard_leading_probe_frames(selected_idxs; discard_fraction=discard_fraction)
+    return (selected=selected_idxs, retained=retained_idxs)
+end
+
+
 function count_full_round_trips(active_idx_history::Vector{Int}, low_idx::Int, high_idx::Int)
     if isempty(active_idx_history)
         return 0
@@ -183,9 +254,10 @@ end
 
 
 function evaluate_stage_a_readiness(
-    awh_sim::AWHSimulation,
+    awh_sim,
     awh_tol::FT;
     tail_lag::Int,
+    min_lambda_ess::Int,
     min_linear_neff::Int,
     min_round_trips::Int,
     endpoint_min_fraction::FT,
@@ -196,17 +268,21 @@ function evaluate_stage_a_readiness(
     neff_ready = !awh_sim.state.in_initial_stage && linear_neff >= FT(min_linear_neff)
 
     idx_history = get_awh_active_idx_history(awh_sim)
+    lambda_ess = estimate_lambda_history_ess(idx_history, FT)
+    lambda_ess_ready = lambda_ess >= FT(min_lambda_ess)
     round_trips = count_full_round_trips(idx_history, low_idx, high_idx)
     round_trip_ready = round_trips >= min_round_trips
 
     endpoint_low, endpoint_high = endpoint_occupancy_fractions(idx_history, low_idx, high_idx)
     endpoint_ready = endpoint_low >= endpoint_min_fraction && endpoint_high >= endpoint_min_fraction
 
-    ready = df_ready && neff_ready && round_trip_ready && endpoint_ready
+    ready = df_ready && lambda_ess_ready && round_trip_ready && endpoint_ready
     return (
         ready = ready,
         df_ready = df_ready,
         df_mean = df_mean,
+        lambda_ess = lambda_ess,
+        lambda_ess_ready = lambda_ess_ready,
         linear_neff = linear_neff,
         neff_ready = neff_ready,
         round_trips = round_trips,
@@ -236,9 +312,8 @@ function run_stage_b_probe(
     probe_frame_stride::Int=1,
     probe_min_frames::Int=2,
     probe_max_frames::Int=0,
-    awh_probe_update_freq::Int=typemax(Int),
-    awh_well_tempered_factor::Real=Inf,
-    awh_coverage_type::Symbol=:physical,
+    awh_probe_discard_fraction::Real=0.0,
+    awh_control::AWHControlConfig=AWHControlConfig(),
 ) where {FT <: AbstractFloat}
     if md_steps_probe <= 0
         @info "Stage B ($(leg_name)) skipped: md_steps_probe <= 0 (md_steps_probe=$md_steps_probe)."
@@ -257,9 +332,7 @@ function run_stage_b_probe(
     probe_sim = AWHSimulation(
         deepcopy(awh_sim.state);
         num_md_steps=awh_sim.n_md_steps,
-        update_freq=awh_probe_update_freq,
-        well_tempered_factor=awh_well_tempered_factor,
-        coverage_type=awh_coverage_type,
+        awh_simulation_control_kwargs(awh_control)...,
     )
     clear_awh_logger_histories!(probe_sim)
     probe_sim.state.active_sys.loggers.awh_logger.should_log = true
@@ -283,19 +356,20 @@ function run_stage_b_probe(
         )
     end
 
-    probe_idxs = probe_frame_indices(
+    probe_selection = select_probe_frame_indices(
         n_frames_raw;
         frame_stride=probe_frame_stride,
         min_frames=probe_min_frames,
         max_frames=probe_max_frames,
+        discard_fraction=awh_probe_discard_fraction,
     )
-    logger_probe = subset_awh_logger_frames(logger_probe_raw, probe_idxs)
-    n_frames = length(logger_probe.active_idx_history)
+    n_frames_selected = length(probe_selection.selected)
+    n_frames = length(probe_selection.retained)
     max_frames_msg = probe_max_frames > 0 ? string(probe_max_frames) : "none"
-    @info "Stage B ($(leg_name)) probe frame selection: raw_frames=$n_frames_raw | used_frames=$n_frames | stride=$(max(1, probe_frame_stride)) | min_frames=$(max(2, probe_min_frames)) | max_frames=$max_frames_msg"
+    @info "Stage B ($(leg_name)) probe frame selection: raw_frames=$n_frames_raw | selected_frames=$n_frames_selected | retained_frames=$n_frames | discard_fraction=$(round(Float64(awh_probe_discard_fraction), digits=3)) | stride=$(max(1, probe_frame_stride)) | min_frames=$(max(2, probe_min_frames)) | max_frames=$max_frames_msg"
 
     if n_frames < 2
-        @info "Stage B ($(leg_name)) early exit: insufficient selected probe frames (n_frames=$n_frames, required=2) | probe_md_wall_s=$(round(probe_md_timed.timing.wall_s, digits=3)) | probe_md_steps_per_s=$(round(probe_md_timed.timing.steps_per_s, digits=2))"
+        @info "Stage B ($(leg_name)) early exit: insufficient retained probe frames after discard (n_frames=$n_frames, required=2) | probe_md_wall_s=$(round(probe_md_timed.timing.wall_s, digits=3)) | probe_md_steps_per_s=$(round(probe_md_timed.timing.steps_per_s, digits=2))"
         return (
             ready = false,
             split_ready = false,
@@ -307,6 +381,9 @@ function run_stage_b_probe(
             dG_half_2 = FT(NaN)
         )
     end
+
+    logger_probe = subset_awh_logger_frames(logger_probe_raw, probe_selection.retained)
+    n_frames = length(logger_probe.active_idx_history)
 
     nbrs_probe_timed = timed_phase("Stage B Neighbor Precompute", leg_name) do
         precompute_neighbors(logger_probe, probe_sim.state.active_sys)

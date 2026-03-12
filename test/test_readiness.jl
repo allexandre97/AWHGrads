@@ -1,3 +1,5 @@
+using Random
+
 @testset "readiness helpers" begin
     a, b = AWHGrads.split_half_ranges(10)
     @test collect(a) == collect(1:5)
@@ -39,6 +41,19 @@ end
     @test logger_subset.volume_history == [201, 204, 210]
     @test logger_subset.potential_energy_history == [301, 304, 310]
     @test logger.active_idx_history == collect(1:10)
+
+    selection = AWHGrads.select_probe_frame_indices(10; frame_stride=1, min_frames=2, max_frames=0, discard_fraction=0.2)
+    @test selection.selected == collect(1:10)
+    @test selection.retained == collect(3:10)
+
+    split_a, split_b = AWHGrads.split_half_ranges(length(selection.retained))
+    @test selection.retained[split_a] == [3, 4, 5, 6]
+    @test selection.retained[split_b] == [7, 8, 9, 10]
+
+    short_selection = AWHGrads.select_probe_frame_indices(2; frame_stride=1, min_frames=2, max_frames=0, discard_fraction=0.5)
+    @test short_selection.selected == [1, 2]
+    @test short_selection.retained == [2]
+    @test length(short_selection.retained) < 2
 end
 
 @testset "active index history source priority" begin
@@ -84,6 +99,72 @@ end
     @test isempty(AWHGrads.get_awh_active_idx_history(mock_empty))
 end
 
+@testset "lambda-history ESS" begin
+    rng = MersenneTwister(123)
+    iid_history = rand(rng, 1:21, 1200)
+    iid_ess = AWHGrads.estimate_lambda_history_ess(iid_history, Float64)
+    @test iid_ess > 0.75 * length(iid_history)
+    @test iid_ess <= length(iid_history)
+
+    blocky_history = vcat(fill(1, 400), fill(21, 400), fill(1, 400), fill(21, 400), fill(1, 400))
+    blocky_ess = AWHGrads.estimate_lambda_history_ess(blocky_history, Float64)
+    @test blocky_ess < 0.2 * length(blocky_history)
+
+    @test AWHGrads.estimate_lambda_history_ess(fill(7, 100), Float64) == 1.0
+end
+
+@testset "Stage A readiness uses lambda ESS" begin
+    stats_field = Symbol("active_\u03bb")
+
+    function mock_awh(history; N_eff::Float32, delta::Float32=1f-4)
+        return (
+            state = (
+                in_initial_stage = false,
+                N_eff = N_eff,
+                stats = NamedTuple{(:stage_history, :max_delta_f_history, stats_field)}((
+                    fill(:linear, 20),
+                    fill(delta, 20),
+                    history,
+                )),
+                active_sys = (loggers = (awh_logger = (active_idx_history = Int[],),),),
+                state_loggers = Any[],
+            ),
+        )
+    end
+
+    high_ess_history = repeat([1, 4], 250)
+    high_ess_result = AWHGrads.evaluate_stage_a_readiness(
+        mock_awh(high_ess_history; N_eff=0f0),
+        1f-3;
+        tail_lag=10,
+        min_lambda_ess=300,
+        min_linear_neff=3000,
+        min_round_trips=3,
+        endpoint_min_fraction=0.03f0,
+        high_idx=4,
+    )
+    @test high_ess_result.ready
+    @test high_ess_result.lambda_ess_ready
+    @test high_ess_result.lambda_ess >= 300
+    @test !high_ess_result.neff_ready
+
+    low_ess_history = vcat(fill(1, 250), fill(4, 250), fill(1, 250), fill(4, 250), fill(1, 250))
+    low_ess_result = AWHGrads.evaluate_stage_a_readiness(
+        mock_awh(low_ess_history; N_eff=10_000f0),
+        1f-3;
+        tail_lag=10,
+        min_lambda_ess=300,
+        min_linear_neff=3000,
+        min_round_trips=2,
+        endpoint_min_fraction=0.03f0,
+        high_idx=4,
+    )
+    @test low_ess_result.df_ready
+    @test low_ess_result.neff_ready
+    @test !low_ess_result.lambda_ess_ready
+    @test !low_ess_result.ready
+end
+
 @testset "phase timing helpers" begin
     meta_start = AWHGrads.phase_timing_metadata("Stage A Block", "solvent"; md_steps=500)
     @test meta_start.phase == "Stage A Block"
@@ -113,7 +194,44 @@ end
 end
 
 @testset "updated optimization defaults" begin
+    sim_cfg = AWHGrads.default_simulation_config()
+    @test sim_cfg.awh_probe_discard_fraction == 0.2
+    @test sim_cfg.awh_control.update_freq == 100
+    @test sim_cfg.awh_control.coverage_threshold == 0.8
+    @test sim_cfg.awh_control.significant_weight == 0.1
+    @test sim_cfg.awh_control.initial_n_bias == 100
+
     opt_cfg = AWHGrads.default_optimization_config()
+    @test opt_cfg.awh_min_lambda_ess == 300
     @test opt_cfg.awh_parity_tol_kT == Float32(0.25)
     @test opt_cfg.awh_stageB_cooldown_blocks == 2
+end
+
+@testset "AWH control plumbing" begin
+    awh_control = AWHGrads.AWHControlConfig(
+        seed_num_md_steps=10,
+        seed_log_freq=100,
+        update_freq=123,
+        coverage_threshold=0.7,
+        significant_weight=0.25,
+        initial_n_bias=321,
+        well_tempered_factor=Inf,
+        coverage_type=:physical,
+    )
+    sim_cfg = AWHGrads.default_simulation_config(FT=Float32, AT=Array)
+    sim_cfg = AWHGrads.simulation_config_with(sim_cfg; awh_control=awh_control)
+    AWHGrads.apply_simulation_config!(sim_cfg)
+
+    awh_sim, _ = AWHGrads.setup_alchemical_awh(
+        "ethanol_vac.pdb",
+        sim_cfg.solute_idx;
+        lambda_values=sim_cfg.lambda_schedule,
+        awh_control=awh_control,
+        is_vacuum=true,
+    )
+
+    @test awh_sim.state.N_bias == Float32(awh_control.initial_n_bias)
+    @test awh_sim.update_freq == awh_control.update_freq
+    @test awh_sim.coverage_threshold == Float32(awh_control.coverage_threshold)
+    @test awh_sim.significant_weight == Float32(awh_control.significant_weight)
 end

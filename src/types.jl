@@ -7,10 +7,13 @@ Base.@kwdef struct AWHControlConfig
     lj_softcore_alpha::Float64 = 0.85
     coul_softcore_alpha::Float64 = 0.3
     reuse_neighbors::Bool = true
+    # Lambda-sampling interval in MD steps.
     seed_num_md_steps::Int = 10
     seed_log_freq::Int = 100
-    probe_update_freq::Int = typemax(Int)
-    production_update_freq::Int = typemax(Int)
+    update_freq::Int = 100
+    coverage_threshold::Float64 = 0.8
+    significant_weight::Float64 = 0.1
+    initial_n_bias::Int = 100
     well_tempered_factor::Float64 = Inf
     coverage_type::Symbol = :physical
 end
@@ -64,7 +67,7 @@ Base.@kwdef struct SimulationConfig
     # Backward-compatible defaults for a 2-leg hydration cycle.
     pdb_solv::String = "ethanol_solv.pdb"
     pdb_vac::String = "ethanol_vac.pdb"
-    awh_probe_time_solv = Float32(0.75)u"ns"
+    awh_probe_time_solv = Float32(1.5)u"ns"
     awh_probe_time_vac = Float32(0.25)u"ns"
     # Probe-frame controls for Stage B reweighting/evaluation only.
     awh_probe_reweight_stride_solv::Int = 5
@@ -73,6 +76,7 @@ Base.@kwdef struct SimulationConfig
     awh_probe_reweight_min_frames_vac::Int = 500
     awh_probe_reweight_max_frames_solv::Int = 2000
     awh_probe_reweight_max_frames_vac::Int = 1200
+    awh_probe_discard_fraction::Float64 = 0.2
     dG_exp_kcal_mol::Float64 = -5.01
 
     # New user-facing configuration for non-hardcoded systems/cycles.
@@ -101,6 +105,7 @@ Base.@kwdef struct OptimizationConfig
 
     ess_threshold_scale = Float32(0.22)
     awh_min_linear_neff::Int = 3000
+    awh_min_lambda_ess::Int = 300
     awh_split_tol_kT = Float32(0.5)
     awh_parity_tol_kT = Float32(0.25)
     awh_tail_lag::Int = 10
@@ -145,6 +150,8 @@ Base.@kwdef struct StageAStats
     ready::Bool = false
     df_ready::Bool = false
     df_mean::Any = Inf
+    lambda_ess::Any = 1.0
+    lambda_ess_ready::Bool = false
     linear_neff::Any = 0.0
     neff_ready::Bool = false
     round_trips::Int = 0
@@ -159,6 +166,8 @@ StageAStats(nt::NamedTuple) = StageAStats(
     ready = nt.ready,
     df_ready = nt.df_ready,
     df_mean = nt.df_mean,
+    lambda_ess = nt.lambda_ess,
+    lambda_ess_ready = nt.lambda_ess_ready,
     linear_neff = nt.linear_neff,
     neff_ready = nt.neff_ready,
     round_trips = nt.round_trips,

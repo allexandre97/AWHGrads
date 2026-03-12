@@ -6,7 +6,7 @@
 # 3) run the full AWH + optimization pipeline
 #
 # Run with Julia 1.11:
-#   julia +1.11 --project=. scripts/run_alch_full_example.jl
+#   julia +1.11 scripts/run_alch_full_example.jl
 
 include(joinpath(@__DIR__, "..", "src", "AWHGrads.jl"))
 
@@ -52,8 +52,10 @@ sim_cfg = AWHGrads.simulation_config_with(
         coul_softcore_alpha=0.3,
         seed_num_md_steps=10,
         seed_log_freq=100,
-        probe_update_freq=typemax(Int),
-        production_update_freq=typemax(Int),
+        update_freq=100,
+        coverage_threshold=0.8,
+        significant_weight=0.1,
+        initial_n_bias=100,
         well_tempered_factor=Inf,
         coverage_type=:physical,
     ),

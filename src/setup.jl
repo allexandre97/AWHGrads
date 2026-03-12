@@ -1,5 +1,25 @@
 # Helper functions extracted from main_alch.jl
 
+function awh_state_control_kwargs(awh_control::AWHControlConfig; first_state::Int)
+    return (
+        reuse_neighbors=awh_control.reuse_neighbors,
+        first_state=first_state,
+        n_bias=awh_control.initial_n_bias,
+    )
+end
+
+
+function awh_simulation_control_kwargs(awh_control::AWHControlConfig)
+    return (
+        update_freq=awh_control.update_freq,
+        well_tempered_factor=awh_control.well_tempered_factor,
+        coverage_threshold=awh_control.coverage_threshold,
+        significant_weight=awh_control.significant_weight,
+        coverage_type=awh_control.coverage_type,
+    )
+end
+
+
 function setup_alchemical_awh(
     pdb_file,
     solute_indices;
@@ -111,14 +131,14 @@ function setup_alchemical_awh(
     end
 
     first_state = (warm_start && !isnothing(restart_state)) ? clamp(restart_active_idx, 1, length(lambda_values)) : 1
-    awh_state = AWHState(thermo_states; reuse_neighbors=awh_control.reuse_neighbors, first_state=first_state)
+    awh_state = AWHState(thermo_states; awh_state_control_kwargs(awh_control; first_state=first_state)...)
     
     if !isnothing(injected_bias)  
         awh_state.f .= injected_bias.f  
         awh_state.rho .= injected_bias.rho  
         awh_state.log_rho .= injected_bias.log_rho  
         awh_state.in_initial_stage = true
-        awh_state.N_bias = FT(100.0) 
+        awh_state.N_bias = FT(awh_control.initial_n_bias)
         awh_state.N_eff = zero(FT)
         empty!(awh_state.visited_windows)
     end
@@ -127,8 +147,7 @@ function setup_alchemical_awh(
         awh_state;
         num_md_steps=awh_control.seed_num_md_steps,
         log_freq=awh_control.seed_log_freq,
-        well_tempered_factor=awh_control.well_tempered_factor,
-        coverage_type=awh_control.coverage_type,
+        awh_simulation_control_kwargs(awh_control)...,
     )
     
     return awh_sim, sys_base  

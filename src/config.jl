@@ -6,7 +6,7 @@ function default_cycle_config(; target_dG_kcal_mol::Real=-5.01)
             coefficient=1.0,
             is_vacuum=false,
             include_pv=true,
-            probe_time=Float32(0.75)u"ns",
+            probe_time=Float32(1.5)u"ns",
         ),
         ThermodynamicLegConfig(
             name=:vacuum,
@@ -40,7 +40,7 @@ function default_simulation_config(; FT::DataType=Float32, AT=CuArray, device_id
         solute_idx=1:9,
         pdb_solv="ethanol_solv.pdb",
         pdb_vac="ethanol_vac.pdb",
-        awh_probe_time_solv=FT(0.75)u"ns",
+        awh_probe_time_solv=FT(1.5)u"ns",
         awh_probe_time_vac=FT(0.25)u"ns",
         awh_probe_reweight_stride_solv=5,
         awh_probe_reweight_stride_vac=5,
@@ -48,6 +48,7 @@ function default_simulation_config(; FT::DataType=Float32, AT=CuArray, device_id
         awh_probe_reweight_min_frames_vac=500,
         awh_probe_reweight_max_frames_solv=2000,
         awh_probe_reweight_max_frames_vac=1200,
+        awh_probe_discard_fraction=0.2,
         dG_exp_kcal_mol=-5.01,
         force_field=ForceFieldConfig(),
         cycle=nothing,
@@ -74,6 +75,7 @@ function default_optimization_config(; FT::DataType=Float32)
         optimize_solvent=false,
         ess_threshold_scale=FT(0.22),
         awh_min_linear_neff=3000,
+        awh_min_lambda_ess=300,
         awh_split_tol_kT=FT(0.5),
         awh_parity_tol_kT=FT(0.25),
         awh_tail_lag=10,
@@ -186,6 +188,10 @@ end
 
 function apply_simulation_config!(cfg::SimulationConfig)
     validate_lambda_schedule(cfg.lambda_schedule)
+    discard_fraction = Float64(cfg.awh_probe_discard_fraction)
+    if !(0.0 <= discard_fraction < 1.0)
+        throw(ArgumentError("awh_probe_discard_fraction must lie in [0, 1)."))
+    end
 
     global FT = cfg.FT
     global AT = cfg.AT

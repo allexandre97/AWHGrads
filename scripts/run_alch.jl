@@ -2,7 +2,7 @@
 
 include(joinpath(@__DIR__, "..", "src", "AWHGrads.jl"))
 # Run with Julia 1.11:
-#   julia +1.11 --project=. scripts/run_alch.jl [optional_config.jl]
+#   julia +1.11 scripts/run_alch.jl [optional_config.jl]
 
 function load_configs(config_path::AbstractString)
     cfg_obj = include(config_path)

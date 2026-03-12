@@ -227,6 +227,7 @@ function run_readiness_loop!(
     awh_budget_time,
     awh_convergence_tol::FT,
     awh_min_linear_neff::Int,
+    awh_min_lambda_ess::Int,
     awh_split_tol_kT::FT,
     awh_parity_tol_kT::FT,
     awh_tail_lag::Int,
@@ -234,13 +235,12 @@ function run_readiness_loop!(
     awh_endpoint_min_fraction::FT,
     awh_stageA_stable_blocks::Int,
     awh_stageB_cooldown_blocks::Int,
-    awh_probe_update_freq::Int,
-    awh_well_tempered_factor::Real,
-    awh_coverage_type::Symbol,
+    awh_control::AWHControlConfig,
+    awh_probe_discard_fraction::Float64,
     beta_val::FT,
     p0_energy_per_vol::FT,
 ) where {FT <: AbstractFloat}
-    stageA_default = StageAStats(df_mean=FT(Inf), linear_neff=zero(FT))
+    stageA_default = StageAStats(df_mean=FT(Inf), lambda_ess=one(FT), linear_neff=zero(FT))
     stageB_default = StageBStats(split_gap=FT(Inf), parity_gap=FT(Inf), dG_half_1=FT(NaN), dG_half_2=FT(NaN))
 
     stageA_stats_by_leg = Dict{Symbol, StageAStats}(leg.name => stageA_default for leg in cycle_cfg.legs)
@@ -302,6 +302,7 @@ function run_readiness_loop!(
                 awh_leg,
                 awh_convergence_tol;
                 tail_lag=awh_tail_lag,
+                min_lambda_ess=awh_min_lambda_ess,
                 min_linear_neff=awh_min_linear_neff,
                 min_round_trips=awh_min_round_trips,
                 endpoint_min_fraction=awh_endpoint_min_fraction,
@@ -338,9 +339,8 @@ function run_readiness_loop!(
                         probe_frame_stride=probe_stride_by_leg[name],
                         probe_min_frames=probe_min_frames_by_leg[name],
                         probe_max_frames=probe_max_frames_by_leg[name],
-                        awh_probe_update_freq=awh_probe_update_freq,
-                        awh_well_tempered_factor=awh_well_tempered_factor,
-                        awh_coverage_type=awh_coverage_type,
+                        awh_probe_discard_fraction=awh_probe_discard_fraction,
+                        awh_control=awh_control,
                     ))
 
                     split_gap_by_leg[name] = stageB_stats_by_leg[name].split_gap
@@ -378,7 +378,7 @@ function run_readiness_loop!(
         for leg in cycle_cfg.legs
             name = leg.name
             statsA = stageA_stats_by_leg[name]
-            @info "  Stage A ($(name)): df=$(round(statsA.df_mean, digits=6)) (ok=$(statsA.df_ready)) | neff=$(round(statsA.linear_neff, digits=1)) (ok=$(statsA.neff_ready)) | rt=$(statsA.round_trips) (ok=$(statsA.round_trip_ready)) | endpt=($(round(statsA.endpoint_low, digits=3)), $(round(statsA.endpoint_high, digits=3))) (ok=$(statsA.endpoint_ready)) | n_hist=$(statsA.n_hist) | streak=$(stageA_streak[name]) | cooldown=$(stageB_cooldown[name])"
+            @info "  Stage A ($(name)): df=$(round(statsA.df_mean, digits=6)) (ok=$(statsA.df_ready)) | ess=$(round(statsA.lambda_ess, digits=1)) (ok=$(statsA.lambda_ess_ready)) | rt=$(statsA.round_trips) (ok=$(statsA.round_trip_ready)) | endpt=($(round(statsA.endpoint_low, digits=3)), $(round(statsA.endpoint_high, digits=3))) (ok=$(statsA.endpoint_ready)) | n_hist=$(statsA.n_hist) | streak=$(stageA_streak[name]) | cooldown=$(stageB_cooldown[name])"
 
             statsB = stageB_stats_by_leg[name]
             if statsB.n_frames > 0
@@ -423,9 +423,7 @@ function collect_production_artifacts!(
     param_names::Vector{String},
     md_steps_prod::Int,
     p0_energy_per_vol::FT,
-    awh_production_update_freq::Int,
-    awh_well_tempered_factor::Real,
-    awh_coverage_type::Symbol,
+    awh_control::AWHControlConfig,
 ) where {FT <: AbstractFloat}
     for leg in cycle_cfg.legs
         runtime.active_bias[leg.name] = extract_awh_data(awh_by_leg[leg.name])
@@ -443,9 +441,7 @@ function collect_production_artifacts!(
         awh_prod = AWHSimulation(
             awh_by_leg[name].state;
             num_md_steps=awh_by_leg[name].n_md_steps,
-            update_freq=awh_production_update_freq,
-            well_tempered_factor=awh_well_tempered_factor,
-            coverage_type=awh_coverage_type,
+            awh_simulation_control_kwargs(awh_control)...,
         )
         awh_prod.state.active_sys.loggers.awh_logger.should_log = true
         simulate!(awh_prod, md_steps_prod)
@@ -578,6 +574,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             sim_cfg.awh_budget_time,
             opt_cfg.awh_convergence_tol,
             opt_cfg.awh_min_linear_neff,
+            opt_cfg.awh_min_lambda_ess,
             opt_cfg.awh_split_tol_kT,
             opt_cfg.awh_parity_tol_kT,
             opt_cfg.awh_tail_lag,
@@ -585,9 +582,8 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             opt_cfg.awh_endpoint_min_fraction,
             opt_cfg.awh_stageA_stable_blocks,
             opt_cfg.awh_stageB_cooldown_blocks,
-            sim_cfg.awh_control.probe_update_freq,
-            sim_cfg.awh_control.well_tempered_factor,
-            sim_cfg.awh_control.coverage_type,
+            sim_cfg.awh_control,
+            sim_cfg.awh_probe_discard_fraction,
             beta_val,
             p0_energy_per_vol,
         )
@@ -595,7 +591,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
         if !readiness_result.awh_ready
             stageA_summary = join(
                 [
-                    "$(leg.name)=df:$(round(readiness_result.stageA_stats_by_leg[leg.name].df_mean, digits=6)) neff:$(round(readiness_result.stageA_stats_by_leg[leg.name].linear_neff, digits=1)) rt:$(readiness_result.stageA_stats_by_leg[leg.name].round_trips)"
+                    "$(leg.name)=df:$(round(readiness_result.stageA_stats_by_leg[leg.name].df_mean, digits=6)) ess:$(round(readiness_result.stageA_stats_by_leg[leg.name].lambda_ess, digits=1)) rt:$(readiness_result.stageA_stats_by_leg[leg.name].round_trips)"
                     for leg in cycle_cfg.legs
                 ],
                 " | ",
@@ -625,9 +621,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             param_names,
             md_steps_prod,
             p0_energy_per_vol,
-            sim_cfg.awh_control.production_update_freq,
-            sim_cfg.awh_control.well_tempered_factor,
-            sim_cfg.awh_control.coverage_type,
+            sim_cfg.awh_control,
         )
 
         GC.gc()
