@@ -4,6 +4,12 @@ include(joinpath(@__DIR__, "..", "src", "AWHGrads.jl"))
 # Run with Julia 1.11:
 #   julia +1.11 scripts/run_alch.jl [optional_config.jl]
 
+"""
+    load_configs(config_path)
+
+Load a user config file and normalize its return value into
+`(sim_cfg, opt_cfg)`.
+"""
 function load_configs(config_path::AbstractString)
     cfg_obj = include(config_path)
     sim_cfg = AWHGrads.default_simulation_config()

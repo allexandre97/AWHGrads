@@ -53,6 +53,13 @@ _reconstruct_list(l::InteractionList4Atoms, i) = InteractionList4Atoms(l.is, l.j
 # 2. CORE EVALUATION FUNCTIONS
 # ==============================================================================
 
+"""
+    evaluate_frame_energy(params, sys_ref, coords_nounits, box_nounits, neighbors,
+                          atom_idxs, pairwise_idxs, specific_idxs, general_idxs)
+
+Rebuild a single λ-state system with a candidate parameter vector and return its
+potential energy for one stored frame.
+"""
 function evaluate_frame_energy(params::Vector{FT}, sys_ref::System{D, AT, FT}, 
                                coords_nounits, box_nounits, neighbors, 
                                atom_idxs, pairwise_idxs, specific_idxs, general_idxs) where {D, AT, FT}
@@ -95,6 +102,14 @@ function evaluate_frame_energy(params::Vector{FT}, sys_ref::System{D, AT, FT},
     return FT(potential_energy(sys_final, neighbors; n_threads=1))
 end
 
+"""
+    evaluate_frame_gradients(sys_ref, coords_nounits, box_nounits, neighbors,
+                             params, grads_enzyme, atom_idxs, pairwise_idxs,
+                             specific_idxs, general_idxs)
+
+Differentiate `evaluate_frame_energy` with respect to the parameter vector using
+Enzyme and return the primal energy.
+"""
 function evaluate_frame_gradients(sys_ref::System{D, AT, FT}, 
                                   coords_nounits, box_nounits, neighbors, 
                                   params::Vector{FT}, grads_enzyme::Vector{FT}, 
@@ -124,6 +139,13 @@ end
 # 3. FREE ENERGY ENDPOINT EVALUATION
 # ==============================================================================
 
+"""
+    compute_weights_and_ess(energies_current, energies_ref, active_lambda_idx, beta,
+                            volumes=FT[], P0=zero(FT))
+
+Compute per-frame reweighting factors from the reference ensemble to the current
+parameterization together with their effective sample size.
+"""
 function compute_weights_and_ess(
     energies_current::Matrix{FT}, 
     energies_ref::Matrix{FT}, 
@@ -164,6 +186,13 @@ function compute_weights_and_ess(
     return w_norm, ess
 end
 
+"""
+    compute_empirical_gradients_and_fim(param_names, gradients_dict, w_norm,
+                                        active_lambda_idx, beta)
+
+Estimate the weighted score mean and Fisher information matrix from the
+frame-by-frame energy gradients.
+"""
 function compute_empirical_gradients_and_fim(
     param_names::Vector{String},
     gradients_dict::Dict{String, Matrix{FT}}, 
@@ -205,6 +234,16 @@ function compute_empirical_gradients_and_fim(
     return s_mean, fim
 end
 
+"""
+    compute_global_endpoint_gradients(param_names, gradients_dict, energies_current,
+                                      energies_ref, active_lambda_idx,
+                                      lambda_target_idx, beta, awh_bias,
+                                      volumes=FT[], P0_energy_per_vol=zero(FT);
+                                      compute_gradients=true)
+
+Use global MBAR-style reweighting to estimate the free energy of one endpoint λ
+state, optionally alongside its thermodynamic gradient.
+"""
 function compute_global_endpoint_gradients(
     param_names::Vector{String},
     gradients_dict::Dict{String, Matrix{FT}},
@@ -228,7 +267,7 @@ function compute_global_endpoint_gradients(
     log_denoms = zeros(FT, num_lambda)
     log_W_target = zeros(FT, M)
     
-    # 1. Global MBAR Weights to Target Lambda
+    # 1. Global MBAR weights to the requested target λ.
     for k in 1:M
         pv_term = isempty(volumes) ? zero(FT) : beta * P0_energy_per_vol * volumes[k]
         u_k_target = beta * energies_current[k, lambda_target_idx] + pv_term
@@ -248,7 +287,7 @@ function compute_global_endpoint_gradients(
     W_unnorm = exp.(log_W_target .- max_log_W)
     w_lambda_global = W_unnorm ./ sum(W_unnorm)
 
-    # 2. Globally Weighted Gradient Expectation (Thermodynamic Gradient)
+    # 2. Globally weighted gradient expectation (thermodynamic gradient).
     grad_F_lambda = zeros(FT, length(param_names))
     if compute_gradients
         for (i, p_key) in enumerate(param_names)
@@ -259,12 +298,19 @@ function compute_global_endpoint_gradients(
         end
     end
 
-    # 3. True Thermodynamic Free Energy (Dimensionless MBAR)
+    # 3. Dimensionless free energy of the target endpoint.
     F_mbar = -(max_log_W + log(sum(W_unnorm)))
 
     return grad_F_lambda, F_mbar
 end
 
+"""
+    compute_full_mbar_profile(energies_current, energies_ref, awh_bias, beta;
+                              volumes=FT[], P0_energy_per_vol=zero(FT))
+
+Reconstruct the complete λ free-energy profile implied by the stored trajectory
+under a candidate parameter vector.
+"""
 function compute_full_mbar_profile(
     energies_current::Matrix{FT},
     energies_ref::Matrix{FT},
@@ -320,6 +366,12 @@ function compute_full_mbar_profile(
     return F_profile
 end
 
+"""
+    compute_parity_gap(F_mbar, F_awh; ref_idx=1)
+
+Measure the maximum deviation between an MBAR-reconstructed free-energy profile
+and the AWH bias profile after aligning them at `ref_idx`.
+"""
 function compute_parity_gap(F_mbar::Vector{FT}, F_awh::Vector{FT}; ref_idx::Int=1) where {FT <: AbstractFloat}
     if length(F_mbar) != length(F_awh)
         throw(ArgumentError("compute_parity_gap expected vectors with equal length, got $(length(F_mbar)) and $(length(F_awh))."))

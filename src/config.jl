@@ -1,3 +1,9 @@
+"""
+    default_cycle_config(; target_dG_kcal_mol=-5.01)
+
+Return the built-in two-leg ethanol hydration cycle used by the example
+scripts.
+"""
 function default_cycle_config(; target_dG_kcal_mol::Real=-5.01)
     legs = [
         ThermodynamicLegConfig(
@@ -24,6 +30,11 @@ function default_cycle_config(; target_dG_kcal_mol::Real=-5.01)
     )
 end
 
+"""
+    default_simulation_config(; FT=Float32, AT=CuArray, device_id=1)
+
+Construct a `SimulationConfig` populated with the package defaults.
+"""
 function default_simulation_config(; FT::DataType=Float32, AT=CuArray, device_id::Int=1)
     return SimulationConfig(
         device_id=device_id,
@@ -58,6 +69,11 @@ function default_simulation_config(; FT::DataType=Float32, AT=CuArray, device_id
     )
 end
 
+"""
+    default_optimization_config(; FT=Float32)
+
+Construct an `OptimizationConfig` tuned for the default hydration example.
+"""
 function default_optimization_config(; FT::DataType=Float32)
     return OptimizationConfig(
         awh_convergence_tol=FT(1e-3),
@@ -87,6 +103,13 @@ function default_optimization_config(; FT::DataType=Float32)
     )
 end
 
+"""
+    resolved_cycle_config(sim_cfg)
+
+Return the explicit cycle stored in `sim_cfg.cycle` when present, otherwise
+rebuild the legacy two-leg cycle from the backward-compatible fields on
+`SimulationConfig`.
+"""
 function resolved_cycle_config(sim_cfg::SimulationConfig)
     if !isnothing(sim_cfg.cycle) && !isempty(sim_cfg.cycle.legs)
         return sim_cfg.cycle
@@ -116,6 +139,11 @@ function resolved_cycle_config(sim_cfg::SimulationConfig)
     )
 end
 
+"""
+    validate_cycle_config(cycle_cfg)
+
+Validate a thermodynamic cycle and return it unchanged when it is well-formed.
+"""
 function validate_cycle_config(cycle_cfg::ThermodynamicCycleConfig)
     if isempty(cycle_cfg.legs)
         throw(ArgumentError("Thermodynamic cycle must define at least one leg."))
@@ -132,6 +160,12 @@ function validate_cycle_config(cycle_cfg::ThermodynamicCycleConfig)
     return cycle_cfg
 end
 
+"""
+    resolve_parameter_reference_leg(sim_cfg, cycle_cfg)
+
+Choose the leg whose atom types define the reference parameter ordering used
+throughout the optimization.
+"""
 function resolve_parameter_reference_leg(sim_cfg::SimulationConfig, cycle_cfg::ThermodynamicCycleConfig)
     validate_cycle_config(cycle_cfg)
     if isnothing(sim_cfg.parameter_reference_leg)
@@ -147,6 +181,11 @@ function resolve_parameter_reference_leg(sim_cfg::SimulationConfig, cycle_cfg::T
     throw(ArgumentError("parameter_reference_leg=$(sim_cfg.parameter_reference_leg) was not found in configured cycle legs."))
 end
 
+"""
+    resolve_force_field_paths(sim_cfg)
+
+Resolve the force-field XML paths referenced by `sim_cfg.force_field`.
+"""
 function resolve_force_field_paths(sim_cfg::SimulationConfig)
     ff_cfg = sim_cfg.force_field
     default_ff_dir = joinpath(dirname(pathof(Molly)), "..", "data", "force_fields")
@@ -164,6 +203,11 @@ function resolve_force_field_paths(sim_cfg::SimulationConfig)
     return paths
 end
 
+"""
+    validate_lambda_schedule(lambda_schedule)
+
+Ensure the λ schedule is finite, monotone, and spans at least two windows.
+"""
 function validate_lambda_schedule(lambda_schedule)
     vals = collect(lambda_schedule)
     if length(vals) < 2
@@ -186,6 +230,12 @@ function validate_lambda_schedule(lambda_schedule)
     return nothing
 end
 
+"""
+    apply_simulation_config!(cfg)
+
+Promote `cfg` into the module-level globals used by the rest of the package and
+rebuild the force field with the requested precision/backend.
+"""
 function apply_simulation_config!(cfg::SimulationConfig)
     validate_lambda_schedule(cfg.lambda_schedule)
     discard_fraction = Float64(cfg.awh_probe_discard_fraction)
@@ -202,6 +252,8 @@ function apply_simulation_config!(cfg::SimulationConfig)
     global num_lambda_states = length(cfg.lambda_schedule)
     global target_rho = FT(1.0 / num_lambda_states)
 
+    # Recreate the force field after precision changes so all parameters live in
+    # the same numeric type as the simulation state.
     ff_paths = resolve_force_field_paths(cfg)
     global ff = MolecularForceField(FT, ff_paths...; units=true)
 
@@ -212,7 +264,11 @@ function apply_simulation_config!(cfg::SimulationConfig)
     return nothing
 end
 
+"""
+    simulation_config_with(cfg; kwargs...)
 
+Create a copy of `cfg` with selected fields overridden.
+"""
 function simulation_config_with(cfg::SimulationConfig; kwargs...)
     fields = [name => getfield(cfg, name) for name in fieldnames(SimulationConfig)]
     for (k, v) in kwargs
@@ -225,7 +281,11 @@ function simulation_config_with(cfg::SimulationConfig; kwargs...)
     return SimulationConfig(; fields...)
 end
 
+"""
+    optimization_config_with(cfg; kwargs...)
 
+Create a copy of `cfg` with selected fields overridden.
+"""
 function optimization_config_with(cfg::OptimizationConfig; kwargs...)
     fields = [name => getfield(cfg, name) for name in fieldnames(OptimizationConfig)]
     for (k, v) in kwargs

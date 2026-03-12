@@ -1,8 +1,22 @@
+"""
+    ForceFieldConfig
+
+Describes how force-field XML files are resolved. Relative `xml_files` entries
+are looked up under `force_field_dir`; when that is `nothing`, Molly's bundled
+force-field directory is used.
+"""
 Base.@kwdef struct ForceFieldConfig
     force_field_dir::Union{Nothing, String} = nothing
     xml_files::Vector{String} = ["tip3p_standard.xml", "gaff.xml", "ethanol.xml"]
 end
 
+"""
+    AWHControlConfig
+
+Collects the low-level AWH and soft-core parameters passed into each
+`AWHSimulation`. These settings control how quickly the bias is updated and how
+the linear stage is initialized.
+"""
 Base.@kwdef struct AWHControlConfig
     lj_softcore_alpha::Float64 = 0.85
     coul_softcore_alpha::Float64 = 0.3
@@ -18,6 +32,13 @@ Base.@kwdef struct AWHControlConfig
     coverage_type::Symbol = :physical
 end
 
+"""
+    ThermodynamicLegConfig
+
+Configuration for one leg of the thermodynamic cycle. Each leg contributes
+`coefficient * ΔG_leg` to the cycle free energy and can optionally include a
+`pV` correction during reweighting.
+"""
 Base.@kwdef struct ThermodynamicLegConfig
     name::Symbol
     pdb::String
@@ -27,12 +48,24 @@ Base.@kwdef struct ThermodynamicLegConfig
     probe_time = Float32(0.5)u"ns"
 end
 
+"""
+    ThermodynamicCycleConfig
+
+Defines the legs that make up the free-energy cycle and the experimental target
+the optimization is trying to match.
+"""
 Base.@kwdef struct ThermodynamicCycleConfig
     legs::Vector{ThermodynamicLegConfig} = ThermodynamicLegConfig[]
     include_standard_state_correction::Bool = true
     target_dG_kcal_mol::Float64 = -5.01
 end
 
+"""
+    ParameterBoundsConfig
+
+Hard bounds for the optimized Lennard-Jones parameters. The optimization is
+performed in an unconstrained `ϕ` space and mapped back into these intervals.
+"""
 Base.@kwdef struct ParameterBoundsConfig
     sigma_hydrogen_min::Float64 = 0.1
     sigma_hydrogen_max::Float64 = 0.4
@@ -47,21 +80,33 @@ Base.@kwdef struct ParameterBoundsConfig
     reference_clamp_eps::Float64 = 1e-4
 end
 
+"""
+    SimulationConfig
+
+Top-level runtime configuration for simulation, AWH sampling, and thermodynamic
+cycle setup. The defaults keep backward compatibility with the original
+two-state ethanol hydration example while also supporting arbitrary cycle
+definitions through `cycle`.
+"""
 Base.@kwdef struct SimulationConfig
+    # Backend and numeric types used throughout the run.
     device_id::Int = 1
     FT::DataType = Float32
     AT::Any = CuArray
 
+    # Integrator timestep and thermodynamic state.
     Δt = Float32(1)u"fs"
     T0 = Float32(310)u"K"
     P0 = Float32(1)u"bar"
     lambda_schedule = Float32.(range(1.0, stop=0.0, length=21))
 
+    # Macro-cycle timing.
     awh_budget_time = Float32(20)u"ns"
     awh_block_time = Float32(1.0)u"ns"
     md_time_production = Float32(0.1)u"ns"
     production_log_interval::Int = 100
 
+    # Solute atoms whose nonbonded parameters are coupled to λ.
     solute_idx = 1:9
 
     # Backward-compatible defaults for a 2-leg hydration cycle.
@@ -87,12 +132,20 @@ Base.@kwdef struct SimulationConfig
     awh_control::AWHControlConfig = AWHControlConfig()
 end
 
+"""
+    OptimizationConfig
+
+Controls the readiness gates and the natural-gradient-like optimization step
+used after each production phase.
+"""
 Base.@kwdef struct OptimizationConfig
+    # Macro-epoch and line-search controls.
     awh_convergence_tol = Float32(1e-3)
     rewarm_fraction = Float32(0.05)
     max_macro_epochs::Int = 30
     huber_delta = Float32(2.0)
 
+    # Trust-region / natural-gradient step sizing.
     kl_target = Float32(0.1)
     eigenvalue_tol_scale = Float32(1e-2)
     min_phi_step = Float32(5e-4)
@@ -103,6 +156,7 @@ Base.@kwdef struct OptimizationConfig
     restart_rmsd_tol_nm = Float32(1e-5)
     optimize_solvent::Bool = false
 
+    # Stage A / Stage B readiness thresholds.
     ess_threshold_scale = Float32(0.22)
     awh_min_linear_neff::Int = 3000
     awh_min_lambda_ess::Int = 300
@@ -117,6 +171,12 @@ Base.@kwdef struct OptimizationConfig
     k_sigmoid = Float32(1.0)
 end
 
+"""
+    RuntimeState
+
+Mutable state carried across macro epochs. It stores the current bias estimate,
+warm-start restart snapshots, and the latest parameter vectors.
+"""
 Base.@kwdef mutable struct RuntimeState
     active_bias::Dict{Symbol, Any} = Dict{Symbol, Any}()
     restart_cache::Dict{Symbol, Any} = Dict{Symbol, Any}()
@@ -131,6 +191,12 @@ Base.@kwdef mutable struct RuntimeState
     theta_active::Any = nothing
 end
 
+"""
+    LegArtifacts
+
+Production data cached for one thermodynamic leg and reused during the
+optimization phase.
+"""
 Base.@kwdef mutable struct LegArtifacts
     name::Symbol = :unknown
     coefficient::Any = 0.0
@@ -146,6 +212,12 @@ Base.@kwdef mutable struct LegArtifacts
     idxs::Any = nothing
 end
 
+"""
+    StageAStats
+
+Summary of the cheap readiness checks computed after each AWH block. These are
+used to decide when a leg is mature enough to run a Stage B probe.
+"""
 Base.@kwdef struct StageAStats
     ready::Bool = false
     df_ready::Bool = false
@@ -178,6 +250,12 @@ StageAStats(nt::NamedTuple) = StageAStats(
     n_hist = nt.n_hist,
 )
 
+"""
+    StageBStats
+
+Summary of the more expensive probe-based readiness checks that validate the
+split-half consistency and AWH/MBAR parity of a leg.
+"""
 Base.@kwdef struct StageBStats
     ready::Bool = false
     split_ready::Bool = false

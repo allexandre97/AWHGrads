@@ -1,5 +1,9 @@
-# Helper functions extracted from main_alch.jl
+"""
+    awh_state_control_kwargs(awh_control; first_state)
 
+Translate high-level AWH controls into the keyword arguments expected by
+`AWHState`.
+"""
 function awh_state_control_kwargs(awh_control::AWHControlConfig; first_state::Int)
     return (
         reuse_neighbors=awh_control.reuse_neighbors,
@@ -8,7 +12,12 @@ function awh_state_control_kwargs(awh_control::AWHControlConfig; first_state::In
     )
 end
 
+"""
+    awh_simulation_control_kwargs(awh_control)
 
+Translate high-level AWH controls into the keyword arguments expected by
+`AWHSimulation`.
+"""
 function awh_simulation_control_kwargs(awh_control::AWHControlConfig)
     return (
         update_freq=awh_control.update_freq,
@@ -19,7 +28,13 @@ function awh_simulation_control_kwargs(awh_control::AWHControlConfig)
     )
 end
 
+"""
+    setup_alchemical_awh(pdb_file, solute_indices; kwargs...)
 
+Build a λ-expanded AWH simulation for one thermodynamic leg. The function
+optionally injects optimized parameters, restores a warm-start restart state,
+and reuses a previously learned bias estimate.
+"""
 function setup_alchemical_awh(
     pdb_file,
     solute_indices;
@@ -36,6 +51,7 @@ function setup_alchemical_awh(
     sigma_seed=nothing,
     epsilon_seed=nothing,
 )
+    # Start from the reference PDB and optionally attach an AWH logger.
     sys_raw = System(
         pdb_file, ff; array_type=AT, nonbonded_method=:none, 
         loggers=isnothing(logger) ? NamedTuple() : (awh_logger=logger,)  
@@ -52,7 +68,8 @@ function setup_alchemical_awh(
         new_sigma = (ustrip(a.σ) <= FT(1e-6) || ustrip(a.σ) == one(FT)) ? sigma_seed_local : a.σ
         new_eps   = ustrip(a.ϵ) <= FT(1e-6) ? epsilon_seed_local : a.ϵ
         
-        # INJECT NEW PARAMETERS FOR PHASE 3
+        # Optimized parameters are stored by atom type; the index maps project
+        # them back onto per-atom σ/ϵ values for Molly.
         if !isnothing(optimized_params) && !isnothing(param_idxs)
             idx_σ_map = param_idxs[1][2]
             idx_ϵ_map = param_idxs[1][3]
@@ -111,6 +128,8 @@ function setup_alchemical_awh(
         use_neighbors = cl_0.use_neighbors, scheduler = Molly.DefaultLambdaScheduler()
     )
 
+    # Construct one thermodynamic state per λ window by only changing the
+    # alchemical role of the solute atoms.
     for λ in lambda_values
         acopy = Atom[]  
         for (i, a) in enumerate(seeded_atoms)
@@ -134,6 +153,8 @@ function setup_alchemical_awh(
     awh_state = AWHState(thermo_states; awh_state_control_kwargs(awh_control; first_state=first_state)...)
     
     if !isnothing(injected_bias)  
+        # Warm-start bias reuse intentionally forces Molly back into its initial
+        # linear stage so the bias can relax to the new parameterization.
         awh_state.f .= injected_bias.f  
         awh_state.rho .= injected_bias.rho  
         awh_state.log_rho .= injected_bias.log_rho  
@@ -153,7 +174,11 @@ function setup_alchemical_awh(
     return awh_sim, sys_base  
 end
 
-##
+"""
+    capture_restart_state(awh_sim)
+
+Extract the minimal simulation state needed to warm-start the next macro epoch.
+"""
 function capture_restart_state(awh_sim::AWHSimulation)
     sys = awh_sim.state.active_sys
     return (
@@ -164,7 +189,11 @@ function capture_restart_state(awh_sim::AWHSimulation)
     )
 end
 
-##
+"""
+    coords_rmsd_nm(coords_a, coords_b)
+
+Compute the RMSD between two coordinate arrays in nanometers.
+"""
 function coords_rmsd_nm(coords_a, coords_b)
     coords_a_cpu = Array(coords_a)
     coords_b_cpu = Array(coords_b)

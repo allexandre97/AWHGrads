@@ -1,5 +1,10 @@
-# Index-map builders extracted from main_alch.jl
+"""
+    build_index_maps(sys, processed_atom_types)
 
+Build the index tuples consumed by Molly's `inject_atom`/`inject_interaction`
+machinery. This project currently optimizes σ and ϵ per atom type, so the
+interaction index tuples are intentionally empty.
+"""
 function build_index_maps(sys, processed_atom_types::Dict{String, Int})  
     n_atoms = length(sys.atoms)  
     idx_mass   = zeros(Int, n_atoms)  

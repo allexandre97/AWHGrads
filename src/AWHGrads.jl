@@ -1,3 +1,14 @@
+"""
+    AWHGrads
+
+Utilities for alternating between AWH sampling and parameter optimization for a
+thermodynamic cycle. The package is organized around three phases:
+
+1. Configure the cycle, force field, and optimization settings.
+2. Run AWH until each leg passes readiness checks.
+3. Reweight the production data and update the trainable Lennard-Jones
+   parameters.
+"""
 module AWHGrads
 
 using Molly
@@ -6,7 +17,9 @@ using Unitful
 using StatsBase
 using LinearAlgebra
 
-# Defaults are overwritten by `apply_simulation_config!`.
+# Defaults are overwritten by `apply_simulation_config!` so helper functions can
+# share the active precision/backend without threading config objects through
+# every call.
 FT = Float32
 AT = CuArray
 Δt = FT(1)u"fs"

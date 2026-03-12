@@ -1,3 +1,7 @@
+#
+# Example config file consumed by `scripts/run_alch.jl`. Returning a NamedTuple
+# keeps it easy to override either simulation or optimization settings.
+#
 base_sim = AWHGrads.default_simulation_config()
 base_opt = AWHGrads.default_optimization_config()
 lambda_schedule = Float32.(range(1.0, stop=0.0, length=21))

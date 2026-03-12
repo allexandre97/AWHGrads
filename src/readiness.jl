@@ -1,5 +1,10 @@
 # Readiness and probe helpers extracted from main_alch.jl
 
+"""
+    phase_timing_metadata(phase, leg_name; md_steps=nothing, wall_s=nothing)
+
+Build a small timing record for log messages emitted around a simulation phase.
+"""
 function phase_timing_metadata(
     phase::AbstractString,
     leg_name::AbstractString;
@@ -24,6 +29,12 @@ function phase_timing_metadata(
 end
 
 
+"""
+    timed_phase(phase, leg_name, op; md_steps=nothing)
+
+Run `op()` while emitting standardized start/end timing logs. The return value is
+the named tuple `(result, timing)`.
+"""
 function timed_phase(
     phase::AbstractString,
     leg_name::AbstractString,
@@ -52,6 +63,11 @@ function timed_phase(
 end
 
 
+"""
+    timed_phase(op, phase, leg_name; md_steps=nothing)
+
+Convenience argument order for `timed_phase`.
+"""
 function timed_phase(
     op::Function,
     phase::AbstractString,
@@ -62,6 +78,12 @@ function timed_phase(
 end
 
 
+"""
+    awh_linear_stage_stats(awh_sim, tol; max_lag=10)
+
+Summarize the recent linear-stage bias changes and return
+`(df_ready, mean_change, linear_neff)`.
+"""
 function awh_linear_stage_stats(awh_sim, tol::FT; max_lag::Int=10)
     stats = awh_sim.state.stats
     linear_changes = FT[]
@@ -83,6 +105,12 @@ function awh_linear_stage_stats(awh_sim, tol::FT; max_lag::Int=10)
 end
 
 
+"""
+    estimate_lambda_history_ess(active_lambda_idx, FT=Float64)
+
+Estimate the effective sample size of the visited λ-index history using a
+positive-sequence integrated autocorrelation-time estimator.
+"""
 function estimate_lambda_history_ess(active_lambda_idx::AbstractVector{<:Real}, ::Type{FT}=Float64) where {FT <: AbstractFloat}
     n = length(active_lambda_idx)
     if n <= 1
@@ -115,6 +143,14 @@ function estimate_lambda_history_ess(active_lambda_idx::AbstractVector{<:Real}, 
 end
 
 
+"""
+    estimate_leg_dg_from_reference(energies, active_lambda_idx, awh_bias,
+                                   num_lambda_states, beta; volumes=FT[],
+                                   P0_energy_per_vol=zero(FT))
+
+Estimate a leg free energy as the difference between the two endpoint free
+energies reconstructed from the reference ensemble.
+"""
 function estimate_leg_dg_from_reference(
     energies::Matrix{FT},
     active_lambda_idx::Vector{Int},
@@ -138,11 +174,22 @@ function estimate_leg_dg_from_reference(
 end
 
 
+"""
+    split_half_ranges(n)
+
+Split `1:n` into contiguous first-half and second-half ranges.
+"""
 function split_half_ranges(n::Int)
     n_first = fld(n, 2)
     return (1:n_first, (n_first + 1):n)
 end
 
+"""
+    probe_frame_indices(n_frames; frame_stride=1, min_frames=2, max_frames=0)
+
+Select probe-frame indices while guaranteeing inclusion of the last frame and
+respecting optional thinning and capping rules.
+"""
 function probe_frame_indices(
     n_frames::Int;
     frame_stride::Int=1,
@@ -160,6 +207,8 @@ function probe_frame_indices(
         push!(idxs, n_frames)
     end
 
+    # When the raw stride still leaves too many frames, switch to evenly spaced
+    # sampling so the probe cost stays bounded.
     if max_frames > 0 && length(idxs) > max_frames
         target = min(n_frames, max(2, max_frames))
         idxs = unique(clamp.(round.(Int, range(1, n_frames, length=target)), 1, n_frames))
@@ -178,6 +227,12 @@ function probe_frame_indices(
 end
 
 
+"""
+    discard_leading_probe_frames(frame_idxs; discard_fraction=0.0)
+
+Drop an initial fraction of already-selected probe frames. This is used to
+ignore the earliest part of the probe trajectory during Stage B reweighting.
+"""
 function discard_leading_probe_frames(frame_idxs::Vector{Int}; discard_fraction::Real=0.0)
     if isempty(frame_idxs)
         return Int[]
@@ -198,6 +253,12 @@ function discard_leading_probe_frames(frame_idxs::Vector{Int}; discard_fraction:
 end
 
 
+"""
+    select_probe_frame_indices(n_frames; kwargs...)
+
+Return both the initially selected probe indices and the subset retained after
+leading-frame discard.
+"""
 function select_probe_frame_indices(
     n_frames::Int;
     frame_stride::Int=1,
@@ -216,6 +277,11 @@ function select_probe_frame_indices(
 end
 
 
+"""
+    count_full_round_trips(active_idx_history, low_idx, high_idx)
+
+Count completed `low -> high -> low` round trips in the λ-index history.
+"""
 function count_full_round_trips(active_idx_history::Vector{Int}, low_idx::Int, high_idx::Int)
     if isempty(active_idx_history)
         return 0
@@ -242,6 +308,11 @@ function count_full_round_trips(active_idx_history::Vector{Int}, low_idx::Int, h
 end
 
 
+"""
+    endpoint_occupancy_fractions(active_idx_history, low_idx, high_idx)
+
+Return the fractions of frames spent at the low and high endpoint λ states.
+"""
 function endpoint_occupancy_fractions(active_idx_history::Vector{Int}, low_idx::Int, high_idx::Int)
     n_frames = length(active_idx_history)
     if n_frames == 0
@@ -253,6 +324,12 @@ function endpoint_occupancy_fractions(active_idx_history::Vector{Int}, low_idx::
 end
 
 
+"""
+    evaluate_stage_a_readiness(awh_sim, awh_tol; kwargs...)
+
+Evaluate the cheap, continuously updated readiness metrics used before launching
+an expensive Stage B probe.
+"""
 function evaluate_stage_a_readiness(
     awh_sim,
     awh_tol::FT;
@@ -267,6 +344,8 @@ function evaluate_stage_a_readiness(
     df_ready, df_mean, linear_neff = awh_linear_stage_stats(awh_sim, awh_tol; max_lag=tail_lag)
     neff_ready = !awh_sim.state.in_initial_stage && linear_neff >= FT(min_linear_neff)
 
+    # Stage A deliberately mixes bias-stability and trajectory-mixing criteria:
+    # a flat bias alone is not enough if λ exploration is still poor.
     idx_history = get_awh_active_idx_history(awh_sim)
     lambda_ess = estimate_lambda_history_ess(idx_history, FT)
     lambda_ess_ready = lambda_ess >= FT(min_lambda_ess)
@@ -295,6 +374,14 @@ function evaluate_stage_a_readiness(
 end
 
 
+"""
+    run_stage_b_probe(awh_sim, sys_base, theta_params, param_names, idxs,
+                      num_lambda_states, beta, awh_split_tol_kT,
+                      awh_parity_tol_kT; kwargs...)
+
+Clone the current leg, run a short probe trajectory, and test whether the probe
+is consistent under split-half reweighting and MBAR/AWH profile parity checks.
+"""
 function run_stage_b_probe(
     awh_sim::AWHSimulation,
     sys_base,
@@ -329,6 +416,8 @@ function run_stage_b_probe(
         )
     end
 
+    # Probe on a cloned state so a failed Stage B check does not disturb the
+    # main leg that continues accumulating readiness statistics.
     probe_sim = AWHSimulation(
         deepcopy(awh_sim.state);
         num_md_steps=awh_sim.n_md_steps,
@@ -417,6 +506,8 @@ function run_stage_b_probe(
     end
 
     split_parity_timed = timed_phase("Stage B Split-Parity", leg_name) do
+        # Split-half agreement checks time stability, while parity checks that
+        # the sampled AWH bias matches the MBAR-reconstructed profile.
         volumes_probe = include_pv ? FT.(ustrip.(logger_probe.volume_history)) : FT[]
         dG_half_1 = estimate_leg_dg_from_reference(
             u_probe_ref[half_1, :],

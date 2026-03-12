@@ -1,3 +1,9 @@
+"""
+    leg_volumes(leg, FT)
+
+Return the production-frame volumes for a leg when a `pV` correction is part of
+that leg's free-energy definition.
+"""
 function leg_volumes(leg::LegArtifacts, ::Type{FT}) where {FT <: AbstractFloat}
     if !leg.include_pv
         return FT[]
@@ -6,6 +12,12 @@ function leg_volumes(leg::LegArtifacts, ::Type{FT}) where {FT <: AbstractFloat}
 end
 
 
+"""
+    compute_leg_weights_and_ess(leg, energies_current, beta_val, volumes)
+
+Wrapper around `compute_weights_and_ess` that injects the leg-specific
+reference energies and optional `pV` term.
+"""
 function compute_leg_weights_and_ess(
     leg::LegArtifacts,
     energies_current::Matrix{FT},
@@ -32,6 +44,14 @@ function compute_leg_weights_and_ess(
 end
 
 
+"""
+    compute_leg_endpoint_state(leg, trainable_param_names, gradients_phi,
+                               energies_current, beta_val, volumes;
+                               compute_gradients=true)
+
+Estimate `ΔG_leg = F(λ=1) - F(λ=0)` and optionally its gradient with respect to
+the trainable `ϕ` parameters.
+"""
 function compute_leg_endpoint_state(
     leg::LegArtifacts,
     trainable_param_names::Vector{String},
@@ -100,6 +120,18 @@ function compute_leg_endpoint_state(
 end
 
 
+"""
+    run_optimization_phase!(phi_active, theta_active, leg_artifacts, param_names,
+                            trainable_param_names, trainable_param_indices,
+                            trainable_position_map, solute_param_indices,
+                            solvent_param_indices, theta_min, theta_max, phi_0,
+                            beta_val, dG_std_corr, dG_exp, opt_cfg)
+
+Perform the inner optimization loop for one macro epoch. The loop alternates
+between evaluating the current parameterization, building a Fisher-preconditioned
+update direction, and line-searching until either progress stalls or the ESS
+constraint is violated.
+"""
 function run_optimization_phase!(
     phi_active::Vector{FT},
     theta_active::Vector{FT},
@@ -200,6 +232,8 @@ function run_optimization_phase!(
                 compute_gradients=true,
             )
 
+            # Gradients are evaluated in θ-space, but the optimizer lives in the
+            # bounded-transform coordinates ϕ.
             grads_eval_phi = Dict{String, Matrix{FT}}()
             for (i, p_key) in enumerate(param_names)
                 grads_eval_phi[p_key] = grads_eval_theta[p_key] .* chain_rule_multiplier[i]
@@ -271,6 +305,8 @@ function run_optimization_phase!(
         fim_corr = D_mat * fim_active * D_mat
         grad_loss_scaled = D_vec .* grad_loss_active
 
+        # Use a Fisher-preconditioned step in the active block, truncating small
+        # eigendirections that are too noisy to trust.
         decomp = eigen(Symmetric(fim_corr))
         vals, vecs = decomp.values, decomp.vectors
 
@@ -316,6 +352,8 @@ function run_optimization_phase!(
         accepted_residual = error_residual
         ess_prop = Dict{Symbol, FT}()
 
+        # Backtracking line search enforces both residual improvement and a
+        # minimum effective sample size under the proposed reweighting.
         for ls_iter in 1:7
             phi_prop .= phi_active .- alpha .* update_direction
             theta_prop .= map_phi_to_theta(phi_prop, theta_min, theta_max, phi_0, opt_cfg.k_sigmoid)

@@ -1,3 +1,10 @@
+"""
+    sync_runtime_aliases!(runtime)
+
+Populate the legacy `*_solv`/`*_vac` aliases from the general per-leg runtime
+maps. This keeps older calling code working while the package uses arbitrary leg
+names internally.
+"""
 function sync_runtime_aliases!(runtime::RuntimeState)
     runtime.active_bias_solv = get(runtime.active_bias, :solvent, nothing)
     runtime.active_bias_vac = get(runtime.active_bias, :vacuum, nothing)
@@ -10,7 +17,12 @@ end
 time_to_steps_floor(duration) = Int(floor(uconvert(unit(Δt), duration) / Δt))
 time_to_steps_round(duration) = max(1, Int(round(uconvert(unit(Δt), duration) / Δt)))
 
+"""
+    compute_standard_state_correction(cycle_cfg, FT)
 
+Return the dimensionless standard-state correction applied to the cycle free
+energy when requested.
+"""
 function compute_standard_state_correction(cycle_cfg::ThermodynamicCycleConfig, ::Type{FT}) where {FT <: AbstractFloat}
     if !cycle_cfg.include_standard_state_correction
         return zero(FT)
@@ -21,6 +33,12 @@ function compute_standard_state_correction(cycle_cfg::ThermodynamicCycleConfig, 
 end
 
 
+"""
+    initialize_parameter_state(sim_cfg, opt_cfg, cycle_cfg)
+
+Derive the reference parameter vector, trainable subset, transform bounds, and
+per-leg injection index maps used throughout the optimization pipeline.
+"""
 function initialize_parameter_state(
     sim_cfg::SimulationConfig,
     opt_cfg::OptimizationConfig,
@@ -46,6 +64,8 @@ function initialize_parameter_state(
     epsilon_floor = FT(bounds_cfg.epsilon_floor)
     clamp_eps = FT(bounds_cfg.reference_clamp_eps)
 
+    # Each unique atom type contributes one σ and one ϵ parameter. The ordering
+    # established here becomes the canonical parameter ordering everywhere else.
     for idx in eachindex(atoms_cpu)
         atom = atoms_cpu[idx]
         atype = String(sys_ref.atoms_data[idx].atom_type)
@@ -121,6 +141,8 @@ function initialize_parameter_state(
     phi_active = zeros(FT, length(theta_ref))
     theta_active = map_phi_to_theta(phi_active, theta_min, theta_max, phi_0, opt_cfg.k_sigmoid)
 
+    # Rebuild injection maps for every leg so later reweighting can reuse the
+    # same global parameter vector across different systems.
     idxs_by_leg = Dict{Symbol, Any}()
     for leg in cycle_cfg.legs
         sys_leg = leg.name == ref_leg.name ? sys_ref : System(leg.pdb, ff; array_type=AT, nonbonded_method=:none)
@@ -144,6 +166,12 @@ function initialize_parameter_state(
 end
 
 
+"""
+    setup_macro_legs(cycle_cfg, sim_cfg, runtime, theta_active, idxs_by_leg,
+                     T_coord, T_vol, T_en, macro_epoch, restart_rmsd_tol_nm)
+
+Create or warm-start the AWH simulations for the current macro epoch.
+"""
 function setup_macro_legs(
     cycle_cfg::ThermodynamicCycleConfig,
     sim_cfg::SimulationConfig,
@@ -209,6 +237,13 @@ function setup_macro_legs(
 end
 
 
+"""
+    run_readiness_loop!(cycle_cfg, awh_by_leg, sys_by_leg, idxs_by_leg, runtime,
+                        theta_active, param_names, ... )
+
+Advance each leg through repeated Stage A blocks until all legs either pass the
+Stage B probe and freeze, or one of them exhausts its AWH budget.
+"""
 function run_readiness_loop!(
     cycle_cfg::ThermodynamicCycleConfig,
     awh_by_leg::Dict{Symbol, Any},
@@ -346,6 +381,9 @@ function run_readiness_loop!(
                     split_gap_by_leg[name] = stageB_stats_by_leg[name].split_gap
                     parity_gap_by_leg[name] = stageB_stats_by_leg[name].parity_gap
                     if stageB_stats_by_leg[name].ready
+                        # Once a leg passes Stage B it is frozen for the rest of
+                        # the macro epoch; the bias and restart snapshot are kept
+                        # for later production/resimulation.
                         leg_status[name] = :ready_frozen
                         @info "$(uppercasefirst(String(name))) leg frozen after passing Stage B (split_gap=$(round(split_gap_by_leg[name], digits=4)) kT, parity_gap=$(round(parity_gap_by_leg[name], digits=4)) kT)."
                     else
@@ -413,6 +451,14 @@ function run_readiness_loop!(
 end
 
 
+"""
+    collect_production_artifacts!(cycle_cfg, awh_by_leg, sys_by_leg, idxs_by_leg,
+                                  runtime, theta_active, param_names, md_steps_prod,
+                                  p0_energy_per_vol, awh_control)
+
+Run the final production segment for each ready leg and package the results for
+the optimization phase.
+"""
 function collect_production_artifacts!(
     cycle_cfg::ThermodynamicCycleConfig,
     awh_by_leg::Dict{Symbol, Any},
@@ -446,6 +492,8 @@ function collect_production_artifacts!(
         awh_prod.state.active_sys.loggers.awh_logger.should_log = true
         simulate!(awh_prod, md_steps_prod)
 
+        # Persist the end-of-production state so the next macro epoch can start
+        # close to the current basin.
         runtime.restart_cache[name] = capture_restart_state(awh_prod)
 
         logger_prod = get_production_logger(awh_prod, String(name))
@@ -481,6 +529,19 @@ function collect_production_artifacts!(
 end
 
 
+"""
+    run_pipeline(; sim_cfg=default_simulation_config(),
+                   opt_cfg=default_optimization_config())
+
+Run the full outer loop:
+
+1. Apply the requested simulation configuration.
+2. Repeatedly sample each cycle leg until readiness passes.
+3. Collect production artifacts and update the active parameter vector.
+
+The returned `RuntimeState` contains the final parameters, reusable bias state,
+and restart snapshots from the last macro epoch.
+"""
 function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), opt_cfg::OptimizationConfig=default_optimization_config())
     apply_simulation_config!(sim_cfg)
     FT = sim_cfg.FT

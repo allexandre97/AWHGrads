@@ -1,10 +1,19 @@
-# Ensemble evaluation helpers extracted from main_alch.jl
+"""
+    steps_to_ns(n_steps)
 
+Convert an MD step count into nanoseconds using the active module timestep.
+"""
 function steps_to_ns(n_steps::Int)
     return FT(ustrip(u"ns", n_steps * Δt))
 end
 
-##
+"""
+    precompute_neighbors(logger, sys)
+
+Replay the logged trajectory and cache a neighbor list for every saved frame.
+This keeps the later energy/gradient evaluation pass deterministic and avoids
+rebuilding neighbor lists inside the tight inner loops.
+"""
 function precompute_neighbors(logger, sys)
     sys = Molly.from_device(sys)  
     neighbors = []  
@@ -22,7 +31,15 @@ function precompute_neighbors(logger, sys)
     return neighbors  
 end
 
-##
+"""
+    evaluate_ensemble(logger, neighbors, awh_sim_prod, sys_base, params, param_names,
+                      atom_idxs, pairwise_idxs, specific_idxs, general_idxs;
+                      compute_gradients=true)
+
+Evaluate the stored production frames under every λ state for a candidate
+parameter vector. When `compute_gradients=true`, the result also includes a
+parameter-name keyed dictionary of frame-by-frame gradients.
+"""
 function evaluate_ensemble(logger, neighbors, awh_sim_prod, sys_base, 
                            params::Vector{FT}, param_names::Vector{String},
                            atom_idxs, pairwise_idxs, specific_idxs, general_idxs;
@@ -34,6 +51,8 @@ function evaluate_ensemble(logger, neighbors, awh_sim_prod, sys_base,
     energies = zeros(FT, num_frames, num_lambda)  
     gradients_raw = compute_gradients ? [zeros(FT, num_frames, num_lambda) for _ in 1:num_params] : nothing
     
+    # Each λ window gets a CPU-side template stripped of units so Enzyme sees a
+    # stable, allocation-light function signature.
     cpu_templates = Vector{System}(undef, num_lambda)  
     for l in 1:num_lambda  
         sys_template_gpu = System(
@@ -48,6 +67,8 @@ function evaluate_ensemble(logger, neighbors, awh_sim_prod, sys_base,
         cpu_templates[l] = Molly.from_device(sys_nounits)  
     end
 
+    # Thread-local scratch buffers avoid races while keeping the per-frame loop
+    # free of repeated allocations.
     n_threads = Threads.nthreads()  
     thread_templates = [deepcopy(cpu_templates) for _ in 1:n_threads]  
     thread_params    = [deepcopy(params) for _ in 1:n_threads] 
@@ -65,7 +86,6 @@ function evaluate_ensemble(logger, neighbors, awh_sim_prod, sys_base,
         end  
     end
     
-    progress = Threads.Atomic{Int}(0)  
     batch_size = n_threads   
     for b in 1:batch_size:num_frames  
         end_idx = min(b + batch_size - 1, num_frames)

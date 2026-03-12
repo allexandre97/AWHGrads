@@ -1,5 +1,10 @@
-# Logger/history utilities extracted from main_alch.jl
+"""
+    get_production_logger(awh_sim_prod, leg_name)
 
+Return the logger history for a finished production simulation. If the active
+system logger is empty, the function reconstructs a combined history from the
+per-state loggers that Molly stores internally.
+"""
 function get_production_logger(awh_sim_prod::AWHSimulation, leg_name::String)
     logger_main = awh_sim_prod.state.active_sys.loggers.awh_logger
     if !isempty(logger_main.active_idx_history)
@@ -31,7 +36,11 @@ function get_production_logger(awh_sim_prod::AWHSimulation, leg_name::String)
     return logger_combined
 end
 
+"""
+    clear_awh_logger_history!(logger)
 
+Drop all stored frame histories from a single AWH logger.
+"""
 function clear_awh_logger_history!(logger)
     empty!(logger.active_idx_history)
     empty!(logger.coords_history)
@@ -40,6 +49,11 @@ function clear_awh_logger_history!(logger)
     return nothing
 end
 
+"""
+    subset_awh_logger_frames(logger, frame_idxs)
+
+Return a deep-copied logger containing only the selected frame indices.
+"""
 function subset_awh_logger_frames(logger, frame_idxs::Vector{Int})
     n_frames = length(logger.active_idx_history)
     if isempty(frame_idxs)
@@ -63,7 +77,12 @@ function subset_awh_logger_frames(logger, frame_idxs::Vector{Int})
     return logger_subset
 end
 
-##
+"""
+    clear_awh_logger_histories!(awh_sim)
+
+Clear the active-system logger and every per-state logger attached to an
+`AWHSimulation`.
+"""
 function clear_awh_logger_histories!(awh_sim::AWHSimulation)
     if hasproperty(awh_sim.state.active_sys.loggers, :awh_logger)
         clear_awh_logger_history!(awh_sim.state.active_sys.loggers.awh_logger)
@@ -76,6 +95,12 @@ function clear_awh_logger_histories!(awh_sim::AWHSimulation)
     return nothing
 end
 
+"""
+    get_awh_active_idx_history(awh_sim)
+
+Recover the λ-index history used by readiness checks, preferring Molly's
+lightweight stats stream before falling back to explicit logger histories.
+"""
 function get_awh_active_idx_history(awh_sim)
     if !hasproperty(awh_sim, :state)
         return Int[]
