@@ -200,8 +200,7 @@ function setup_macro_legs(
         awh_leg, sys_leg = setup_alchemical_awh(
             leg.pdb,
             sim_cfg.solute_idx;
-            coulomb_lambda_values=state_schedule.coulomb,
-            lj_lambda_values=state_schedule.lj,
+            lambda_values=state_schedule.lambda,
             awh_control=sim_cfg.awh_control,
             is_vacuum=leg.is_vacuum,
             ensemble=leg.ensemble,
@@ -523,7 +522,7 @@ function collect_production_artifacts!(
             coefficient=FT(leg.coefficient),
             include_pv=leg.include_pv,
             p0_energy_per_vol=leg.include_pv ? p0_energy_per_vol : zero(FT),
-            n_states=length(state_schedules_by_leg[name].coulomb),
+            n_states=length(state_schedules_by_leg[name].lambda),
             coupled_state_idx=state_schedules_by_leg[name].coupled_state_idx,
             decoupled_state_idx=state_schedules_by_leg[name].decoupled_state_idx,
             awh_prod=awh_prod,

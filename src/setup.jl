@@ -45,19 +45,29 @@ function awh_coupling_methods(is_vacuum::Bool, ensemble::Symbol)
 end
 
 """
+    awh_global_lambda_schedule(lambda_values, FT=Float32)
+
+Resolve and validate the global atom λ ladder used by Molly's default
+alchemical scheduler.
+"""
+function awh_global_lambda_schedule(lambda_values, ::Type{FT}=Float32) where {FT <: AbstractFloat}
+    global_values = FT.(collect(lambda_values))
+    validate_lambda_schedule(global_values)
+    return global_values
+end
+
+"""
     setup_alchemical_awh(pdb_file, solute_indices; kwargs...)
 
 Build a λ-expanded AWH simulation for one thermodynamic leg. The function
 optionally injects optimized parameters, restores a warm-start restart state,
-reuses a previously learned bias estimate, and supports separate Coulomb/LJ
-schedules per leg.
+reuses a previously learned bias estimate, and lets Molly's default lambda
+scheduler map the global atom λ values onto the soft-core Coulomb/LJ scaling.
 """
 function setup_alchemical_awh(
     pdb_file,
     solute_indices;
     lambda_values=lambda_schedule,
-    coulomb_lambda_values=nothing,
-    lj_lambda_values=nothing,
     awh_control=AWHControlConfig(),
     is_vacuum=false,
     ensemble::Symbol=:npt,
@@ -110,15 +120,8 @@ function setup_alchemical_awh(
     coupling_methods = awh_coupling_methods(is_vacuum, ensemble)
     integrator = VelocityVerlet(Δt, coupling_methods, 100)
 
-    coulomb_schedule = isnothing(coulomb_lambda_values) ? FT.(collect(lambda_values)) : FT.(collect(coulomb_lambda_values))
-    lj_schedule = isnothing(lj_lambda_values) ? FT.(collect(lambda_values)) : FT.(collect(lj_lambda_values))
-    if length(coulomb_schedule) != length(lj_schedule)
-        throw(ArgumentError("Coulomb and LJ schedules must have equal length; got $(length(coulomb_schedule)) and $(length(lj_schedule))."))
-    end
-    if length(coulomb_schedule) < 2
-        throw(ArgumentError("Alchemical schedules must contain at least two states."))
-    end
-    atom_lambda_schedule = collect(range(one(FT), stop=zero(FT), length=length(coulomb_schedule)))
+    atom_lambda_schedule = awh_global_lambda_schedule(lambda_values, FT)
+    solute_index_set = Set(solute_indices)
 
     if warm_start && !isnothing(restart_state)
         sys_base = System(
@@ -140,43 +143,37 @@ function setup_alchemical_awh(
     lj_0 = p_inters[idx_lj]  
     cl_0 = p_inters[idx_coul]  
 
+    lj_sc = LennardJonesSoftCoreBeutler(
+        cutoff=lj_0.cutoff,
+        α=FT(awh_control.lj_softcore_alpha),
+        use_neighbors=lj_0.use_neighbors,
+        shortcut=lj_0.shortcut,
+        σ_mixing=lj_0.σ_mixing,
+        ϵ_mixing=lj_0.ϵ_mixing,
+        weight_special=lj_0.weight_special,
+    )
+    coul_sc = CoulombSoftCoreBeutler(
+        cutoff=cl_0.cutoff,
+        α=FT(awh_control.coul_softcore_alpha),
+        use_neighbors=cl_0.use_neighbors,
+        weight_special=cl_0.weight_special,
+        coulomb_const=cl_0.coulomb_const,
+    )
+
     thermo_states = ThermoState[]  
 
     # Construct one thermodynamic state per λ window by only changing the
-    # alchemical role of the solute atoms.
-    for state_idx in eachindex(coulomb_schedule)
+    # solute atoms' global λ values and alchemical role.
+    for state_idx in eachindex(atom_lambda_schedule)
         λ_atom = atom_lambda_schedule[state_idx]
-        λ_coul = coulomb_schedule[state_idx]
-        λ_lj = lj_schedule[state_idx]
         acopy = Atom[]  
         for (i, a) in enumerate(seeded_atoms)
-            if a.index ∈ solute_indices 
+            if a.index in solute_index_set
                 push!(acopy, Atom(a.index, a.atom_type, a.mass, a.charge, a.σ, a.ϵ, FT(λ_atom), Molly.InsertRole))
             else
                 push!(acopy, Atom(a.index, a.atom_type, a.mass, a.charge, a.σ, a.ϵ, a.λ, a.alch_role))  
             end
         end
-
-        lj_sc = LennardJonesSoftCoreBeutler(
-            cutoff=lj_0.cutoff,
-            α=FT(awh_control.lj_softcore_alpha),
-            λ=FT(λ_lj),
-            use_neighbors=lj_0.use_neighbors,
-            shortcut=lj_0.shortcut,
-            σ_mixing=lj_0.σ_mixing,
-            ϵ_mixing=lj_0.ϵ_mixing,
-            weight_special=lj_0.weight_special,
-        )
-        coul_sc = CoulombSoftCoreBeutler(
-            cutoff=cl_0.cutoff,
-            α=FT(awh_control.coul_softcore_alpha),
-            λ=FT(λ_coul),
-            use_neighbors=cl_0.use_neighbors,
-            σ_mixing=cl_0.σ_mixing,
-            ϵ_mixing=cl_0.ϵ_mixing,
-            weight_special=cl_0.weight_special,
-            coulomb_const=cl_0.coulomb_const,
-        )
 
         sys_w = System(
             deepcopy(sys_base);
@@ -187,7 +184,7 @@ function setup_alchemical_awh(
         push!(thermo_states, ThermoState(sys_w, deepcopy(integrator)))  
     end
 
-    first_state = (warm_start && !isnothing(restart_state)) ? clamp(restart_active_idx, 1, length(coulomb_schedule)) : 1
+    first_state = (warm_start && !isnothing(restart_state)) ? clamp(restart_active_idx, 1, length(atom_lambda_schedule)) : 1
     awh_state = AWHState(thermo_states; awh_state_control_kwargs(awh_control; first_state=first_state)...)
     
     if !isnothing(injected_bias)  

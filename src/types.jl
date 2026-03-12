@@ -46,8 +46,6 @@ Base.@kwdef struct ThermodynamicLegConfig
     is_vacuum::Bool = false
     include_pv::Bool = false
     probe_time = Float32(0.5)u"ns"
-    coulomb_lambda_schedule::Union{Nothing, Vector{<:Real}} = nothing
-    lj_lambda_schedule::Union{Nothing, Vector{<:Real}} = nothing
     ensemble::Symbol = :npt
 end
 
@@ -58,8 +56,7 @@ Concrete per-leg alchemical state schedule used at runtime after applying
 fallbacks and validation.
 """
 struct ResolvedLegStateSchedule{FT <: AbstractFloat}
-    coulomb::Vector{FT}
-    lj::Vector{FT}
+    lambda::Vector{FT}
     coupled_state_idx::Int
     decoupled_state_idx::Int
 end

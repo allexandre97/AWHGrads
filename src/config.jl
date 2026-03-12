@@ -1,26 +1,10 @@
 """
-    default_solvent_leg_schedules(FT=Float32)
-
-Return the staged solvent-leg Coulomb/LJ schedules used by the default
-hydration cycle.
-"""
-function default_solvent_leg_schedules(::Type{FT}=Float32) where {FT <: AbstractFloat}
-    charge_stage = collect(FT.(range(one(FT), stop=zero(FT), length=11)))
-    lj_stage = reverse(FT.(collect(range(zero(FT), stop=one(FT), length=21)) .^ 2))[2:end]
-    return (
-        coulomb_lambda_schedule = vcat(charge_stage, zeros(FT, length(lj_stage))),
-        lj_lambda_schedule = vcat(ones(FT, length(charge_stage)), lj_stage),
-    )
-end
-
-"""
     default_cycle_config(; target_dG_kcal_mol=-5.01, FT=Float32)
 
 Return the built-in two-leg ethanol hydration cycle used by the example
 scripts.
 """
 function default_cycle_config(; target_dG_kcal_mol::Real=-5.01, FT::DataType=Float32)
-    solvent_schedule = default_solvent_leg_schedules(FT)
     legs = [
         ThermodynamicLegConfig(
             name=:solvent,
@@ -29,8 +13,6 @@ function default_cycle_config(; target_dG_kcal_mol::Real=-5.01, FT::DataType=Flo
             is_vacuum=false,
             include_pv=true,
             probe_time=FT(1.5)u"ns",
-            coulomb_lambda_schedule=solvent_schedule.coulomb_lambda_schedule,
-            lj_lambda_schedule=solvent_schedule.lj_lambda_schedule,
             ensemble=:npt,
         ),
         ThermodynamicLegConfig(
@@ -134,7 +116,6 @@ function resolved_cycle_config(sim_cfg::SimulationConfig)
         return sim_cfg.cycle
     end
 
-    solvent_schedule = default_solvent_leg_schedules(sim_cfg.FT)
     return ThermodynamicCycleConfig(
         legs=[
             ThermodynamicLegConfig(
@@ -144,8 +125,6 @@ function resolved_cycle_config(sim_cfg::SimulationConfig)
                 is_vacuum=false,
                 include_pv=true,
                 probe_time=sim_cfg.awh_probe_time_solv,
-                coulomb_lambda_schedule=solvent_schedule.coulomb_lambda_schedule,
-                lj_lambda_schedule=solvent_schedule.lj_lambda_schedule,
                 ensemble=:npt,
             ),
             ThermodynamicLegConfig(
@@ -194,24 +173,10 @@ function _validate_leg_ensemble(leg::ThermodynamicLegConfig)
     return nothing
 end
 
-function _validate_leg_schedule_values(values::Vector{FT}, label::String, leg_name::Symbol) where {FT <: AbstractFloat}
-    if length(values) < 2
-        throw(ArgumentError("Leg $(leg_name) $(label) must contain at least two states."))
-    end
-    if any(v -> !isfinite(v), values)
-        throw(ArgumentError("Leg $(leg_name) $(label) contains non-finite values."))
-    end
-    if any(v -> v < zero(FT) || v > one(FT), values)
-        throw(ArgumentError("Leg $(leg_name) $(label) must lie in [0, 1]."))
-    end
-    return nothing
-end
-
 """
     resolve_leg_state_schedule(leg, default_lambda_schedule, FT=Float32)
 
-Resolve a leg's runtime Coulomb/LJ schedules, falling back to the global
-`default_lambda_schedule` when the leg does not override them.
+Resolve a leg's runtime global λ schedule.
 """
 function resolve_leg_state_schedule(
     leg::ThermodynamicLegConfig,
@@ -221,47 +186,27 @@ function resolve_leg_state_schedule(
     _validate_leg_ensemble(leg)
     validate_lambda_schedule(default_lambda_schedule)
 
-    if isnothing(leg.coulomb_lambda_schedule) != isnothing(leg.lj_lambda_schedule)
-        throw(ArgumentError("Leg $(leg.name) must set both coulomb_lambda_schedule and lj_lambda_schedule together, or leave both as nothing."))
-    end
-
-    if isnothing(leg.coulomb_lambda_schedule)
-        coulomb_values = FT.(collect(default_lambda_schedule))
-        lj_values = FT.(collect(default_lambda_schedule))
-    else
-        coulomb_values = FT.(collect(leg.coulomb_lambda_schedule))
-        lj_values = FT.(collect(leg.lj_lambda_schedule))
-    end
-
-    if length(coulomb_values) != length(lj_values)
-        throw(ArgumentError("Leg $(leg.name) Coulomb/LJ schedules must have equal length; got $(length(coulomb_values)) and $(length(lj_values))."))
-    end
-
-    _validate_leg_schedule_values(coulomb_values, "coulomb_lambda_schedule", leg.name)
-    _validate_leg_schedule_values(lj_values, "lj_lambda_schedule", leg.name)
+    lambda_values = FT.(collect(default_lambda_schedule))
 
     atol = sqrt(eps(FT))
     coupled_candidates = [
-        idx for idx in eachindex(coulomb_values)
-        if isapprox(coulomb_values[idx], one(FT); atol=atol, rtol=atol) &&
-           isapprox(lj_values[idx], one(FT); atol=atol, rtol=atol)
+        idx for idx in eachindex(lambda_values)
+        if isapprox(lambda_values[idx], one(FT); atol=atol, rtol=atol)
     ]
     decoupled_candidates = [
-        idx for idx in eachindex(coulomb_values)
-        if isapprox(coulomb_values[idx], zero(FT); atol=atol, rtol=atol) &&
-           isapprox(lj_values[idx], zero(FT); atol=atol, rtol=atol)
+        idx for idx in eachindex(lambda_values)
+        if isapprox(lambda_values[idx], zero(FT); atol=atol, rtol=atol)
     ]
 
     if length(coupled_candidates) != 1
-        throw(ArgumentError("Leg $(leg.name) must contain exactly one fully coupled state with Coulomb=1 and LJ=1; found $(length(coupled_candidates))."))
+        throw(ArgumentError("Leg $(leg.name) must contain exactly one fully coupled state with λ=1; found $(length(coupled_candidates))."))
     end
     if length(decoupled_candidates) != 1
-        throw(ArgumentError("Leg $(leg.name) must contain exactly one fully decoupled state with Coulomb=0 and LJ=0; found $(length(decoupled_candidates))."))
+        throw(ArgumentError("Leg $(leg.name) must contain exactly one fully decoupled state with λ=0; found $(length(decoupled_candidates))."))
     end
 
     return ResolvedLegStateSchedule{FT}(
-        coulomb_values,
-        lj_values,
+        lambda_values,
         only(coupled_candidates),
         only(decoupled_candidates),
     )

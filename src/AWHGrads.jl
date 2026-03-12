@@ -56,7 +56,6 @@ export StageBStats
 export default_simulation_config
 export default_optimization_config
 export default_cycle_config
-export default_solvent_leg_schedules
 export resolved_cycle_config
 export validate_cycle_config
 export validate_lambda_schedule
