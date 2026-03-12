@@ -40,6 +40,29 @@ function clear_awh_logger_history!(logger)
     return nothing
 end
 
+function subset_awh_logger_frames(logger, frame_idxs::Vector{Int})
+    n_frames = length(logger.active_idx_history)
+    if isempty(frame_idxs)
+        throw(ArgumentError("subset_awh_logger_frames received an empty frame index set."))
+    end
+    if n_frames == 0
+        throw(ArgumentError("subset_awh_logger_frames cannot operate on an empty logger history."))
+    end
+
+    idxs = sort(unique(frame_idxs))
+    if any(i -> i < 1 || i > n_frames, idxs)
+        throw(ArgumentError("subset_awh_logger_frames got indices outside valid range 1:$(n_frames)."))
+    end
+
+    logger_subset = deepcopy(logger)
+    clear_awh_logger_history!(logger_subset)
+    append!(logger_subset.active_idx_history, logger.active_idx_history[idxs])
+    append!(logger_subset.coords_history, logger.coords_history[idxs])
+    append!(logger_subset.volume_history, logger.volume_history[idxs])
+    append!(logger_subset.potential_energy_history, logger.potential_energy_history[idxs])
+    return logger_subset
+end
+
 ##
 function clear_awh_logger_histories!(awh_sim::AWHSimulation)
     if hasproperty(awh_sim.state.active_sys.loggers, :awh_logger)

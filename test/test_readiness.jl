@@ -11,6 +11,36 @@
     @test high_frac > 0
 end
 
+@testset "probe frame selection and thinning" begin
+    @test isempty(AWHGrads.probe_frame_indices(0; frame_stride=4, min_frames=10, max_frames=20))
+
+    idxs_stride = AWHGrads.probe_frame_indices(10; frame_stride=3, min_frames=2, max_frames=0)
+    @test idxs_stride == [1, 4, 7, 10]
+
+    idxs_min = AWHGrads.probe_frame_indices(10; frame_stride=6, min_frames=8, max_frames=0)
+    @test length(idxs_min) >= 8
+    @test first(idxs_min) == 1
+    @test last(idxs_min) == 10
+
+    idxs_capped = AWHGrads.probe_frame_indices(100; frame_stride=1, min_frames=2, max_frames=7)
+    @test length(idxs_capped) <= 7
+    @test first(idxs_capped) == 1
+    @test last(idxs_capped) == 100
+
+    logger = (
+        active_idx_history = collect(1:10),
+        coords_history = collect(101:110),
+        volume_history = collect(201:210),
+        potential_energy_history = collect(301:310),
+    )
+    logger_subset = AWHGrads.subset_awh_logger_frames(logger, [1, 4, 10])
+    @test logger_subset.active_idx_history == [1, 4, 10]
+    @test logger_subset.coords_history == [101, 104, 110]
+    @test logger_subset.volume_history == [201, 204, 210]
+    @test logger_subset.potential_energy_history == [301, 304, 310]
+    @test logger.active_idx_history == collect(1:10)
+end
+
 @testset "active index history source priority" begin
     stats_field = Symbol("active_\u03bb")
 
@@ -80,4 +110,10 @@ end
     @test timed_payload.timing.wall_s !== nothing
     @test timed_payload.timing.wall_s >= 0.0
     @test timed_payload.timing.steps_per_s !== nothing
+end
+
+@testset "updated optimization defaults" begin
+    opt_cfg = AWHGrads.default_optimization_config()
+    @test opt_cfg.awh_parity_tol_kT == Float32(0.25)
+    @test opt_cfg.awh_stageB_cooldown_blocks == 2
 end

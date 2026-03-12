@@ -219,6 +219,9 @@ function run_readiness_loop!(
     md_steps_block::Int,
     md_steps_rewarm::Int,
     probe_steps_by_leg::Dict{Symbol, Int},
+    probe_stride_by_leg::Dict{Symbol, Int},
+    probe_min_frames_by_leg::Dict{Symbol, Int},
+    probe_max_frames_by_leg::Dict{Symbol, Int},
     awh_budget_time,
     awh_convergence_tol::FT,
     awh_min_linear_neff::Int,
@@ -228,6 +231,7 @@ function run_readiness_loop!(
     awh_min_round_trips::Int,
     awh_endpoint_min_fraction::FT,
     awh_stageA_stable_blocks::Int,
+    awh_stageB_cooldown_blocks::Int,
     beta_val::FT,
     p0_energy_per_vol::FT,
 ) where {FT <: AbstractFloat}
@@ -237,10 +241,12 @@ function run_readiness_loop!(
     stageA_stats_by_leg = Dict{Symbol, StageAStats}(leg.name => stageA_default for leg in cycle_cfg.legs)
     stageB_stats_by_leg = Dict{Symbol, StageBStats}(leg.name => stageB_default for leg in cycle_cfg.legs)
     stageA_streak = Dict{Symbol, Int}(leg.name => 0 for leg in cycle_cfg.legs)
+    stageB_cooldown = Dict{Symbol, Int}(leg.name => 0 for leg in cycle_cfg.legs)
     spent_steps = Dict{Symbol, Int}(leg.name => 0 for leg in cycle_cfg.legs)
     leg_status = Dict{Symbol, Symbol}(leg.name => :active for leg in cycle_cfg.legs)
     split_gap_by_leg = Dict{Symbol, FT}(leg.name => FT(Inf) for leg in cycle_cfg.legs)
     parity_gap_by_leg = Dict{Symbol, FT}(leg.name => FT(Inf) for leg in cycle_cfg.legs)
+    cooldown_blocks = max(0, awh_stageB_cooldown_blocks)
 
     for leg in cycle_cfg.legs
         runtime.active_bias[leg.name] = extract_awh_data(awh_by_leg[leg.name])
@@ -304,31 +310,43 @@ function run_readiness_loop!(
             end
 
             if stageA_streak[name] >= awh_stageA_stable_blocks
-                probe_steps = probe_steps_by_leg[name]
-                @info "Stage A ($(name)) reached stable streak ($(stageA_streak[name])/$(awh_stageA_stable_blocks)); entering Stage B probe | probe_steps=$probe_steps | probe_ns=$(round(steps_to_ns(probe_steps), digits=4))"
-                stageB_stats_by_leg[name] = StageBStats(run_stage_b_probe(
-                    awh_leg,
-                    sys_by_leg[name],
-                    theta_active,
-                    param_names,
-                    idxs_by_leg[name],
-                    num_lambda_states,
-                    beta_val,
-                    awh_split_tol_kT,
-                    awh_parity_tol_kT;
-                    md_steps_probe=probe_steps_by_leg[name],
-                    leg_name=String(name),
-                    include_pv=leg.include_pv,
-                    P0_energy_per_vol=leg.include_pv ? p0_energy_per_vol : zero(FT),
-                ))
-
-                split_gap_by_leg[name] = stageB_stats_by_leg[name].split_gap
-                parity_gap_by_leg[name] = stageB_stats_by_leg[name].parity_gap
-                if stageB_stats_by_leg[name].ready
-                    leg_status[name] = :ready_frozen
-                    @info "$(uppercasefirst(String(name))) leg frozen after passing Stage B (split_gap=$(round(split_gap_by_leg[name], digits=4)) kT, parity_gap=$(round(parity_gap_by_leg[name], digits=4)) kT)."
+                if stageB_cooldown[name] > 0
+                    @info "Stage B ($(name)) cooldown active: remaining_checks=$(stageB_cooldown[name]); skipping probe this block."
+                    stageB_cooldown[name] -= 1
                 else
-                    stageA_streak[name] = 0
+                    probe_steps = probe_steps_by_leg[name]
+                    @info "Stage A ($(name)) reached stable streak ($(stageA_streak[name])/$(awh_stageA_stable_blocks)); entering Stage B probe | probe_steps=$probe_steps | probe_ns=$(round(steps_to_ns(probe_steps), digits=4))"
+                    stageB_stats_by_leg[name] = StageBStats(run_stage_b_probe(
+                        awh_leg,
+                        sys_by_leg[name],
+                        theta_active,
+                        param_names,
+                        idxs_by_leg[name],
+                        num_lambda_states,
+                        beta_val,
+                        awh_split_tol_kT,
+                        awh_parity_tol_kT;
+                        md_steps_probe=probe_steps_by_leg[name],
+                        leg_name=String(name),
+                        include_pv=leg.include_pv,
+                        P0_energy_per_vol=leg.include_pv ? p0_energy_per_vol : zero(FT),
+                        probe_frame_stride=probe_stride_by_leg[name],
+                        probe_min_frames=probe_min_frames_by_leg[name],
+                        probe_max_frames=probe_max_frames_by_leg[name],
+                    ))
+
+                    split_gap_by_leg[name] = stageB_stats_by_leg[name].split_gap
+                    parity_gap_by_leg[name] = stageB_stats_by_leg[name].parity_gap
+                    if stageB_stats_by_leg[name].ready
+                        leg_status[name] = :ready_frozen
+                        @info "$(uppercasefirst(String(name))) leg frozen after passing Stage B (split_gap=$(round(split_gap_by_leg[name], digits=4)) kT, parity_gap=$(round(parity_gap_by_leg[name], digits=4)) kT)."
+                    else
+                        stageA_streak[name] = 0
+                        stageB_cooldown[name] = cooldown_blocks
+                        if cooldown_blocks > 0
+                            @info "Stage B ($(name)) failed; scheduling cooldown for $cooldown_blocks stable-check opportunities."
+                        end
+                    end
                 end
             end
 
@@ -352,7 +370,7 @@ function run_readiness_loop!(
         for leg in cycle_cfg.legs
             name = leg.name
             statsA = stageA_stats_by_leg[name]
-            @info "  Stage A ($(name)): df=$(round(statsA.df_mean, digits=6)) (ok=$(statsA.df_ready)) | neff=$(round(statsA.linear_neff, digits=1)) (ok=$(statsA.neff_ready)) | rt=$(statsA.round_trips) (ok=$(statsA.round_trip_ready)) | endpt=($(round(statsA.endpoint_low, digits=3)), $(round(statsA.endpoint_high, digits=3))) (ok=$(statsA.endpoint_ready)) | n_hist=$(statsA.n_hist) | streak=$(stageA_streak[name])"
+            @info "  Stage A ($(name)): df=$(round(statsA.df_mean, digits=6)) (ok=$(statsA.df_ready)) | neff=$(round(statsA.linear_neff, digits=1)) (ok=$(statsA.neff_ready)) | rt=$(statsA.round_trips) (ok=$(statsA.round_trip_ready)) | endpt=($(round(statsA.endpoint_low, digits=3)), $(round(statsA.endpoint_high, digits=3))) (ok=$(statsA.endpoint_ready)) | n_hist=$(statsA.n_hist) | streak=$(stageA_streak[name]) | cooldown=$(stageB_cooldown[name])"
 
             statsB = stageB_stats_by_leg[name]
             if statsB.n_frames > 0
@@ -473,8 +491,20 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
     )
 
     probe_steps_by_leg = Dict{Symbol, Int}()
+    probe_stride_by_leg = Dict{Symbol, Int}()
+    probe_min_frames_by_leg = Dict{Symbol, Int}()
+    probe_max_frames_by_leg = Dict{Symbol, Int}()
     for leg in cycle_cfg.legs
         probe_steps_by_leg[leg.name] = time_to_steps_round(leg.probe_time)
+        if leg.is_vacuum
+            probe_stride_by_leg[leg.name] = max(1, sim_cfg.awh_probe_reweight_stride_vac)
+            probe_min_frames_by_leg[leg.name] = max(2, sim_cfg.awh_probe_reweight_min_frames_vac)
+            probe_max_frames_by_leg[leg.name] = max(0, sim_cfg.awh_probe_reweight_max_frames_vac)
+        else
+            probe_stride_by_leg[leg.name] = max(1, sim_cfg.awh_probe_reweight_stride_solv)
+            probe_min_frames_by_leg[leg.name] = max(2, sim_cfg.awh_probe_reweight_min_frames_solv)
+            probe_max_frames_by_leg[leg.name] = max(0, sim_cfg.awh_probe_reweight_max_frames_solv)
+        end
     end
 
     T_coord = typeof(FT(1.0)u"nm")
@@ -531,6 +561,9 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             md_steps_block,
             md_steps_rewarm,
             probe_steps_by_leg,
+            probe_stride_by_leg,
+            probe_min_frames_by_leg,
+            probe_max_frames_by_leg,
             sim_cfg.awh_budget_time,
             opt_cfg.awh_convergence_tol,
             opt_cfg.awh_min_linear_neff,
@@ -540,6 +573,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             opt_cfg.awh_min_round_trips,
             opt_cfg.awh_endpoint_min_fraction,
             opt_cfg.awh_stageA_stable_blocks,
+            opt_cfg.awh_stageB_cooldown_blocks,
             beta_val,
             p0_energy_per_vol,
         )

@@ -110,6 +110,40 @@ function split_half_ranges(n::Int)
     return (1:n_first, (n_first + 1):n)
 end
 
+function probe_frame_indices(
+    n_frames::Int;
+    frame_stride::Int=1,
+    min_frames::Int=2,
+    max_frames::Int=0,
+)
+    if n_frames <= 0
+        return Int[]
+    end
+
+    stride = max(1, frame_stride)
+    required = min(n_frames, max(2, min_frames))
+    idxs = collect(1:stride:n_frames)
+    if isempty(idxs) || last(idxs) != n_frames
+        push!(idxs, n_frames)
+    end
+
+    if max_frames > 0 && length(idxs) > max_frames
+        target = min(n_frames, max(2, max_frames))
+        idxs = unique(clamp.(round.(Int, range(1, n_frames, length=target)), 1, n_frames))
+    end
+
+    if length(idxs) < required
+        idxs = unique(clamp.(round.(Int, range(1, n_frames, length=required)), 1, n_frames))
+    end
+
+    sort!(idxs)
+    if isempty(idxs) || last(idxs) != n_frames
+        push!(idxs, n_frames)
+        sort!(idxs)
+    end
+    return idxs
+end
+
 
 function count_full_round_trips(active_idx_history::Vector{Int}, low_idx::Int, high_idx::Int)
     if isempty(active_idx_history)
@@ -198,7 +232,10 @@ function run_stage_b_probe(
     md_steps_probe::Int,
     leg_name::String,
     include_pv::Bool=false,
-    P0_energy_per_vol::FT=zero(FT)
+    P0_energy_per_vol::FT=zero(FT),
+    probe_frame_stride::Int=1,
+    probe_min_frames::Int=2,
+    probe_max_frames::Int=0,
 ) where {FT <: AbstractFloat}
     if md_steps_probe <= 0
         @info "Stage B ($(leg_name)) skipped: md_steps_probe <= 0 (md_steps_probe=$md_steps_probe)."
@@ -227,10 +264,35 @@ function run_stage_b_probe(
         simulate!(probe_sim, md_steps_probe)
     end
 
-    logger_probe = get_production_logger(probe_sim, "$leg_name probe")
+    logger_probe_raw = get_production_logger(probe_sim, "$leg_name probe")
+    n_frames_raw = length(logger_probe_raw.active_idx_history)
+    if n_frames_raw < 2
+        @info "Stage B ($(leg_name)) early exit: insufficient probe frames (n_frames=$n_frames_raw, required=2) | probe_md_wall_s=$(round(probe_md_timed.timing.wall_s, digits=3)) | probe_md_steps_per_s=$(round(probe_md_timed.timing.steps_per_s, digits=2))"
+        return (
+            ready = false,
+            split_ready = false,
+            split_gap = FT(Inf),
+            parity_ready = false,
+            parity_gap = FT(Inf),
+            n_frames = n_frames_raw,
+            dG_half_1 = FT(NaN),
+            dG_half_2 = FT(NaN)
+        )
+    end
+
+    probe_idxs = probe_frame_indices(
+        n_frames_raw;
+        frame_stride=probe_frame_stride,
+        min_frames=probe_min_frames,
+        max_frames=probe_max_frames,
+    )
+    logger_probe = subset_awh_logger_frames(logger_probe_raw, probe_idxs)
     n_frames = length(logger_probe.active_idx_history)
+    max_frames_msg = probe_max_frames > 0 ? string(probe_max_frames) : "none"
+    @info "Stage B ($(leg_name)) probe frame selection: raw_frames=$n_frames_raw | used_frames=$n_frames | stride=$(max(1, probe_frame_stride)) | min_frames=$(max(2, probe_min_frames)) | max_frames=$max_frames_msg"
+
     if n_frames < 2
-        @info "Stage B ($(leg_name)) early exit: insufficient probe frames (n_frames=$n_frames, required=2) | probe_md_wall_s=$(round(probe_md_timed.timing.wall_s, digits=3)) | probe_md_steps_per_s=$(round(probe_md_timed.timing.steps_per_s, digits=2))"
+        @info "Stage B ($(leg_name)) early exit: insufficient selected probe frames (n_frames=$n_frames, required=2) | probe_md_wall_s=$(round(probe_md_timed.timing.wall_s, digits=3)) | probe_md_steps_per_s=$(round(probe_md_timed.timing.steps_per_s, digits=2))"
         return (
             ready = false,
             split_ready = false,

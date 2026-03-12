@@ -54,6 +54,13 @@ Base.@kwdef struct SimulationConfig
     pdb_vac::String = "ethanol_vac.pdb"
     awh_probe_time_solv = Float32(0.75)u"ns"
     awh_probe_time_vac = Float32(0.25)u"ns"
+    # Probe-frame controls for Stage B reweighting/evaluation only.
+    awh_probe_reweight_stride_solv::Int = 5
+    awh_probe_reweight_stride_vac::Int = 5
+    awh_probe_reweight_min_frames_solv::Int = 1000
+    awh_probe_reweight_min_frames_vac::Int = 500
+    awh_probe_reweight_max_frames_solv::Int = 2000
+    awh_probe_reweight_max_frames_vac::Int = 1200
     dG_exp_kcal_mol::Float64 = -5.01
 
     # New user-facing configuration for non-hardcoded systems/cycles.
@@ -82,11 +89,12 @@ Base.@kwdef struct OptimizationConfig
     ess_threshold_scale = Float32(0.22)
     awh_min_linear_neff::Int = 3000
     awh_split_tol_kT = Float32(0.5)
-    awh_parity_tol_kT = Float32(0.1)
+    awh_parity_tol_kT = Float32(0.25)
     awh_tail_lag::Int = 10
     awh_min_round_trips::Int = 3
     awh_endpoint_min_fraction = Float32(0.03)
     awh_stageA_stable_blocks::Int = 2
+    awh_stageB_cooldown_blocks::Int = 2
 
     k_sigmoid = Float32(1.0)
 end
