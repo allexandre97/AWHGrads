@@ -236,6 +236,9 @@ function run_stage_b_probe(
     probe_frame_stride::Int=1,
     probe_min_frames::Int=2,
     probe_max_frames::Int=0,
+    awh_probe_update_freq::Int=typemax(Int),
+    awh_well_tempered_factor::Real=Inf,
+    awh_coverage_type::Symbol=:physical,
 ) where {FT <: AbstractFloat}
     if md_steps_probe <= 0
         @info "Stage B ($(leg_name)) skipped: md_steps_probe <= 0 (md_steps_probe=$md_steps_probe)."
@@ -254,9 +257,9 @@ function run_stage_b_probe(
     probe_sim = AWHSimulation(
         deepcopy(awh_sim.state);
         num_md_steps=awh_sim.n_md_steps,
-        update_freq=typemax(Int),
-        well_tempered_factor=Inf,
-        coverage_type=:physical
+        update_freq=awh_probe_update_freq,
+        well_tempered_factor=awh_well_tempered_factor,
+        coverage_type=awh_coverage_type,
     )
     clear_awh_logger_histories!(probe_sim)
     probe_sim.state.active_sys.loggers.awh_logger.should_log = true

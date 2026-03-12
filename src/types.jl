@@ -3,6 +3,18 @@ Base.@kwdef struct ForceFieldConfig
     xml_files::Vector{String} = ["tip3p_standard.xml", "gaff.xml", "ethanol.xml"]
 end
 
+Base.@kwdef struct AWHControlConfig
+    lj_softcore_alpha::Float64 = 0.85
+    coul_softcore_alpha::Float64 = 0.3
+    reuse_neighbors::Bool = true
+    seed_num_md_steps::Int = 10
+    seed_log_freq::Int = 100
+    probe_update_freq::Int = typemax(Int)
+    production_update_freq::Int = typemax(Int)
+    well_tempered_factor::Float64 = Inf
+    coverage_type::Symbol = :physical
+end
+
 Base.@kwdef struct ThermodynamicLegConfig
     name::Symbol
     pdb::String
@@ -68,6 +80,7 @@ Base.@kwdef struct SimulationConfig
     cycle::Union{Nothing, ThermodynamicCycleConfig} = nothing
     parameter_reference_leg::Union{Nothing, Symbol} = nothing
     parameter_bounds::ParameterBoundsConfig = ParameterBoundsConfig()
+    awh_control::AWHControlConfig = AWHControlConfig()
 end
 
 Base.@kwdef struct OptimizationConfig

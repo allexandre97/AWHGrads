@@ -35,6 +35,7 @@ include("pipeline.jl")
 export SimulationConfig
 export OptimizationConfig
 export ForceFieldConfig
+export AWHControlConfig
 export ThermodynamicLegConfig
 export ThermodynamicCycleConfig
 export ParameterBoundsConfig
@@ -47,6 +48,7 @@ export default_optimization_config
 export default_cycle_config
 export resolved_cycle_config
 export validate_cycle_config
+export validate_lambda_schedule
 export resolve_parameter_reference_leg
 export resolve_force_field_paths
 export simulation_config_with

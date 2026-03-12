@@ -1,8 +1,22 @@
+#!/usr/bin/env julia
+
+# Example end-to-end workflow:
+# 1) define a thermodynamic cycle
+# 2) build simulation and optimization configs
+# 3) run the full AWH + optimization pipeline
+#
+# Run with Julia 1.11:
+#   julia +1.11 --project=. scripts/run_alch_full_example.jl
+
+include(joinpath(@__DIR__, "..", "src", "AWHGrads.jl"))
+
 base_sim = AWHGrads.default_simulation_config()
 base_opt = AWHGrads.default_optimization_config()
+
+# Explicit lambda window schedule (same as current default: 21 windows from 1.0 to 0.0).
 lambda_schedule = Float32.(range(1.0, stop=0.0, length=21))
 
-custom_cycle = AWHGrads.ThermodynamicCycleConfig(
+cycle_cfg = AWHGrads.ThermodynamicCycleConfig(
     legs=[
         AWHGrads.ThermodynamicLegConfig(
             name=:solvent,
@@ -22,22 +36,29 @@ custom_cycle = AWHGrads.ThermodynamicCycleConfig(
         ),
     ],
     include_standard_state_correction=true,
-    target_dG_kcal_mol=-5.01,
+    target_dG_kcal_mol=base_sim.dG_exp_kcal_mol,
 )
 
 sim_cfg = AWHGrads.simulation_config_with(
     base_sim;
     device_id=1,
-    lambda_schedule=lambda_schedule,
-    cycle=custom_cycle,
     solute_idx=1:9,
+    lambda_schedule=lambda_schedule,
     force_field=AWHGrads.ForceFieldConfig(
         xml_files=["tip3p_standard.xml", "gaff.xml", "ethanol.xml"],
     ),
     awh_control=AWHGrads.AWHControlConfig(
         lj_softcore_alpha=0.85,
         coul_softcore_alpha=0.3,
+        seed_num_md_steps=10,
+        seed_log_freq=100,
+        probe_update_freq=typemax(Int),
+        production_update_freq=typemax(Int),
+        well_tempered_factor=Inf,
+        coverage_type=:physical,
     ),
+    cycle=cycle_cfg,
+    parameter_reference_leg=:solvent,
 )
 
 opt_cfg = AWHGrads.optimization_config_with(
@@ -46,4 +67,8 @@ opt_cfg = AWHGrads.optimization_config_with(
     optimize_solvent=false,
 )
 
-(sim_cfg=sim_cfg, opt_cfg=opt_cfg)
+runtime = AWHGrads.run_pipeline(; sim_cfg=sim_cfg, opt_cfg=opt_cfg)
+
+println("Run finished.")
+println("  tuned parameter count: ", isnothing(runtime.theta_active) ? 0 : length(runtime.theta_active))
+println("  latent parameter count: ", isnothing(runtime.phi_active) ? 0 : length(runtime.phi_active))

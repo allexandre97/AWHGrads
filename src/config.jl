@@ -53,6 +53,7 @@ function default_simulation_config(; FT::DataType=Float32, AT=CuArray, device_id
         cycle=nothing,
         parameter_reference_leg=nothing,
         parameter_bounds=ParameterBoundsConfig(),
+        awh_control=AWHControlConfig(),
     )
 end
 
@@ -161,7 +162,31 @@ function resolve_force_field_paths(sim_cfg::SimulationConfig)
     return paths
 end
 
+function validate_lambda_schedule(lambda_schedule)
+    vals = collect(lambda_schedule)
+    if length(vals) < 2
+        throw(ArgumentError("lambda_schedule must contain at least two windows."))
+    end
+
+    vals_f64 = Float64.(vals)
+    if any(v -> !isfinite(v), vals_f64)
+        throw(ArgumentError("lambda_schedule contains non-finite values."))
+    end
+
+    if any(v -> v < 0.0 || v > 1.0, vals_f64)
+        throw(ArgumentError("lambda_schedule values must lie in [0, 1]."))
+    end
+
+    if !(issorted(vals_f64) || issorted(vals_f64; rev=true))
+        throw(ArgumentError("lambda_schedule must be monotonic (ascending or descending)."))
+    end
+
+    return nothing
+end
+
 function apply_simulation_config!(cfg::SimulationConfig)
+    validate_lambda_schedule(cfg.lambda_schedule)
+
     global FT = cfg.FT
     global AT = cfg.AT
     global Δt = cfg.Δt

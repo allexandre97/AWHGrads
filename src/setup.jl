@@ -3,6 +3,8 @@
 function setup_alchemical_awh(
     pdb_file,
     solute_indices;
+    lambda_values=lambda_schedule,
+    awh_control=AWHControlConfig(),
     is_vacuum=false,
     logger=nothing,
     injected_bias=nothing,
@@ -80,16 +82,16 @@ function setup_alchemical_awh(
     thermo_states = ThermoState[]  
 
     lj_sc = LennardJonesSoftCoreBeutler(
-        cutoff = lj_0.cutoff, α = FT(0.85),  
-        use_neighbors = lj_0.use_neighbors, scheduler = Molly.DefaultLambdaScheduler()  
+        cutoff = lj_0.cutoff, α = FT(awh_control.lj_softcore_alpha),
+        use_neighbors = lj_0.use_neighbors, scheduler = Molly.DefaultLambdaScheduler()
     )
 
     coul_sc = CoulombSoftCoreBeutler(
-        cutoff = cl_0.cutoff, α = FT(0.3), coulomb_const = cl_0.coulomb_const,  
-        use_neighbors = cl_0.use_neighbors, scheduler = Molly.DefaultLambdaScheduler()  
+        cutoff = cl_0.cutoff, α = FT(awh_control.coul_softcore_alpha), coulomb_const = cl_0.coulomb_const,
+        use_neighbors = cl_0.use_neighbors, scheduler = Molly.DefaultLambdaScheduler()
     )
 
-    for λ in lambda_schedule  
+    for λ in lambda_values
         acopy = Atom[]  
         for (i, a) in enumerate(seeded_atoms)
             if a.index ∈ solute_indices 
@@ -108,8 +110,8 @@ function setup_alchemical_awh(
         push!(thermo_states, ThermoState(sys_w, deepcopy(integrator)))  
     end
 
-    first_state = (warm_start && !isnothing(restart_state)) ? clamp(restart_active_idx, 1, num_lambda_states) : 1
-    awh_state = AWHState(thermo_states; reuse_neighbors=true, first_state=first_state)
+    first_state = (warm_start && !isnothing(restart_state)) ? clamp(restart_active_idx, 1, length(lambda_values)) : 1
+    awh_state = AWHState(thermo_states; reuse_neighbors=awh_control.reuse_neighbors, first_state=first_state)
     
     if !isnothing(injected_bias)  
         awh_state.f .= injected_bias.f  
@@ -121,7 +123,13 @@ function setup_alchemical_awh(
         empty!(awh_state.visited_windows)
     end
 
-    awh_sim = AWHSimulation(awh_state; num_md_steps = 10, log_freq=100, well_tempered_factor=Inf, coverage_type=:physical)  
+    awh_sim = AWHSimulation(
+        awh_state;
+        num_md_steps=awh_control.seed_num_md_steps,
+        log_freq=awh_control.seed_log_freq,
+        well_tempered_factor=awh_control.well_tempered_factor,
+        coverage_type=awh_control.coverage_type,
+    )
     
     return awh_sim, sys_base  
 end

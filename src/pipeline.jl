@@ -170,6 +170,8 @@ function setup_macro_legs(
         awh_leg, sys_leg = setup_alchemical_awh(
             leg.pdb,
             sim_cfg.solute_idx;
+            lambda_values=sim_cfg.lambda_schedule,
+            awh_control=sim_cfg.awh_control,
             is_vacuum=leg.is_vacuum,
             logger=logger,
             injected_bias=get(runtime.active_bias, leg.name, nothing),
@@ -232,6 +234,9 @@ function run_readiness_loop!(
     awh_endpoint_min_fraction::FT,
     awh_stageA_stable_blocks::Int,
     awh_stageB_cooldown_blocks::Int,
+    awh_probe_update_freq::Int,
+    awh_well_tempered_factor::Real,
+    awh_coverage_type::Symbol,
     beta_val::FT,
     p0_energy_per_vol::FT,
 ) where {FT <: AbstractFloat}
@@ -333,6 +338,9 @@ function run_readiness_loop!(
                         probe_frame_stride=probe_stride_by_leg[name],
                         probe_min_frames=probe_min_frames_by_leg[name],
                         probe_max_frames=probe_max_frames_by_leg[name],
+                        awh_probe_update_freq=awh_probe_update_freq,
+                        awh_well_tempered_factor=awh_well_tempered_factor,
+                        awh_coverage_type=awh_coverage_type,
                     ))
 
                     split_gap_by_leg[name] = stageB_stats_by_leg[name].split_gap
@@ -415,6 +423,9 @@ function collect_production_artifacts!(
     param_names::Vector{String},
     md_steps_prod::Int,
     p0_energy_per_vol::FT,
+    awh_production_update_freq::Int,
+    awh_well_tempered_factor::Real,
+    awh_coverage_type::Symbol,
 ) where {FT <: AbstractFloat}
     for leg in cycle_cfg.legs
         runtime.active_bias[leg.name] = extract_awh_data(awh_by_leg[leg.name])
@@ -432,9 +443,9 @@ function collect_production_artifacts!(
         awh_prod = AWHSimulation(
             awh_by_leg[name].state;
             num_md_steps=awh_by_leg[name].n_md_steps,
-            update_freq=typemax(Int),
-            well_tempered_factor=Inf,
-            coverage_type=:physical
+            update_freq=awh_production_update_freq,
+            well_tempered_factor=awh_well_tempered_factor,
+            coverage_type=awh_coverage_type,
         )
         awh_prod.state.active_sys.loggers.awh_logger.should_log = true
         simulate!(awh_prod, md_steps_prod)
@@ -574,6 +585,9 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             opt_cfg.awh_endpoint_min_fraction,
             opt_cfg.awh_stageA_stable_blocks,
             opt_cfg.awh_stageB_cooldown_blocks,
+            sim_cfg.awh_control.probe_update_freq,
+            sim_cfg.awh_control.well_tempered_factor,
+            sim_cfg.awh_control.coverage_type,
             beta_val,
             p0_energy_per_vol,
         )
@@ -611,6 +625,9 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             param_names,
             md_steps_prod,
             p0_energy_per_vol,
+            sim_cfg.awh_control.production_update_freq,
+            sim_cfg.awh_control.well_tempered_factor,
+            sim_cfg.awh_control.coverage_type,
         )
 
         GC.gc()
