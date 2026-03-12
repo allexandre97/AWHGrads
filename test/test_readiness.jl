@@ -176,19 +176,66 @@ end
     @test fallback_resolved.coupled_state_idx == 1
     @test fallback_resolved.decoupled_state_idx == 21
 
+    solvent_schedule = AWHGrads.default_solvent_leg_lambda_schedule(Float32)
+    @test length(solvent_schedule) == 31
+    @test solvent_schedule[1] ≈ 1.0f0
+    @test solvent_schedule[11] ≈ 0.5f0
+    @test solvent_schedule[12] ≈ 0.45125f0
+    @test solvent_schedule[end] ≈ 0.0f0
+
+    override_leg = AWHGrads.ThermodynamicLegConfig(
+        name=:solvent,
+        pdb="ethanol_solv.pdb",
+        lambda_schedule=solvent_schedule,
+    )
+    override_resolved = AWHGrads.resolve_leg_state_schedule(override_leg, fallback_schedule, Float32)
+    @test override_resolved.lambda == solvent_schedule
+    @test override_resolved.coupled_state_idx == 1
+    @test override_resolved.decoupled_state_idx == 31
+
+    invalid_short_leg = AWHGrads.ThermodynamicLegConfig(
+        name=:solvent,
+        pdb="ethanol_solv.pdb",
+        lambda_schedule=[1.0],
+    )
+    @test_throws ArgumentError AWHGrads.resolve_leg_state_schedule(invalid_short_leg, fallback_schedule, Float32)
+
+    invalid_out_of_range_leg = AWHGrads.ThermodynamicLegConfig(
+        name=:solvent,
+        pdb="ethanol_solv.pdb",
+        lambda_schedule=[1.0, -0.1, 0.0],
+    )
+    @test_throws ArgumentError AWHGrads.resolve_leg_state_schedule(invalid_out_of_range_leg, fallback_schedule, Float32)
+
+    invalid_nonmonotonic_leg = AWHGrads.ThermodynamicLegConfig(
+        name=:solvent,
+        pdb="ethanol_solv.pdb",
+        lambda_schedule=[1.0, 0.5, 0.75, 0.0],
+    )
+    @test_throws ArgumentError AWHGrads.resolve_leg_state_schedule(invalid_nonmonotonic_leg, fallback_schedule, Float32)
+
     cycle_cfg = AWHGrads.default_cycle_config()
     solvent_leg = only(filter(leg -> leg.name == :solvent, cycle_cfg.legs))
     vacuum_leg = only(filter(leg -> leg.name == :vacuum, cycle_cfg.legs))
 
+    @test solvent_leg.lambda_schedule == solvent_schedule
+    @test isnothing(vacuum_leg.lambda_schedule)
     @test solvent_leg.ensemble == :npt
     @test solvent_leg.include_pv
     @test vacuum_leg.is_vacuum
     @test !vacuum_leg.include_pv
 
     staged_resolved = AWHGrads.resolve_leg_state_schedule(solvent_leg, fallback_schedule, Float32)
-    @test staged_resolved.lambda == fallback_schedule
+    @test staged_resolved.lambda == solvent_schedule
     @test staged_resolved.coupled_state_idx == 1
-    @test staged_resolved.decoupled_state_idx == 21
+    @test staged_resolved.decoupled_state_idx == 31
+
+    sim_cfg = AWHGrads.default_simulation_config(FT=Float32, AT=Array)
+    resolved_cycle = AWHGrads.resolved_cycle_config(sim_cfg)
+    resolved_solvent_leg = only(filter(leg -> leg.name == :solvent, resolved_cycle.legs))
+    resolved_vacuum_leg = only(filter(leg -> leg.name == :vacuum, resolved_cycle.legs))
+    @test resolved_solvent_leg.lambda_schedule == solvent_schedule
+    @test isnothing(resolved_vacuum_leg.lambda_schedule)
 end
 
 @testset "ensemble controls and benchmark configs" begin
@@ -209,10 +256,23 @@ end
 
     baseline_cfg = include(joinpath(@__DIR__, "..", "scripts", "benchmark_config_baseline.jl"))
     baseline_solvent_leg = only(filter(leg -> leg.name == :solvent, baseline_cfg.sim_cfg.cycle.legs))
+    baseline_vacuum_leg = only(filter(leg -> leg.name == :vacuum, baseline_cfg.sim_cfg.cycle.legs))
+    @test isnothing(baseline_solvent_leg.lambda_schedule)
+    @test isnothing(baseline_vacuum_leg.lambda_schedule)
+    @test length(baseline_cfg.sim_cfg.lambda_schedule) == 21
     @test baseline_solvent_leg.include_pv
+
+    staged_npt_cfg = include(joinpath(@__DIR__, "..", "scripts", "benchmark_config_staged_npt.jl"))
+    staged_npt_solvent_leg = only(filter(leg -> leg.name == :solvent, staged_npt_cfg.sim_cfg.cycle.legs))
+    staged_npt_vacuum_leg = only(filter(leg -> leg.name == :vacuum, staged_npt_cfg.sim_cfg.cycle.legs))
+    @test length(staged_npt_solvent_leg.lambda_schedule) == 31
+    @test isnothing(staged_npt_vacuum_leg.lambda_schedule)
 
     nvt_cfg = include(joinpath(@__DIR__, "..", "scripts", "benchmark_config_staged_nvt.jl"))
     nvt_solvent_leg = only(filter(leg -> leg.name == :solvent, nvt_cfg.sim_cfg.cycle.legs))
+    nvt_vacuum_leg = only(filter(leg -> leg.name == :vacuum, nvt_cfg.sim_cfg.cycle.legs))
+    @test length(nvt_solvent_leg.lambda_schedule) == 31
+    @test isnothing(nvt_vacuum_leg.lambda_schedule)
     @test nvt_solvent_leg.ensemble == :nvt
     @test !nvt_solvent_leg.include_pv
 end
@@ -307,21 +367,27 @@ end
     ]
     @test observed_lambda == custom_lambda
 
-    awh_sim_default, _ = AWHGrads.setup_alchemical_awh(
-        "ethanol_vac.pdb",
+    solvent_schedule = AWHGrads.default_solvent_leg_lambda_schedule(Float32)
+    awh_sim_staged, _ = AWHGrads.setup_alchemical_awh(
+        "ethanol_solv.pdb",
         sim_cfg.solute_idx;
-        lambda_values=sim_cfg.lambda_schedule,
-        is_vacuum=true,
+        lambda_values=solvent_schedule,
+        is_vacuum=false,
+        ensemble=:npt,
     )
 
-    @test length(awh_sim_default.state.partition.λ_atoms) == length(sim_cfg.lambda_schedule)
+    @test length(awh_sim_staged.state.partition.λ_atoms) == length(solvent_schedule)
 
-    first_atoms = AWHGrads.Molly.from_device(first(awh_sim_default.state.partition.λ_atoms))
-    last_atoms = AWHGrads.Molly.from_device(last(awh_sim_default.state.partition.λ_atoms))
+    first_atoms = AWHGrads.Molly.from_device(first(awh_sim_staged.state.partition.λ_atoms))
+    mid_atoms = AWHGrads.Molly.from_device(awh_sim_staged.state.partition.λ_atoms[11])
+    next_atoms = AWHGrads.Molly.from_device(awh_sim_staged.state.partition.λ_atoms[12])
+    last_atoms = AWHGrads.Molly.from_device(last(awh_sim_staged.state.partition.λ_atoms))
     @test first_atoms[solute_idx].λ ≈ 1.0f0
+    @test mid_atoms[solute_idx].λ ≈ 0.5f0
+    @test next_atoms[solute_idx].λ ≈ 0.45125f0
     @test last_atoms[solute_idx].λ ≈ 0.0f0
 
-    state_inters = awh_sim_default.state.state_pairwise_inters[1]
+    state_inters = awh_sim_staged.state.state_pairwise_inters[1]
     lj_idx = findfirst(x -> x isa AWHGrads.Molly.LennardJonesSoftCoreBeutler, state_inters)
     coul_idx = findfirst(x -> x isa AWHGrads.Molly.CoulombSoftCoreBeutler, state_inters)
     @test lj_idx !== nothing

@@ -5,6 +5,7 @@ base_sim = AWHGrads.default_simulation_config()
 base_opt = AWHGrads.default_optimization_config()
 
 lambda_schedule = Float32.(range(1.0, stop=0.0, length=21))
+solvent_lambda_schedule = AWHGrads.default_solvent_leg_lambda_schedule(base_sim.FT)
 
 cycle_cfg = AWHGrads.ThermodynamicCycleConfig(
     legs=[
@@ -15,6 +16,7 @@ cycle_cfg = AWHGrads.ThermodynamicCycleConfig(
             is_vacuum=false,
             include_pv=true,
             probe_time=base_sim.awh_probe_time_solv,
+            lambda_schedule=solvent_lambda_schedule,
             ensemble=:npt,
         ),
         AWHGrads.ThermodynamicLegConfig(

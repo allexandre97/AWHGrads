@@ -1,10 +1,25 @@
 """
+    default_solvent_leg_lambda_schedule(FT=Float32)
+
+Return the staged 31-state global λ schedule for the solvent leg. Under
+Molly's `DefaultLambdaScheduler` and the current `InsertRole` convention, this
+encodes charge-first, LJ-second decoupling while still using only atom λ
+values.
+"""
+function default_solvent_leg_lambda_schedule(::Type{FT}=Float32) where {FT <: AbstractFloat}
+    charge_stage = collect(FT.(range(one(FT), stop=zero(FT), length=11)))
+    lj_stage = reverse(FT.(collect(range(zero(FT), stop=one(FT), length=21)) .^ 2))[2:end]
+    return vcat((charge_stage .+ one(FT)) ./ FT(2), lj_stage ./ FT(2))
+end
+
+"""
     default_cycle_config(; target_dG_kcal_mol=-5.01, FT=Float32)
 
 Return the built-in two-leg ethanol hydration cycle used by the example
 scripts.
 """
 function default_cycle_config(; target_dG_kcal_mol::Real=-5.01, FT::DataType=Float32)
+    solvent_lambda_schedule = default_solvent_leg_lambda_schedule(FT)
     legs = [
         ThermodynamicLegConfig(
             name=:solvent,
@@ -13,6 +28,7 @@ function default_cycle_config(; target_dG_kcal_mol::Real=-5.01, FT::DataType=Flo
             is_vacuum=false,
             include_pv=true,
             probe_time=FT(1.5)u"ns",
+            lambda_schedule=solvent_lambda_schedule,
             ensemble=:npt,
         ),
         ThermodynamicLegConfig(
@@ -116,6 +132,7 @@ function resolved_cycle_config(sim_cfg::SimulationConfig)
         return sim_cfg.cycle
     end
 
+    solvent_lambda_schedule = default_solvent_leg_lambda_schedule(sim_cfg.FT)
     return ThermodynamicCycleConfig(
         legs=[
             ThermodynamicLegConfig(
@@ -125,6 +142,7 @@ function resolved_cycle_config(sim_cfg::SimulationConfig)
                 is_vacuum=false,
                 include_pv=true,
                 probe_time=sim_cfg.awh_probe_time_solv,
+                lambda_schedule=solvent_lambda_schedule,
                 ensemble=:npt,
             ),
             ThermodynamicLegConfig(
@@ -176,7 +194,8 @@ end
 """
     resolve_leg_state_schedule(leg, default_lambda_schedule, FT=Float32)
 
-Resolve a leg's runtime global λ schedule.
+Resolve a leg's runtime global λ schedule, preferring the leg-specific
+override when present and otherwise falling back to `default_lambda_schedule`.
 """
 function resolve_leg_state_schedule(
     leg::ThermodynamicLegConfig,
@@ -184,9 +203,9 @@ function resolve_leg_state_schedule(
     ::Type{FT}=Float32,
 ) where {FT <: AbstractFloat}
     _validate_leg_ensemble(leg)
-    validate_lambda_schedule(default_lambda_schedule)
-
-    lambda_values = FT.(collect(default_lambda_schedule))
+    schedule_source = isnothing(leg.lambda_schedule) ? default_lambda_schedule : leg.lambda_schedule
+    validate_lambda_schedule(schedule_source)
+    lambda_values = FT.(collect(schedule_source))
 
     atol = sqrt(eps(FT))
     coupled_candidates = [

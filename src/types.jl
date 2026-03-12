@@ -46,6 +46,7 @@ Base.@kwdef struct ThermodynamicLegConfig
     is_vacuum::Bool = false
     include_pv::Bool = false
     probe_time = Float32(0.5)u"ns"
+    lambda_schedule::Union{Nothing, Vector{<:Real}} = nothing
     ensemble::Symbol = :npt
 end
 
