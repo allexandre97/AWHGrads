@@ -316,6 +316,7 @@ end
     opt_cfg = AWHGrads.default_optimization_config()
     @test opt_cfg.awh_min_lambda_ess == 300
     @test opt_cfg.awh_parity_tol_kT == Float32(0.25)
+    @test opt_cfg.awh_endpoint_target_ratio == Float32(0.3)
     @test opt_cfg.awh_stageB_cooldown_blocks == 2
 end
 

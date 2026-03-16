@@ -16,6 +16,8 @@ using CUDA
 using Unitful
 using StatsBase
 using LinearAlgebra
+using Logging
+using Enzyme
 
 # Defaults are overwritten by `apply_simulation_config!` so helper functions can
 # share the active precision/backend without threading config objects through
@@ -65,5 +67,6 @@ export resolve_force_field_paths
 export simulation_config_with
 export optimization_config_with
 export run_pipeline
+export setup_logging
 
 end

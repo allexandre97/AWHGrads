@@ -18,14 +18,15 @@ function precompute_neighbors(logger, sys)
     sys = Molly.from_device(sys)  
     neighbors = []  
     num_frames = length(logger.active_idx_history)  
+
     for f_idx in 1:num_frames  
         coords = logger.coords_history[f_idx]  
         vol    = logger.volume_history[f_idx]  
         side   = cbrt(ustrip(vol)) * unit(vol)^(1/3)  
         box    = CubicBoundary(side, side, side)  
 
-        sys = System(sys; coords = coords, boundary = box)  
-        nbrs = find_neighbors(sys)  
+        sys_temp = System(sys; coords = coords, boundary = box)  
+        nbrs = find_neighbors(sys_temp)  
         push!(neighbors, nbrs)  
     end
     return neighbors  

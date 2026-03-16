@@ -8,7 +8,12 @@
 # Run with Julia 1.11:
 #   julia +1.11 scripts/run_alch_full_example.jl
 
+using Unitful
+
 include(joinpath(@__DIR__, "..", "src", "AWHGrads.jl"))
+
+# Set up file logging
+log_io = AWHGrads.setup_logging("logs.log")
 
 base_sim = AWHGrads.default_simulation_config()
 base_opt = AWHGrads.default_optimization_config()
@@ -18,23 +23,45 @@ base_opt = AWHGrads.default_optimization_config()
 lambda_schedule = Float32.(range(1.0, stop=0.0, length=21))
 cycle_cfg = AWHGrads.default_cycle_config(; target_dG_kcal_mol=base_sim.dG_exp_kcal_mol, FT=base_sim.FT)
 
+# Ensure the solvent leg in the cycle object matches our desired R&D sampling depth
+for leg in cycle_cfg.legs
+    if leg.name == :solvent
+        # Manually update the leg config to ensure the 5.0ns probe is actually used
+        new_leg = AWHGrads.ThermodynamicLegConfig(
+            name=leg.name,
+            pdb=leg.pdb,
+            coefficient=leg.coefficient,
+            is_vacuum=leg.is_vacuum,
+            include_pv=leg.include_pv,
+            probe_time=base_sim.FT(5.0)u"ns",
+            lambda_schedule=leg.lambda_schedule,
+            ensemble=leg.ensemble
+        )
+        # Find the index and replace
+        idx = findfirst(l -> l.name == :solvent, cycle_cfg.legs)
+        cycle_cfg.legs[idx] = new_leg
+    end
+end
+
 sim_cfg = AWHGrads.simulation_config_with(
     base_sim;
     device_id=1,
     solute_idx=1:9,
     lambda_schedule=lambda_schedule,
+    awh_budget_time=base_sim.FT(60)u"ns",
+    awh_probe_time_solv=base_sim.FT(5.0)u"ns",
     force_field=AWHGrads.ForceFieldConfig(
         xml_files=["tip3p_standard.xml", "gaff.xml", "ethanol.xml"],
     ),
     awh_control=AWHGrads.AWHControlConfig(
         lj_softcore_alpha=0.85,
         coul_softcore_alpha=0.3,
-        seed_num_md_steps=10,
+        seed_num_md_steps=50,
         seed_log_freq=100,
-        update_freq=100,
+        update_freq=500,
         coverage_threshold=0.8,
         significant_weight=0.1,
-        initial_n_bias=100,
+        initial_n_bias=500,
         well_tempered_factor=Inf,
         coverage_type=:physical,
     ),
@@ -46,6 +73,9 @@ opt_cfg = AWHGrads.optimization_config_with(
     base_opt;
     max_macro_epochs=30,
     optimize_solvent=false,
+    awh_split_tol_kT=1.0,
+    awh_parity_tol_kT=0.5,
+    awh_convergence_tol=5e-3,
 )
 
 runtime = AWHGrads.run_pipeline(; sim_cfg=sim_cfg, opt_cfg=opt_cfg)

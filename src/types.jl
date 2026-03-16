@@ -178,7 +178,7 @@ Base.@kwdef struct OptimizationConfig
     awh_parity_tol_kT = Float32(0.25)
     awh_tail_lag::Int = 10
     awh_min_round_trips::Int = 3
-    awh_endpoint_min_fraction = Float32(0.03)
+    awh_endpoint_target_ratio = Float32(0.3)
     awh_stageA_stable_blocks::Int = 2
     awh_stageB_cooldown_blocks::Int = 2
 

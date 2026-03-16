@@ -1,1 +1,8 @@
 [deps]
+Logging = "56ddb016-857c-54ac-832c-4a2a3a571950"
+Molly = "aa0f7f06-fb81-11e8-319c-074095493092"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+Unitful = "1986cc42-f94f-5168-af9a-99ad098d78f6"
+StatsBase = "2913bbd2-9723-5481-bd96-ae2c219c00da"
+LinearAlgebra = "37e2e46d-5412-4217-9c98-1e43d7fa3110"
+Enzyme = "7da242da-9f05-4c6e-8120-008108c48a70"

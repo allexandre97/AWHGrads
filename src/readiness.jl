@@ -492,6 +492,7 @@ function run_stage_b_probe(
     u_probe_ref, _ = ensemble_eval_timed.result
 
     bias_data = extract_awh_data(awh_sim)
+    # The actual bias applied to the simulation and used in the mixture denominator
     awh_bias = bias_data.f .+ bias_data.log_rho
 
     half_1, half_2 = split_half_ranges(n_frames)
@@ -540,7 +541,11 @@ function run_stage_b_probe(
         F_mbar_profile = include_pv ?
             compute_full_mbar_profile(u_probe_ref, u_probe_ref, awh_bias, beta; volumes=volumes_probe, P0_energy_per_vol=P0_energy_per_vol) :
             compute_full_mbar_profile(u_probe_ref, u_probe_ref, awh_bias, beta)
-        parity_gap = compute_parity_gap(F_mbar_profile, awh_bias; ref_idx=coupled_state_idx)
+            
+        # The reconstructed profile is the true thermodynamic free energy, so it must
+        # be compared to AWH's estimate of the true free energy (bias_data.f), NOT the
+        # sampling bias (awh_bias = f + log_rho).
+        parity_gap = compute_parity_gap(F_mbar_profile, bias_data.f; ref_idx=coupled_state_idx)
         parity_ready = parity_gap <= awh_parity_tol_kT
 
         return (

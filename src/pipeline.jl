@@ -271,7 +271,7 @@ function run_readiness_loop!(
     awh_parity_tol_kT::FT,
     awh_tail_lag::Int,
     awh_min_round_trips::Int,
-    awh_endpoint_min_fraction::FT,
+    awh_endpoint_target_ratio::FT,
     awh_stageA_stable_blocks::Int,
     awh_stageB_cooldown_blocks::Int,
     awh_control::AWHControlConfig,
@@ -338,6 +338,9 @@ function run_readiness_loop!(
             spent_steps[name] += block_steps
             runtime.active_bias[name] = extract_awh_data(awh_leg)
 
+            n_states = length(state_schedule.lambda)
+            dynamic_endpoint_fraction = FT(awh_endpoint_target_ratio / n_states)
+
             stageA_stats_by_leg[name] = StageAStats(evaluate_stage_a_readiness(
                 awh_leg,
                 awh_convergence_tol;
@@ -345,7 +348,7 @@ function run_readiness_loop!(
                 min_lambda_ess=awh_min_lambda_ess,
                 min_linear_neff=awh_min_linear_neff,
                 min_round_trips=awh_min_round_trips,
-                endpoint_min_fraction=awh_endpoint_min_fraction,
+                endpoint_min_fraction=dynamic_endpoint_fraction,
                 low_idx=state_schedule.coupled_state_idx,
                 high_idx=state_schedule.decoupled_state_idx,
             ))
@@ -654,18 +657,18 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             probe_min_frames_by_leg,
             probe_max_frames_by_leg,
             sim_cfg.awh_budget_time,
-            opt_cfg.awh_convergence_tol,
+            FT(opt_cfg.awh_convergence_tol),
             opt_cfg.awh_min_linear_neff,
             opt_cfg.awh_min_lambda_ess,
-            opt_cfg.awh_split_tol_kT,
-            opt_cfg.awh_parity_tol_kT,
+            FT(opt_cfg.awh_split_tol_kT),
+            FT(opt_cfg.awh_parity_tol_kT),
             opt_cfg.awh_tail_lag,
             opt_cfg.awh_min_round_trips,
-            opt_cfg.awh_endpoint_min_fraction,
+            FT(opt_cfg.awh_endpoint_target_ratio),
             opt_cfg.awh_stageA_stable_blocks,
             opt_cfg.awh_stageB_cooldown_blocks,
             sim_cfg.awh_control,
-            sim_cfg.awh_probe_discard_fraction,
+            Float64(sim_cfg.awh_probe_discard_fraction),
             beta_val,
             p0_energy_per_vol,
         )

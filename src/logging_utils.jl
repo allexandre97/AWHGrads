@@ -1,3 +1,36 @@
+using Logging
+
+"""
+    TeeLogger(loggers::Vector{AbstractLogger})
+
+A basic logger that duplicates every message to a collection of sub-loggers.
+"""
+struct TeeLogger <: AbstractLogger
+    loggers::Vector{AbstractLogger}
+end
+
+Logging.shouldlog(l::TeeLogger, args...) = any(lg -> Logging.shouldlog(lg, args...), l.loggers)
+Logging.min_enabled_level(l::TeeLogger) = minimum(Logging.min_enabled_level, l.loggers)
+Logging.handle_message(l::TeeLogger, args...; kwargs...) = 
+    for lg in l.loggers; Logging.handle_message(lg, args...; kwargs...); end
+
+"""
+    setup_logging(log_file::String="logs.log")
+
+Configure the global logger to write to both stdout and the specified file.
+"""
+function setup_logging(log_file::String="logs.log")
+    file_io = open(log_file, "a")
+    # SimpleLogger for the file, ConsoleLogger for stdout
+    loggers = [
+        ConsoleLogger(stdout, Logging.Info),
+        SimpleLogger(file_io, Logging.Info)
+    ]
+    global_logger(TeeLogger(loggers))
+    @info "Logging initialized. Writing to $log_file and stdout."
+    return file_io
+end
+
 """
     get_production_logger(awh_sim_prod, leg_name)
 
