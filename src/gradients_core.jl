@@ -140,11 +140,81 @@ end
 # ==============================================================================
 
 """
+    awh_log_gibbs_weights(bias_data)
+
+Return Molly's fixed AWH λ-state Gibbs log-weights
+
+`g_ref(λ) = f_ref(λ) + logρ_ref(λ)`
+
+used in `process_sample` through `scratch_z = log_rho + f - potentials`. This
+is the correct quantity for MBAR/AWH mixture denominators. It is not a
+coordinate-space bias potential and is never differentiated as a force term.
+"""
+function awh_log_gibbs_weights(bias_data)
+    return bias_data.f .+ bias_data.log_rho
+end
+
+"""
+    reference_log_mixture_denominator(energies_ref, log_gibbs_weights, beta;
+                                      volumes=FT[], P0_energy_per_vol=zero(FT))
+
+For each stored frame `x_k`, compute
+
+`log ∑_j exp(g_ref(j) - u_ref(x_k, j))`
+
+where `g_ref = f_ref + logρ_ref` are the fixed AWH Gibbs log-weights and
+`u_ref` is the reduced potential under the reference Hamiltonians that generated
+the trajectory.
+"""
+function reference_log_mixture_denominator(
+    energies_ref::Matrix{FT},
+    log_gibbs_weights::Vector{FT},
+    beta::FT;
+    volumes::Vector{FT}=FT[],
+    P0_energy_per_vol::FT=zero(FT),
+) where {FT <: AbstractFloat}
+    M, num_lambda = size(energies_ref)
+    if length(log_gibbs_weights) != num_lambda
+        throw(ArgumentError("reference_log_mixture_denominator expected log_gibbs_weights length $num_lambda, got $(length(log_gibbs_weights))."))
+    end
+    if !isempty(volumes) && length(volumes) != M
+        throw(ArgumentError("reference_log_mixture_denominator expected `volumes` length $M, got $(length(volumes))."))
+    end
+    if M == 0 || num_lambda == 0
+        throw(ArgumentError("reference_log_mixture_denominator received empty energies matrix."))
+    end
+
+    pv_terms = zeros(FT, M)
+    if !isempty(volumes)
+        @inbounds for k in 1:M
+            pv_terms[k] = beta * P0_energy_per_vol * volumes[k]
+        end
+    end
+
+    log_mixture_denom = zeros(FT, M)
+    scratch = zeros(FT, num_lambda)
+    @inbounds for k in 1:M
+        pv_k = pv_terms[k]
+        for j in 1:num_lambda
+            scratch[j] = log_gibbs_weights[j] - (beta * energies_ref[k, j] + pv_k)
+        end
+        max_log = maximum(scratch)
+        log_mixture_denom[k] = max_log + log(sum(exp.(scratch .- max_log)))
+    end
+    return log_mixture_denom
+end
+
+"""
     compute_weights_and_ess(energies_current, energies_ref, active_lambda_idx, beta,
                             volumes=FT[], P0=zero(FT))
 
 Compute per-frame reweighting factors from the reference ensemble to the current
 parameterization together with their effective sample size.
+
+This reweights the full extended state `(x_k, λ_k)` under a fixed AWH Gibbs
+scheme. Because the λ-state log-weight `g_ref(λ_k)` is the same in the numerator
+and denominator, it cancels exactly; only the reduced-potential change at the
+physically sampled `λ_k` remains.
 """
 function compute_weights_and_ess(
     energies_current::Matrix{FT}, 
@@ -156,11 +226,21 @@ function compute_weights_and_ess(
 ) where {FT <: AbstractFloat}
     
     M = length(active_lambda_idx)
+    if size(energies_current, 1) != M
+        throw(ArgumentError("compute_weights_and_ess expected energies_current to have $M rows, got $(size(energies_current, 1))."))
+    end
+    if size(energies_ref) != size(energies_current)
+        throw(ArgumentError("compute_weights_and_ess expected energies_ref size $(size(energies_current)), got $(size(energies_ref))."))
+    end
     if M == 0
         throw(ArgumentError("compute_weights_and_ess received zero frames (`active_lambda_idx` is empty)."))
     end
     if !isempty(volumes) && length(volumes) != M
         throw(ArgumentError("compute_weights_and_ess expected `volumes` length $M, got $(length(volumes))."))
+    end
+    num_lambda = size(energies_current, 2)
+    if any(idx -> idx < 1 || idx > num_lambda, active_lambda_idx)
+        throw(ArgumentError("compute_weights_and_ess got active λ indices outside valid range 1:$num_lambda."))
     end
     log_W = zeros(FT, M)
     
@@ -203,10 +283,20 @@ function compute_empirical_gradients_and_fim(
 
     P = length(param_names)
     M = length(w_norm)
+    if length(active_lambda_idx) != M
+        throw(ArgumentError("compute_empirical_gradients_and_fim expected active_lambda_idx length $M, got $(length(active_lambda_idx))."))
+    end
     
     S = zeros(FT, P, M)
     for (i, p_key) in enumerate(param_names)
         grad_matrix = gradients_dict[p_key]
+        if size(grad_matrix, 1) != M
+            throw(ArgumentError("compute_empirical_gradients_and_fim expected gradient matrix for $p_key to have $M rows, got $(size(grad_matrix, 1))."))
+        end
+        num_lambda = size(grad_matrix, 2)
+        if any(idx -> idx < 1 || idx > num_lambda, active_lambda_idx)
+            throw(ArgumentError("compute_empirical_gradients_and_fim got active λ indices outside valid range 1:$num_lambda for parameter $p_key."))
+        end
         for k in 1:M
             l_k = active_lambda_idx[k]
             S[i, k] = beta * grad_matrix[k, l_k]
@@ -237,12 +327,14 @@ end
 """
     compute_global_endpoint_gradients(param_names, gradients_dict, energies_current,
                                       energies_ref, active_lambda_idx,
-                                      lambda_target_idx, beta, awh_bias,
+                                      lambda_target_idx, beta, log_gibbs_weights,
                                       volumes=FT[], P0_energy_per_vol=zero(FT);
                                       compute_gradients=true)
 
 Use global MBAR-style reweighting to estimate the free energy of one endpoint λ
-state, optionally alongside its thermodynamic gradient.
+state, optionally alongside its thermodynamic gradient. `log_gibbs_weights`
+must be Molly's fixed AWH Gibbs log-weights `f_ref + logρ_ref`, not a
+force-derived potential.
 """
 function compute_global_endpoint_gradients(
     param_names::Vector{String},
@@ -252,7 +344,7 @@ function compute_global_endpoint_gradients(
     active_lambda_idx::Vector{Int},
     lambda_target_idx::Int,
     beta::FT,
-    awh_bias::Vector{FT},
+    log_gibbs_weights::Vector{FT},
     volumes::Vector{FT} = FT[],
     P0_energy_per_vol::FT = zero(FT);
     compute_gradients::Bool=true
@@ -261,26 +353,34 @@ function compute_global_endpoint_gradients(
 
     P = length(param_names)
     M = length(active_lambda_idx)
-    num_lambda = length(awh_bias)
-
-    # Preallocate to avoid GC thrashing in the inner loop
-    log_denoms = zeros(FT, num_lambda)
+    if size(energies_current, 1) != M
+        throw(ArgumentError("compute_global_endpoint_gradients expected energies_current to have $M rows, got $(size(energies_current, 1))."))
+    end
+    if size(energies_ref) != size(energies_current)
+        throw(ArgumentError("compute_global_endpoint_gradients expected energies_ref size $(size(energies_current)), got $(size(energies_ref))."))
+    end
+    _, num_lambda = size(energies_current)
+    if lambda_target_idx < 1 || lambda_target_idx > num_lambda
+        throw(ArgumentError("compute_global_endpoint_gradients got lambda_target_idx=$lambda_target_idx outside valid range 1:$num_lambda."))
+    end
+    if any(idx -> idx < 1 || idx > num_lambda, active_lambda_idx)
+        throw(ArgumentError("compute_global_endpoint_gradients got active λ indices outside valid range 1:$num_lambda."))
+    end
     log_W_target = zeros(FT, M)
+    log_mixture_denom = reference_log_mixture_denominator(
+        energies_ref,
+        log_gibbs_weights,
+        beta;
+        volumes=volumes,
+        P0_energy_per_vol=P0_energy_per_vol,
+    )
     
-    # 1. Global MBAR weights to the requested target λ.
+    # 1. Global MBAR weights to the requested target λ. The denominator uses
+    # Molly's fixed AWH Gibbs log-weights g_ref = f_ref + logρ_ref.
     for k in 1:M
         pv_term = isempty(volumes) ? zero(FT) : beta * P0_energy_per_vol * volumes[k]
         u_k_target = beta * energies_current[k, lambda_target_idx] + pv_term
-        
-        # Mixture denominator (log-sum-exp)
-        for j in 1:num_lambda
-            u_k_j_ref = beta * energies_ref[k, j] + pv_term
-            log_denoms[j] = awh_bias[j] - u_k_j_ref
-        end
-        max_log_denom = maximum(log_denoms)
-        denom_term = max_log_denom + log(sum(exp.(log_denoms .- max_log_denom)))
-        
-        log_W_target[k] = -u_k_target - denom_term
+        log_W_target[k] = -u_k_target - log_mixture_denom[k]
     end
 
     max_log_W = maximum(log_W_target)
@@ -305,16 +405,17 @@ function compute_global_endpoint_gradients(
 end
 
 """
-    compute_full_mbar_profile(energies_current, energies_ref, awh_bias, beta;
+    compute_full_mbar_profile(energies_current, energies_ref, log_gibbs_weights, beta;
                               volumes=FT[], P0_energy_per_vol=zero(FT))
 
 Reconstruct the complete λ free-energy profile implied by the stored trajectory
-under a candidate parameter vector.
+under a candidate parameter vector. `log_gibbs_weights` must be the fixed AWH
+Gibbs log-weights `f_ref + logρ_ref` used to sample λ.
 """
 function compute_full_mbar_profile(
     energies_current::Matrix{FT},
     energies_ref::Matrix{FT},
-    awh_bias::Vector{FT},
+    log_gibbs_weights::Vector{FT},
     beta::FT;
     volumes::Vector{FT}=FT[],
     P0_energy_per_vol::FT=zero(FT)
@@ -323,8 +424,8 @@ function compute_full_mbar_profile(
     if size(energies_ref) != (M, num_lambda)
         throw(ArgumentError("compute_full_mbar_profile expected energies_ref size $(M), $(num_lambda), got $(size(energies_ref))."))
     end
-    if length(awh_bias) != num_lambda
-        throw(ArgumentError("compute_full_mbar_profile expected awh_bias length $num_lambda, got $(length(awh_bias))."))
+    if length(log_gibbs_weights) != num_lambda
+        throw(ArgumentError("compute_full_mbar_profile expected log_gibbs_weights length $num_lambda, got $(length(log_gibbs_weights))."))
     end
     if !isempty(volumes) && length(volumes) != M
         throw(ArgumentError("compute_full_mbar_profile expected `volumes` length $M, got $(length(volumes))."))
@@ -339,18 +440,13 @@ function compute_full_mbar_profile(
             pv_terms[k] = beta * P0_energy_per_vol * volumes[k]
         end
     end
-
-    # Shared denominator term for each frame, reused across all λ targets.
-    log_mixture_denom = zeros(FT, M)
-    scratch = zeros(FT, num_lambda)
-    @inbounds for k in 1:M
-        pv_k = pv_terms[k]
-        for j in 1:num_lambda
-            scratch[j] = awh_bias[j] - (beta * energies_ref[k, j] + pv_k)
-        end
-        max_log = maximum(scratch)
-        log_mixture_denom[k] = max_log + log(sum(exp.(scratch .- max_log)))
-    end
+    log_mixture_denom = reference_log_mixture_denominator(
+        energies_ref,
+        log_gibbs_weights,
+        beta;
+        volumes=volumes,
+        P0_energy_per_vol=P0_energy_per_vol,
+    )
 
     F_profile = zeros(FT, num_lambda)
     log_W_target = zeros(FT, M)
@@ -370,7 +466,7 @@ end
     compute_parity_gap(F_mbar, F_awh; ref_idx=1)
 
 Measure the maximum deviation between an MBAR-reconstructed free-energy profile
-and the AWH bias profile after aligning them at `ref_idx`.
+and the AWH free-energy estimate after aligning them at `ref_idx`.
 """
 function compute_parity_gap(F_mbar::Vector{FT}, F_awh::Vector{FT}; ref_idx::Int=1) where {FT <: AbstractFloat}
     if length(F_mbar) != length(F_awh)

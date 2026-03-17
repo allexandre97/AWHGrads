@@ -62,7 +62,9 @@ function compute_leg_endpoint_state(
     compute_gradients::Bool=true,
 ) where {FT <: AbstractFloat}
     idx_history = leg.logger_prod.active_idx_history
-    awh_bias = leg.active_bias.f .+ leg.active_bias.log_rho
+    # Endpoint MBAR conditions on arbitrary λ targets, so the denominator must
+    # use Molly's fixed AWH Gibbs log-weights g_ref = f_ref + logρ_ref.
+    log_gibbs_weights = awh_log_gibbs_weights(leg.active_bias)
 
     if leg.include_pv
         grad_F_1, F_1 = compute_global_endpoint_gradients(
@@ -73,7 +75,7 @@ function compute_leg_endpoint_state(
             idx_history,
             leg.coupled_state_idx,
             beta_val,
-            awh_bias,
+            log_gibbs_weights,
             volumes,
             FT(leg.p0_energy_per_vol);
             compute_gradients=compute_gradients,
@@ -86,7 +88,7 @@ function compute_leg_endpoint_state(
             idx_history,
             leg.decoupled_state_idx,
             beta_val,
-            awh_bias,
+            log_gibbs_weights,
             volumes,
             FT(leg.p0_energy_per_vol);
             compute_gradients=compute_gradients,
@@ -100,7 +102,7 @@ function compute_leg_endpoint_state(
             idx_history,
             leg.coupled_state_idx,
             beta_val,
-            awh_bias;
+            log_gibbs_weights;
             compute_gradients=compute_gradients,
         )
         grad_F_0, F_0 = compute_global_endpoint_gradients(
@@ -111,7 +113,7 @@ function compute_leg_endpoint_state(
             idx_history,
             leg.decoupled_state_idx,
             beta_val,
-            awh_bias;
+            log_gibbs_weights;
             compute_gradients=compute_gradients,
         )
     end

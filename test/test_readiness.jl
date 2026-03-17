@@ -1,5 +1,6 @@
 using Random
 using Molly
+using Unitful
 
 @testset "readiness helpers" begin
     a, b = AWHGrads.split_half_ranges(10)
@@ -347,6 +348,67 @@ end
     @test awh_sim.update_freq == awh_control.update_freq
     @test awh_sim.coverage_threshold == Float32(awh_control.coverage_threshold)
     @test awh_sim.significant_weight == Float32(awh_control.significant_weight)
+end
+
+@testset "Stage B probe freezes bias updates" begin
+    sim_cfg = AWHGrads.default_simulation_config(FT=Float32, AT=Array)
+    awh_control = AWHGrads.AWHControlConfig(
+        seed_num_md_steps=5,
+        seed_log_freq=10,
+        update_freq=2,
+        coverage_threshold=0.8,
+        significant_weight=0.1,
+        initial_n_bias=50,
+        well_tempered_factor=Inf,
+        coverage_type=:physical,
+    )
+    sim_cfg = AWHGrads.simulation_config_with(sim_cfg; awh_control=awh_control)
+    AWHGrads.apply_simulation_config!(sim_cfg)
+
+    T_coord = typeof(sim_cfg.FT(1.0)u"nm")
+    T_vol = typeof(sim_cfg.FT(1.0)u"nm^3")
+    T_en = typeof(sim_cfg.FT(1.0)u"kJ * mol^-1")
+    logger = Molly.AWHEnsembleLogger(T_coord, T_vol, T_en, 1)
+
+    awh_sim, _ = AWHGrads.setup_alchemical_awh(
+        "ethanol_vac.pdb",
+        sim_cfg.solute_idx;
+        lambda_values=Float32[1.0, 0.5, 0.0],
+        awh_control=awh_control,
+        is_vacuum=true,
+        logger=logger,
+    )
+
+    awh_sim.state.f .= Float32[0.0, 0.25, -0.15]
+    awh_sim.state.n_accum = 1
+    awh_sim.state.w_seg .= one.(awh_sim.state.w_seg)
+    awh_sim.state.w2_seg .= fill(2.0f0, length(awh_sim.state.w2_seg))
+    awh_sim.state.w_last .= fill(3.0f0, length(awh_sim.state.w_last))
+    push!(awh_sim.state.visited_windows, 1)
+    push!(awh_sim.state.cv_buffer, Float32[0.25])
+
+    frozen_bias = AWHGrads.extract_awh_data(awh_sim)
+    probe_sim, probe_bias = AWHGrads.build_stage_b_probe_sim(awh_sim, 20)
+
+    @test probe_bias.f == frozen_bias.f
+    @test probe_bias.log_rho == frozen_bias.log_rho
+    @test probe_sim.update_freq == max(awh_sim.update_freq, fld(20, awh_sim.n_md_steps) + 1)
+    @test probe_sim.state.n_accum == 0
+    @test all(iszero, probe_sim.state.w_seg)
+    @test all(iszero, probe_sim.state.w2_seg)
+    @test all(iszero, probe_sim.state.w_last)
+    @test isempty(probe_sim.state.visited_windows)
+    @test isempty(probe_sim.state.cv_buffer)
+    @test probe_sim.state.active_sys.loggers.awh_logger.should_log
+    @test all(
+        state_loggers -> !hasproperty(state_loggers, :awh_logger) || state_loggers.awh_logger.should_log,
+        probe_sim.state.state_loggers,
+    )
+
+    simulate!(probe_sim, 20)
+
+    @test probe_sim.state.f == frozen_bias.f
+    @test probe_sim.state.log_rho == frozen_bias.log_rho
 end
 
 @testset "AWH default lambda scheduler plumbing" begin

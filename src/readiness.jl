@@ -144,7 +144,7 @@ end
 
 
 """
-    estimate_leg_dg_from_reference(energies, active_lambda_idx, awh_bias,
+    estimate_leg_dg_from_reference(energies, active_lambda_idx, log_gibbs_weights,
                                    coupled_state_idx, decoupled_state_idx, beta;
                                    volumes=FT[], P0_energy_per_vol=zero(FT))
 
@@ -154,7 +154,7 @@ energies reconstructed from the reference ensemble.
 function estimate_leg_dg_from_reference(
     energies::Matrix{FT},
     active_lambda_idx::Vector{Int},
-    awh_bias::Vector{FT},
+    log_gibbs_weights::Vector{FT},
     coupled_state_idx::Int,
     decoupled_state_idx::Int,
     beta::FT;
@@ -165,11 +165,11 @@ function estimate_leg_dg_from_reference(
     dummy_grads = Dict{String, Matrix{FT}}()
     _, F_1 = compute_global_endpoint_gradients(
         dummy_names, dummy_grads, energies, energies, active_lambda_idx, coupled_state_idx,
-        beta, awh_bias, volumes, P0_energy_per_vol; compute_gradients=false
+        beta, log_gibbs_weights, volumes, P0_energy_per_vol; compute_gradients=false
     )
     _, F_0 = compute_global_endpoint_gradients(
         dummy_names, dummy_grads, energies, energies, active_lambda_idx, decoupled_state_idx,
-        beta, awh_bias, volumes, P0_energy_per_vol; compute_gradients=false
+        beta, log_gibbs_weights, volumes, P0_energy_per_vol; compute_gradients=false
     )
     return F_1 - F_0
 end
@@ -378,6 +378,77 @@ end
 
 
 """
+    reset_frozen_bias_state!(awh_state)
+
+Clear transient AWH accumulators on a cloned state so a frozen-bias probe or
+production segment starts from the stored bias instead of inheriting a
+partially filled update block from the main leg.
+"""
+function reset_frozen_bias_state!(awh_state)
+    fill!(awh_state.w_seg, zero(eltype(awh_state.w_seg)))
+    fill!(awh_state.w2_seg, zero(eltype(awh_state.w2_seg)))
+    fill!(awh_state.w_last, zero(eltype(awh_state.w_last)))
+    awh_state.n_accum = 0
+    empty!(awh_state.visited_windows)
+    empty!(awh_state.cv_buffer)
+    return awh_state
+end
+
+
+"""
+    build_frozen_bias_awh_sim(awh_sim, md_steps_segment)
+
+Clone `awh_sim` for a short segment while freezing the AWH bias throughout that
+segment. The returned `(frozen_sim, bias_data)` pair keeps logged frames, MBAR
+denominators, and AWH profile comparisons tied to the same fixed reference
+bias.
+"""
+function build_frozen_bias_awh_sim(awh_sim::AWHSimulation, md_steps_segment::Int)
+    n_segment_iterations = fld(max(0, md_steps_segment), awh_sim.n_md_steps)
+    # `reset_frozen_bias_state!` restarts the cloned segment with `n_accum = 0`,
+    # so freezing only requires `update_freq` to exceed the number of AWH
+    # sampling iterations that will occur in this segment.
+    frozen_update_freq = max(awh_sim.update_freq, n_segment_iterations + 1)
+
+    bias_data = extract_awh_data(awh_sim)
+    frozen_sim = AWHSimulation(
+        deepcopy(awh_sim.state);
+        num_md_steps=awh_sim.n_md_steps,
+        update_freq=frozen_update_freq,
+        well_tempered_factor=awh_sim.well_tempered_fac,
+        coverage_threshold=awh_sim.coverage_threshold,
+        significant_weight=awh_sim.significant_weight,
+        coverage_type=awh_sim.coverage_type,
+        log_freq=awh_sim.log_freq,
+    )
+    reset_frozen_bias_state!(frozen_sim.state)
+    clear_awh_logger_histories!(frozen_sim)
+    enable_awh_logger_histories!(frozen_sim)
+    return frozen_sim, bias_data
+end
+
+
+"""
+    reset_stage_b_probe_state!(awh_state)
+
+Backward-compatible wrapper around `reset_frozen_bias_state!`.
+"""
+function reset_stage_b_probe_state!(awh_state)
+    return reset_frozen_bias_state!(awh_state)
+end
+
+
+"""
+    build_stage_b_probe_sim(awh_sim, md_steps_probe)
+
+Backward-compatible wrapper around `build_frozen_bias_awh_sim`.
+"""
+function build_stage_b_probe_sim(awh_sim::AWHSimulation, md_steps_probe::Int)
+    return build_frozen_bias_awh_sim(awh_sim, md_steps_probe)
+end
+
+
+"""
     run_stage_b_probe(awh_sim, sys_base, theta_params, param_names, idxs,
                       coupled_state_idx, decoupled_state_idx, beta, awh_split_tol_kT,
                       awh_parity_tol_kT; kwargs...)
@@ -404,7 +475,6 @@ function run_stage_b_probe(
     probe_min_frames::Int=2,
     probe_max_frames::Int=0,
     awh_probe_discard_fraction::Real=0.0,
-    awh_control::AWHControlConfig=AWHControlConfig(),
 ) where {FT <: AbstractFloat}
     if md_steps_probe <= 0
         @info "Stage B ($(leg_name)) skipped: md_steps_probe <= 0 (md_steps_probe=$md_steps_probe)."
@@ -421,14 +491,10 @@ function run_stage_b_probe(
     end
 
     # Probe on a cloned state so a failed Stage B check does not disturb the
-    # main leg that continues accumulating readiness statistics.
-    probe_sim = AWHSimulation(
-        deepcopy(awh_sim.state);
-        num_md_steps=awh_sim.n_md_steps,
-        awh_simulation_control_kwargs(awh_control)...,
-    )
-    clear_awh_logger_histories!(probe_sim)
-    probe_sim.state.active_sys.loggers.awh_logger.should_log = true
+    # main leg that continues accumulating readiness statistics. The cloned
+    # probe keeps the sampling bias fixed so MBAR and AWH are compared against
+    # the same bias profile.
+    probe_sim, bias_data = build_stage_b_probe_sim(awh_sim, md_steps_probe)
     probe_md_timed = timed_phase("Stage B Probe MD", leg_name; md_steps=md_steps_probe) do
         simulate!(probe_sim, md_steps_probe)
     end
@@ -491,9 +557,10 @@ function run_stage_b_probe(
     end
     u_probe_ref, _ = ensemble_eval_timed.result
 
-    bias_data = extract_awh_data(awh_sim)
-    # The actual bias applied to the simulation and used in the mixture denominator
-    awh_bias = bias_data.f .+ bias_data.log_rho
+    # Molly's AWH "bias" is a λ-state Gibbs log-weight, not a force bias. MBAR
+    # must use the fixed log-weights g_ref = f_ref + logρ_ref in the mixture
+    # denominator, matching `process_sample` in Molly's AWH implementation.
+    log_gibbs_weights = awh_log_gibbs_weights(bias_data)
 
     half_1, half_2 = split_half_ranges(n_frames)
     if isempty(half_1) || isempty(half_2)
@@ -512,12 +579,13 @@ function run_stage_b_probe(
 
     split_parity_timed = timed_phase("Stage B Split-Parity", leg_name) do
         # Split-half agreement checks time stability, while parity checks that
-        # the sampled AWH bias matches the MBAR-reconstructed profile.
+        # the sampled AWH free-energy estimate matches the MBAR-reconstructed
+        # profile when both are referenced to the same fixed Gibbs log-weights.
         volumes_probe = include_pv ? FT.(ustrip.(logger_probe.volume_history)) : FT[]
         dG_half_1 = estimate_leg_dg_from_reference(
             u_probe_ref[half_1, :],
             logger_probe.active_idx_history[half_1],
-            awh_bias,
+            log_gibbs_weights,
             coupled_state_idx,
             decoupled_state_idx,
             beta;
@@ -527,7 +595,7 @@ function run_stage_b_probe(
         dG_half_2 = estimate_leg_dg_from_reference(
             u_probe_ref[half_2, :],
             logger_probe.active_idx_history[half_2],
-            awh_bias,
+            log_gibbs_weights,
             coupled_state_idx,
             decoupled_state_idx,
             beta;
@@ -539,12 +607,12 @@ function run_stage_b_probe(
         split_ready = split_gap <= awh_split_tol_kT
 
         F_mbar_profile = include_pv ?
-            compute_full_mbar_profile(u_probe_ref, u_probe_ref, awh_bias, beta; volumes=volumes_probe, P0_energy_per_vol=P0_energy_per_vol) :
-            compute_full_mbar_profile(u_probe_ref, u_probe_ref, awh_bias, beta)
+            compute_full_mbar_profile(u_probe_ref, u_probe_ref, log_gibbs_weights, beta; volumes=volumes_probe, P0_energy_per_vol=P0_energy_per_vol) :
+            compute_full_mbar_profile(u_probe_ref, u_probe_ref, log_gibbs_weights, beta)
             
         # The reconstructed profile is the true thermodynamic free energy, so it must
         # be compared to AWH's estimate of the true free energy (bias_data.f), NOT the
-        # sampling bias (awh_bias = f + log_rho).
+        # Gibbs log-weight used for λ resampling (g_ref = f + log_rho).
         parity_gap = compute_parity_gap(F_mbar_profile, bias_data.f; ref_idx=coupled_state_idx)
         parity_ready = parity_gap <= awh_parity_tol_kT
 

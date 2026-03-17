@@ -129,6 +129,24 @@ function clear_awh_logger_histories!(awh_sim::AWHSimulation)
 end
 
 """
+    enable_awh_logger_histories!(awh_sim)
+
+Enable logging on the active-system logger and every per-state logger attached
+to an `AWHSimulation`.
+"""
+function enable_awh_logger_histories!(awh_sim::AWHSimulation)
+    if hasproperty(awh_sim.state.active_sys.loggers, :awh_logger)
+        awh_sim.state.active_sys.loggers.awh_logger.should_log = true
+    end
+    for state_loggers in awh_sim.state.state_loggers
+        if hasproperty(state_loggers, :awh_logger)
+            state_loggers.awh_logger.should_log = true
+        end
+    end
+    return nothing
+end
+
+"""
     get_awh_active_idx_history(awh_sim)
 
 Recover the λ-index history used by readiness checks, preferring Molly's

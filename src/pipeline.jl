@@ -385,7 +385,6 @@ function run_readiness_loop!(
                         probe_min_frames=probe_min_frames_by_leg[name],
                         probe_max_frames=probe_max_frames_by_leg[name],
                         awh_probe_discard_fraction=awh_probe_discard_fraction,
-                        awh_control=awh_control,
                     ))
 
                     split_gap_by_leg[name] = stageB_stats_by_leg[name].split_gap
@@ -464,7 +463,7 @@ end
 """
     collect_production_artifacts!(cycle_cfg, awh_by_leg, sys_by_leg, idxs_by_leg,
                                   runtime, theta_active, param_names, md_steps_prod,
-                                  p0_energy_per_vol, awh_control)
+                                  p0_energy_per_vol)
 
 Run the final production segment for each ready leg and package the results for
 the optimization phase.
@@ -480,7 +479,6 @@ function collect_production_artifacts!(
     param_names::Vector{String},
     md_steps_prod::Int,
     p0_energy_per_vol::FT,
-    awh_control::AWHControlConfig,
 ) where {FT <: AbstractFloat}
     for leg in cycle_cfg.legs
         runtime.active_bias[leg.name] = extract_awh_data(awh_by_leg[leg.name])
@@ -495,12 +493,10 @@ function collect_production_artifacts!(
     artifacts = LegArtifacts[]
     for leg in cycle_cfg.legs
         name = leg.name
-        awh_prod = AWHSimulation(
-            awh_by_leg[name].state;
-            num_md_steps=awh_by_leg[name].n_md_steps,
-            awh_simulation_control_kwargs(awh_control)...,
-        )
-        awh_prod.state.active_sys.loggers.awh_logger.should_log = true
+        # Production frames must be sampled under the exact same frozen bias that
+        # the offline MBAR step later uses in its mixture denominator.
+        awh_prod, bias_data = build_frozen_bias_awh_sim(awh_by_leg[name], md_steps_prod)
+        runtime.active_bias[name] = bias_data
         simulate!(awh_prod, md_steps_prod)
 
         # Persist the end-of-production state so the next macro epoch can start
@@ -533,7 +529,7 @@ function collect_production_artifacts!(
             neighbors=neighbors,
             u_ref=u_ref,
             sys_base=sys_by_leg[name],
-            active_bias=runtime.active_bias[name],
+            active_bias=bias_data,
             idxs=idxs_by_leg[name],
         ))
     end
@@ -707,7 +703,6 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             param_names,
             md_steps_prod,
             p0_energy_per_vol,
-            sim_cfg.awh_control,
         )
 
         GC.gc()
