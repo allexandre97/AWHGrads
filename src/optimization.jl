@@ -122,6 +122,108 @@ function compute_leg_endpoint_state(
 end
 
 
+Base.@kwdef struct OptimizationBlock
+    name::String
+    kind::Symbol
+    global_indices::Vector{Int}
+    trainable_indices::Vector{Int}
+end
+
+
+"""
+    optimization_block_key(param_name)
+
+Recover the atom-type label used to group solute-only optimization into smaller
+`σ`/`ϵ` blocks. Nonstandard parameter names fall back to their full name.
+"""
+function optimization_block_key(param_name::AbstractString)
+    match_data = match(r"^atom_(.+)_(σ|ϵ)$", param_name)
+    return isnothing(match_data) ? String(param_name) : String(match_data.captures[1])
+end
+
+
+"""
+    optimization_active_blocks(param_names, trainable_param_indices,
+                               trainable_position_map, solute_param_indices,
+                               solvent_param_indices, optimize_solvent)
+
+Build the ordered list of parameter blocks visited by the inner optimization
+loop. When `optimize_solvent=false`, the solute block is split by atom type to
+reduce Fisher ill-conditioning and overly aggressive clipping.
+"""
+function optimization_active_blocks(
+    param_names::Vector{String},
+    trainable_param_indices::Vector{Int},
+    trainable_position_map::Dict{Int, Int},
+    solute_param_indices::Vector{Int},
+    solvent_param_indices::Vector{Int},
+    optimize_solvent::Bool,
+)
+    blocks = OptimizationBlock[]
+
+    if optimize_solvent
+        for (name, kind, global_indices_raw) in (
+            ("Solute", :solute, solute_param_indices),
+            ("Solvent", :solvent, solvent_param_indices),
+        )
+            global_indices = [idx for idx in global_indices_raw if haskey(trainable_position_map, idx)]
+            isempty(global_indices) && continue
+            trainable_indices = [trainable_position_map[idx] for idx in global_indices]
+            push!(
+                blocks,
+                OptimizationBlock(
+                    name=name,
+                    kind=kind,
+                    global_indices=global_indices,
+                    trainable_indices=trainable_indices,
+                ),
+            )
+        end
+    else
+        grouped_indices = Dict{String, Vector{Int}}()
+        block_order = String[]
+        for idx_global in trainable_param_indices
+            block_key = optimization_block_key(param_names[idx_global])
+            if !haskey(grouped_indices, block_key)
+                grouped_indices[block_key] = Int[]
+                push!(block_order, block_key)
+            end
+            push!(grouped_indices[block_key], idx_global)
+        end
+        for block_key in block_order
+            global_indices = grouped_indices[block_key]
+            trainable_indices = [trainable_position_map[idx] for idx in global_indices]
+            push!(
+                blocks,
+                OptimizationBlock(
+                    name="Solute[$block_key]",
+                    kind=:solute,
+                    global_indices=global_indices,
+                    trainable_indices=trainable_indices,
+                ),
+            )
+        end
+    end
+
+    isempty(blocks) && throw(ArgumentError("No optimization blocks were constructed."))
+    return blocks
+end
+
+
+line_search_noise_tolerance(error_residual::FT, tolerance_fraction::FT) where {FT <: AbstractFloat} =
+    tolerance_fraction * abs(error_residual)
+
+
+function line_search_residual_acceptable(
+    error_residual::FT,
+    error_residual_prop::FT,
+    tolerance_fraction::FT,
+) where {FT <: AbstractFloat}
+    noise_tolerance = line_search_noise_tolerance(error_residual, tolerance_fraction)
+    return abs(error_residual_prop) <= abs(error_residual) + noise_tolerance
+end
+
+
 """
     run_optimization_phase!(phi_active, theta_active, leg_artifacts, param_names,
                             trainable_param_names, trainable_param_indices,
@@ -158,9 +260,20 @@ function run_optimization_phase!(
     if isempty(trainable_param_indices)
         throw(ArgumentError("run_optimization_phase! received no trainable parameters."))
     end
+    if opt_cfg.max_inner_epochs <= 0
+        throw(ArgumentError("OptimizationConfig.max_inner_epochs must be positive."))
+    end
 
     theoretical_ess_ratio = exp(FT(-2.0) * opt_cfg.kl_target)
     ess_threshold_ratio = opt_cfg.ess_threshold_scale * theoretical_ess_ratio
+    active_blocks = optimization_active_blocks(
+        param_names,
+        trainable_param_indices,
+        trainable_position_map,
+        solute_param_indices,
+        solvent_param_indices,
+        opt_cfg.optimize_solvent,
+    )
 
     ess_thresholds = Dict{Symbol, FT}()
     N_base = Dict{Symbol, FT}()
@@ -185,22 +298,12 @@ function run_optimization_phase!(
     solvent_theta_start = isempty(solvent_param_indices) ? FT[] : copy(theta_active[solvent_param_indices])
 
     inner_epoch = 1
-    while true
-        if opt_cfg.optimize_solvent
-            active_global_indices = (inner_epoch % 2 != 0) ? solute_param_indices : solvent_param_indices
-            block_name = (inner_epoch % 2 != 0) ? "Solute" : "Solvent"
-        else
-            active_global_indices = trainable_param_indices
-            block_name = "Solute"
-        end
-
-        active_trainable_indices = Int[]
-        for idx_global in active_global_indices
-            if haskey(trainable_position_map, idx_global)
-                push!(active_trainable_indices, trainable_position_map[idx_global])
-            end
-        end
-        @info "  >> Alternating Optimization: Active Block = $block_name"
+    while inner_epoch <= opt_cfg.max_inner_epochs
+        block = active_blocks[((inner_epoch - 1) % length(active_blocks)) + 1]
+        active_global_indices = block.global_indices
+        active_trainable_indices = block.trainable_indices
+        block_name = block.name
+        @info "  >> Optimization Epoch: Active Block = $block_name"
 
         if isempty(active_trainable_indices)
             @info "  [!] No parameters active for this block. Skipping."
@@ -332,7 +435,7 @@ function run_optimization_phase!(
         fim_cond_raw = cond(fim_corr)
 
         max_phi_update = maximum(abs.(update_direction_active))
-        max_allowed_phi_step = block_name == "Solute" ? opt_cfg.max_phi_step_solute : opt_cfg.max_phi_step_solvent
+        max_allowed_phi_step = block.kind == :solute ? opt_cfg.max_phi_step_solute : opt_cfg.max_phi_step_solvent
 
         if max_phi_update > max_allowed_phi_step
             clip_scaling = max_allowed_phi_step / max_phi_update
@@ -404,8 +507,11 @@ function run_optimization_phase!(
             )
             @info "    LS Iter $ls_iter (α=$(alpha)): ESS[$ess_msg] | Res = $(round(error_residual_prop, digits=3))"
 
-            noise_tolerance = FT(0.05) * abs(error_residual)
-            if ess_ok && abs(error_residual_prop) <= abs(error_residual) + noise_tolerance
+            if ess_ok && line_search_residual_acceptable(
+                error_residual,
+                error_residual_prop,
+                FT(opt_cfg.line_search_noise_tolerance_fraction),
+            )
                 line_search_success = true
                 phi_active .= phi_prop
                 theta_active .= theta_prop
@@ -470,7 +576,16 @@ function run_optimization_phase!(
         inner_epoch += 1
     end
 
-    if (phase2_exit_reason == :step_vanish || phase2_exit_reason == :tiny_alpha) && best_macro_epoch > 0
+    if phase2_exit_reason == :running
+        phase2_exit_reason = :inner_epoch_cap
+        @info "  [!] Reached max_inner_epochs=$(opt_cfg.max_inner_epochs). Triggering Phase 3 resimulation."
+    end
+
+    if (
+        phase2_exit_reason == :step_vanish ||
+        phase2_exit_reason == :tiny_alpha ||
+        phase2_exit_reason == :inner_epoch_cap
+    ) && best_macro_epoch > 0
         phi_active .= phi_best_macro
         theta_active .= theta_best_macro
         macro_end_residual = best_macro_residual

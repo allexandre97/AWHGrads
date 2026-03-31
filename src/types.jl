@@ -167,14 +167,16 @@ Base.@kwdef struct OptimizationConfig
     awh_convergence_tol = Float32(1e-3)
     rewarm_fraction = Float32(0.05)
     max_macro_epochs::Int = 30
+    max_inner_epochs::Int = 10
     huber_delta = Float32(2.0)
 
     # Trust-region / natural-gradient step sizing.
-    kl_target = Float32(0.1)
-    eigenvalue_tol_scale = Float32(1e-2)
+    kl_target = Float32(0.25)
+    eigenvalue_tol_scale = Float32(1e-3)
     min_phi_step = Float32(5e-4)
-    max_phi_step_solute = Float32(0.35)
+    max_phi_step_solute = Float32(0.6)
     max_phi_step_solvent = Float32(0.035)
+    line_search_noise_tolerance_fraction = Float32(0.1)
     tiny_alpha_cutoff = Float32(0.015625)
     max_tiny_alpha_hits::Int = 2
     restart_rmsd_tol_nm = Float32(1e-5)

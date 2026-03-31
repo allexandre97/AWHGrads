@@ -485,6 +485,11 @@ end
     @test sim_cfg.awh_control.initial_n_bias == 100
 
     opt_cfg = AWHGrads.default_optimization_config()
+    @test opt_cfg.max_inner_epochs == 10
+    @test opt_cfg.kl_target == Float32(0.25)
+    @test opt_cfg.eigenvalue_tol_scale == Float32(1e-3)
+    @test opt_cfg.max_phi_step_solute == Float32(0.6)
+    @test opt_cfg.line_search_noise_tolerance_fraction == Float32(0.1)
     @test opt_cfg.awh_min_lambda_ess == 300
     @test opt_cfg.awh_parity_tol_kT == Float32(0.25)
     @test opt_cfg.awh_parity_gate_mode == :support_aware_max
