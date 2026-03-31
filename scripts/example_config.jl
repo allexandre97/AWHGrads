@@ -22,8 +22,9 @@ sim_cfg = AWHGrads.simulation_config_with(
     awh_control=AWHGrads.AWHControlConfig(
         lj_softcore_alpha=0.85,
         coul_softcore_alpha=0.3,
-        update_freq=100,
-        coverage_threshold=0.8,
+        bias_update_interval_md_steps=1000,
+        stats_log_every_updates=1,
+        coverage_threshold=1.0,
         significant_weight=0.1,
         initial_n_bias=100,
     ),

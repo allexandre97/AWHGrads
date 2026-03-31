@@ -463,6 +463,102 @@ function compute_full_mbar_profile(
 end
 
 """
+    compute_full_mbar_profile_from_log_mixture_denom(energies_current, log_mixture_denom, beta;
+                                                     volumes=FT[], P0_energy_per_vol=zero(FT))
+
+Reconstruct the complete λ free-energy profile when the per-frame reference
+mixture denominator `log_mixture_denom` has already been precomputed. This is
+used by Stage B accumulation where each probe segment can have a different
+frozen AWH reference bias.
+"""
+function compute_full_mbar_profile_from_log_mixture_denom(
+    energies_current::Matrix{FT},
+    log_mixture_denom::Vector{FT},
+    beta::FT;
+    volumes::Vector{FT}=FT[],
+    P0_energy_per_vol::FT=zero(FT)
+) where {FT <: AbstractFloat}
+    M, num_lambda = size(energies_current)
+    if length(log_mixture_denom) != M
+        throw(ArgumentError("compute_full_mbar_profile_from_log_mixture_denom expected log_mixture_denom length $M, got $(length(log_mixture_denom))."))
+    end
+    if !isempty(volumes) && length(volumes) != M
+        throw(ArgumentError("compute_full_mbar_profile_from_log_mixture_denom expected `volumes` length $M, got $(length(volumes))."))
+    end
+    if M == 0 || num_lambda == 0
+        throw(ArgumentError("compute_full_mbar_profile_from_log_mixture_denom received empty energies matrix."))
+    end
+
+    pv_terms = zeros(FT, M)
+    if !isempty(volumes)
+        @inbounds for k in 1:M
+            pv_terms[k] = beta * P0_energy_per_vol * volumes[k]
+        end
+    end
+
+    F_profile = zeros(FT, num_lambda)
+    log_W_target = zeros(FT, M)
+    @inbounds for λ in 1:num_lambda
+        for k in 1:M
+            pv_k = pv_terms[k]
+            log_W_target[k] = -(beta * energies_current[k, λ] + pv_k) - log_mixture_denom[k]
+        end
+        max_log_W = maximum(log_W_target)
+        F_profile[λ] = -(max_log_W + log(sum(exp.(log_W_target .- max_log_W))))
+    end
+
+    return F_profile
+end
+
+"""
+    compute_state_reweighting_ess_from_log_mixture_denom(energies_current, log_mixture_denom, beta;
+                                                         volumes=FT[], P0_energy_per_vol=zero(FT))
+
+Compute a per-state effective sample size (ESS) for the MBAR target weights
+using precomputed reference mixture denominators.
+"""
+function compute_state_reweighting_ess_from_log_mixture_denom(
+    energies_current::Matrix{FT},
+    log_mixture_denom::Vector{FT},
+    beta::FT;
+    volumes::Vector{FT}=FT[],
+    P0_energy_per_vol::FT=zero(FT)
+) where {FT <: AbstractFloat}
+    M, num_lambda = size(energies_current)
+    if length(log_mixture_denom) != M
+        throw(ArgumentError("compute_state_reweighting_ess_from_log_mixture_denom expected log_mixture_denom length $M, got $(length(log_mixture_denom))."))
+    end
+    if !isempty(volumes) && length(volumes) != M
+        throw(ArgumentError("compute_state_reweighting_ess_from_log_mixture_denom expected `volumes` length $M, got $(length(volumes))."))
+    end
+    if M == 0 || num_lambda == 0
+        throw(ArgumentError("compute_state_reweighting_ess_from_log_mixture_denom received empty energies matrix."))
+    end
+
+    pv_terms = zeros(FT, M)
+    if !isempty(volumes)
+        @inbounds for k in 1:M
+            pv_terms[k] = beta * P0_energy_per_vol * volumes[k]
+        end
+    end
+
+    ess_by_state = zeros(FT, num_lambda)
+    log_W_target = zeros(FT, M)
+    @inbounds for λ in 1:num_lambda
+        for k in 1:M
+            pv_k = pv_terms[k]
+            log_W_target[k] = -(beta * energies_current[k, λ] + pv_k) - log_mixture_denom[k]
+        end
+        max_log_W = maximum(log_W_target)
+        w = exp.(log_W_target .- max_log_W)
+        w ./= sum(w)
+        ess_by_state[λ] = one(FT) / sum(w .^ 2)
+    end
+
+    return ess_by_state
+end
+
+"""
     compute_parity_gap(F_mbar, F_awh; ref_idx=1)
 
 Measure the maximum deviation between an MBAR-reconstructed free-energy profile

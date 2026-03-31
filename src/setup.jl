@@ -13,19 +13,198 @@ function awh_state_control_kwargs(awh_control::AWHControlConfig; first_state::In
 end
 
 """
+    resolve_awh_iteration_cadence(awh_control)
+
+Resolve the effective Molly iteration counts implied by the user-facing AWH
+cadence settings.
+"""
+function resolve_awh_iteration_cadence(awh_control::AWHControlConfig)
+    n_md_steps = awh_control.seed_num_md_steps
+    n_md_steps > 0 || throw(ArgumentError("`seed_num_md_steps` must be positive, got $n_md_steps."))
+
+    target_bias_md_steps = awh_control.bias_update_interval_md_steps
+    target_bias_md_steps > 0 || throw(ArgumentError("`bias_update_interval_md_steps` must be positive, got $target_bias_md_steps."))
+
+    stats_log_every_updates = awh_control.stats_log_every_updates
+    stats_log_every_updates > 0 || throw(ArgumentError("`stats_log_every_updates` must be positive, got $stats_log_every_updates."))
+
+    resolved_update_freq = if isnothing(awh_control.update_freq)
+        # Round down so auto mode never yields a slower-than-requested bias cadence.
+        max(1, fld(target_bias_md_steps, n_md_steps))
+    else
+        awh_control.update_freq > 0 || throw(ArgumentError("`update_freq` override must be positive, got $(awh_control.update_freq)."))
+        awh_control.update_freq
+    end
+
+    resolved_log_freq = resolved_update_freq * stats_log_every_updates
+
+    return (
+        n_md_steps=n_md_steps,
+        update_freq=resolved_update_freq,
+        log_freq=resolved_log_freq,
+        effective_bias_update_md_steps=n_md_steps * resolved_update_freq,
+        stats_log_every_updates=stats_log_every_updates,
+        auto_update_freq=isnothing(awh_control.update_freq),
+    )
+end
+
+"""
+    resolve_leg_awh_control(awh_control, leg)
+
+Copy the global AWH controls and apply any leg-specific cadence overrides.
+"""
+function resolve_leg_awh_control(
+    awh_control::AWHControlConfig,
+    leg::ThermodynamicLegConfig,
+)
+    return AWHControlConfig(
+        lj_softcore_alpha=awh_control.lj_softcore_alpha,
+        coul_softcore_alpha=awh_control.coul_softcore_alpha,
+        reuse_neighbors=awh_control.reuse_neighbors,
+        seed_num_md_steps=isnothing(leg.awh_seed_num_md_steps) ? awh_control.seed_num_md_steps : leg.awh_seed_num_md_steps,
+        bias_update_interval_md_steps=isnothing(leg.awh_bias_update_interval_md_steps) ? awh_control.bias_update_interval_md_steps : leg.awh_bias_update_interval_md_steps,
+        stats_log_every_updates=awh_control.stats_log_every_updates,
+        update_freq=awh_control.update_freq,
+        coverage_threshold=awh_control.coverage_threshold,
+        significant_weight=awh_control.significant_weight,
+        initial_n_bias=awh_control.initial_n_bias,
+        well_tempered_factor=awh_control.well_tempered_factor,
+        coverage_type=awh_control.coverage_type,
+    )
+end
+
+"""
     awh_simulation_control_kwargs(awh_control)
 
 Translate high-level AWH controls into the keyword arguments expected by
 `AWHSimulation`.
 """
 function awh_simulation_control_kwargs(awh_control::AWHControlConfig)
+    cadence = resolve_awh_iteration_cadence(awh_control)
     return (
-        update_freq=awh_control.update_freq,
+        num_md_steps=cadence.n_md_steps,
+        update_freq=cadence.update_freq,
+        log_freq=cadence.log_freq,
         well_tempered_factor=awh_control.well_tempered_factor,
         coverage_threshold=awh_control.coverage_threshold,
         significant_weight=awh_control.significant_weight,
         coverage_type=awh_control.coverage_type,
     )
+end
+
+normalize_lambda_scheduler_name(value::Union{Nothing, Symbol}) = isnothing(value) ? :default : value
+normalize_softcore_model_name(value::Union{Nothing, Symbol}) = isnothing(value) ? :beutler : value
+uses_reaction_field_coulomb_model(value::Union{Nothing, Symbol}) = normalize_softcore_model_name(value) in (:beutler_rf, :gapsys_rf)
+
+function resolve_lambda_scheduler(value::Union{Nothing, Symbol})
+    scheduler_name = normalize_lambda_scheduler_name(value)
+    if scheduler_name == :default
+        return Molly.DefaultLambdaScheduler()
+    elseif scheduler_name == :namd
+        return Molly.NAMDLambdaScheduler()
+    elseif scheduler_name == :quarters
+        return Molly.QuartersLambdaScheduler()
+    elseif scheduler_name == :ele_scaled
+        return Molly.EleScaledLambdaScheduler()
+    end
+    throw(ArgumentError("Unsupported lambda scheduler `$scheduler_name`."))
+end
+
+function build_lj_softcore_interaction(
+    lj_0::LennardJones,
+    awh_control::AWHControlConfig,
+    scheduler,
+    model::Union{Nothing, Symbol},
+)
+    model_name = normalize_softcore_model_name(model)
+    if model_name == :beutler
+        return LennardJonesSoftCoreBeutler(
+            cutoff=lj_0.cutoff,
+            α=FT(awh_control.lj_softcore_alpha),
+            use_neighbors=lj_0.use_neighbors,
+            shortcut=lj_0.shortcut,
+            σ_mixing=lj_0.σ_mixing,
+            ϵ_mixing=lj_0.ϵ_mixing,
+            scheduler=scheduler,
+            weight_special=lj_0.weight_special,
+        )
+    elseif model_name == :gapsys
+        return LennardJonesSoftCoreGapsys(
+            cutoff=lj_0.cutoff,
+            α=FT(awh_control.lj_softcore_alpha),
+            use_neighbors=lj_0.use_neighbors,
+            shortcut=lj_0.shortcut,
+            σ_mixing=lj_0.σ_mixing,
+            ϵ_mixing=lj_0.ϵ_mixing,
+            scheduler=scheduler,
+            weight_special=lj_0.weight_special,
+        )
+    end
+    throw(ArgumentError("Unsupported LJ soft-core model `$model_name`."))
+end
+
+function build_coulomb_softcore_interaction(
+    cl_0::Coulomb,
+    awh_control::AWHControlConfig,
+    scheduler,
+    model::Union{Nothing, Symbol},
+)
+    model_name = normalize_softcore_model_name(model)
+    if model_name == :beutler
+        return CoulombSoftCoreBeutler(
+            cutoff=cl_0.cutoff,
+            α=FT(awh_control.coul_softcore_alpha),
+            use_neighbors=cl_0.use_neighbors,
+            scheduler=scheduler,
+            weight_special=cl_0.weight_special,
+            coulomb_const=cl_0.coulomb_const,
+        )
+    elseif model_name == :gapsys
+        return CoulombSoftCoreGapsys(
+            cutoff=cl_0.cutoff,
+            α=FT(awh_control.coul_softcore_alpha),
+            σQ=FT(1.0)u"nm",
+            use_neighbors=cl_0.use_neighbors,
+            scheduler=scheduler,
+            weight_special=cl_0.weight_special,
+            coulomb_const=cl_0.coulomb_const,
+        )
+    end
+    throw(ArgumentError("Unsupported Coulomb soft-core model `$model_name`."))
+end
+
+function build_coulomb_softcore_interaction(
+    cl_0::CoulombReactionField,
+    awh_control::AWHControlConfig,
+    scheduler,
+    model::Union{Nothing, Symbol},
+)
+    model_name = normalize_softcore_model_name(model)
+    if model_name == :beutler_rf
+        return CoulombSoftCoreBeutlerReactionField(
+            dist_cutoff=cl_0.dist_cutoff,
+            solvent_dielectric=cl_0.solvent_dielectric,
+            α=FT(awh_control.coul_softcore_alpha),
+            use_neighbors=cl_0.use_neighbors,
+            σ_mixing=LorentzMixing(),
+            ϵ_mixing=GeometricMixing(),
+            scheduler=scheduler,
+            weight_special=cl_0.weight_special,
+            coulomb_const=cl_0.coulomb_const,
+        )
+    elseif model_name == :gapsys_rf
+        return CoulombSoftCoreGapsysReactionField(
+            dist_cutoff=cl_0.dist_cutoff,
+            solvent_dielectric=cl_0.solvent_dielectric,
+            α=FT(awh_control.coul_softcore_alpha),
+            σQ=FT(1.0)u"nm",
+            use_neighbors=cl_0.use_neighbors,
+            scheduler=scheduler,
+            weight_special=cl_0.weight_special,
+            coulomb_const=cl_0.coulomb_const,
+        )
+    end
+    throw(ArgumentError("Reaction-field Coulomb base requires an RF soft-core model, got `$model_name`."))
 end
 
 """
@@ -57,6 +236,33 @@ function awh_global_lambda_schedule(lambda_values, ::Type{FT}=Float32) where {FT
 end
 
 """
+    solvent_lambda_schedule_diagnostics(lambda_values, lambda_scheduler=:default, FT=Float32)
+
+Return a compact per-state summary of the solvent-leg λ schedule under Molly's
+insert-role scheduler so logs can be interpreted in terms of effective
+electrostatic and LJ scaling, not only state indices.
+"""
+function solvent_lambda_schedule_diagnostics(
+    lambda_values,
+    lambda_scheduler::Union{Nothing, Symbol}=:default,
+    ::Type{FT}=Float32,
+) where {FT <: AbstractFloat}
+    scheduler = resolve_lambda_scheduler(lambda_scheduler)
+    global_values = awh_global_lambda_schedule(lambda_values, FT)
+
+    return [
+        (
+            idx=idx,
+            global_lambda=λ,
+            elec_lambda=FT(Molly.scale_elec(scheduler, λ, Molly.InsertRole)),
+            lj_lambda=FT(Molly.scale_sterics(scheduler, λ, Molly.InsertRole)),
+            stage=(λ >= FT(0.5) ? :charge : :lj),
+        )
+        for (idx, λ) in enumerate(global_values)
+    ]
+end
+
+"""
     setup_alchemical_awh(pdb_file, solute_indices; kwargs...)
 
 Build a λ-expanded AWH simulation for one thermodynamic leg. The function
@@ -78,12 +284,16 @@ function setup_alchemical_awh(
     restart_state=nothing,
     restart_active_idx::Int=1,
     warm_start::Bool=false,
+    lambda_scheduler::Union{Nothing, Symbol}=nothing,
+    coulomb_softcore_model::Union{Nothing, Symbol}=nothing,
+    lj_softcore_model::Union{Nothing, Symbol}=nothing,
     sigma_seed=nothing,
     epsilon_seed=nothing,
 )
     # Start from the reference PDB and optionally attach an AWH logger.
+    base_nonbonded_method = (uses_reaction_field_coulomb_model(coulomb_softcore_model) && !is_vacuum) ? :cutoff : :none
     sys_raw = System(
-        pdb_file, ff; array_type=AT, nonbonded_method=:none, 
+        pdb_file, ff; array_type=AT, nonbonded_method=base_nonbonded_method,
         loggers=isnothing(logger) ? NamedTuple() : (awh_logger=logger,)  
     )
 
@@ -138,27 +348,13 @@ function setup_alchemical_awh(
 
     p_inters = sys_base.pairwise_inters 
     idx_lj   = findfirst(x -> x isa LennardJones, p_inters)  
-    idx_coul = findfirst(x -> x isa Coulomb, p_inters)  
+    idx_coul = findfirst(x -> x isa Coulomb || x isa CoulombReactionField, p_inters)
     
     lj_0 = p_inters[idx_lj]  
     cl_0 = p_inters[idx_coul]  
-
-    lj_sc = LennardJonesSoftCoreBeutler(
-        cutoff=lj_0.cutoff,
-        α=FT(awh_control.lj_softcore_alpha),
-        use_neighbors=lj_0.use_neighbors,
-        shortcut=lj_0.shortcut,
-        σ_mixing=lj_0.σ_mixing,
-        ϵ_mixing=lj_0.ϵ_mixing,
-        weight_special=lj_0.weight_special,
-    )
-    coul_sc = CoulombSoftCoreBeutler(
-        cutoff=cl_0.cutoff,
-        α=FT(awh_control.coul_softcore_alpha),
-        use_neighbors=cl_0.use_neighbors,
-        weight_special=cl_0.weight_special,
-        coulomb_const=cl_0.coulomb_const,
-    )
+    scheduler = resolve_lambda_scheduler(lambda_scheduler)
+    lj_sc = build_lj_softcore_interaction(lj_0, awh_control, scheduler, lj_softcore_model)
+    coul_sc = build_coulomb_softcore_interaction(cl_0, awh_control, scheduler, coulomb_softcore_model)
 
     thermo_states = ThermoState[]  
 
@@ -201,8 +397,6 @@ function setup_alchemical_awh(
 
     awh_sim = AWHSimulation(
         awh_state;
-        num_md_steps=awh_control.seed_num_md_steps,
-        log_freq=awh_control.seed_log_freq,
         awh_simulation_control_kwargs(awh_control)...,
     )
     

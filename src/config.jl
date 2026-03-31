@@ -6,10 +6,54 @@ Molly's `DefaultLambdaScheduler` and the current `InsertRole` convention, this
 encodes charge-first, LJ-second decoupling while still using only atom λ
 values.
 """
-function default_solvent_leg_lambda_schedule(::Type{FT}=Float32) where {FT <: AbstractFloat}
+function _charge_stage_global_lambda(
+    elec_stage::AbstractVector{FT},
+    lambda_scheduler::Symbol,
+) where {FT <: AbstractFloat}
+    if lambda_scheduler in (:default, :namd)
+        return (elec_stage .+ one(FT)) ./ FT(2)
+    elseif lambda_scheduler == :ele_scaled
+        return ((elec_stage .^ 2) .+ one(FT)) ./ FT(2)
+    end
+    throw(ArgumentError("Staged solvent schedules only support :default, :namd, and :ele_scaled schedulers; got `$lambda_scheduler`."))
+end
+
+function default_solvent_leg_lambda_schedule(::Type{FT}=Float32; lambda_scheduler::Symbol=:default) where {FT <: AbstractFloat}
     charge_stage = collect(FT.(range(one(FT), stop=zero(FT), length=11)))
     lj_stage = reverse(FT.(collect(range(zero(FT), stop=one(FT), length=21)) .^ 2))[2:end]
-    return vcat((charge_stage .+ one(FT)) ./ FT(2), lj_stage ./ FT(2))
+    return vcat(_charge_stage_global_lambda(charge_stage, lambda_scheduler), lj_stage ./ FT(2))
+end
+
+"""
+    dense_solvent_leg_lambda_schedule(FT=Float32)
+
+Return a staged 35-state solvent-leg global λ schedule that preserves the
+charge-first, LJ-second semantics while concentrating charge-stage windows in
+the problematic partially discharged electrostatic regime without over-densifying
+the easy ends of the path. The charge-stage atom λ values are derived from the
+chosen scheduler so the effective electrostatic λ ladder matches the intended
+charge-stage windows.
+"""
+function dense_solvent_leg_lambda_schedule(::Type{FT}=Float32; lambda_scheduler::Symbol=:default) where {FT <: AbstractFloat}
+    elec_stage = FT[
+        1.0,
+        0.9,
+        0.8,
+        0.7,
+        0.6,
+        0.5,
+        0.45,
+        0.4,
+        0.35,
+        0.3,
+        0.25,
+        0.2,
+        0.15,
+        0.1,
+        0.0,
+    ]
+    lj_stage = reverse(FT.(collect(range(zero(FT), stop=one(FT), length=21)) .^ 2))[2:end]
+    return vcat(_charge_stage_global_lambda(elec_stage, lambda_scheduler), lj_stage ./ FT(2))
 end
 
 """
@@ -19,7 +63,7 @@ Return the built-in two-leg ethanol hydration cycle used by the example
 scripts.
 """
 function default_cycle_config(; target_dG_kcal_mol::Real=-5.01, FT::DataType=Float32)
-    solvent_lambda_schedule = default_solvent_leg_lambda_schedule(FT)
+    solvent_lambda_schedule = dense_solvent_leg_lambda_schedule(FT; lambda_scheduler=:ele_scaled)
     legs = [
         ThermodynamicLegConfig(
             name=:solvent,
@@ -30,6 +74,10 @@ function default_cycle_config(; target_dG_kcal_mol::Real=-5.01, FT::DataType=Flo
             probe_time=FT(1.5)u"ns",
             lambda_schedule=solvent_lambda_schedule,
             ensemble=:npt,
+            probe_awh_seed_num_md_steps=1000,
+            lambda_scheduler=:ele_scaled,
+            coulomb_softcore_model=:gapsys_rf,
+            lj_softcore_model=:beutler,
         ),
         ThermodynamicLegConfig(
             name=:vacuum,
@@ -111,11 +159,23 @@ function default_optimization_config(; FT::DataType=Float32)
         awh_min_lambda_ess=300,
         awh_split_tol_kT=FT(0.5),
         awh_parity_tol_kT=FT(0.25),
+        awh_parity_gate_mode=:support_aware_max,
+        awh_parity_support_threshold=FT(300),
+        awh_stageB_support_allow_missing=3,
+        awh_parity_near_pass_factor=FT(2.0),
         awh_tail_lag=10,
         awh_min_round_trips=3,
         awh_endpoint_target_ratio=FT(0.3),
         awh_stageA_stable_blocks=2,
         awh_stageB_cooldown_blocks=2,
+        awh_stageB_near_pass_cooldown_blocks=0,
+        awh_stageB_probe_growth_factor=FT(1.5),
+        awh_stageB_probe_near_pass_scale=FT(0.5),
+        awh_stageB_probe_max_factor=FT(4.0),
+        awh_stageA_streak_growth_factor=FT(1.5),
+        awh_stageB_cooldown_growth_factor=FT(1.5),
+        awh_stageA_max_streak=10,
+        awh_stageB_max_cooldown=10,
         k_sigmoid=FT(1.0),
     )
 end
@@ -132,7 +192,7 @@ function resolved_cycle_config(sim_cfg::SimulationConfig)
         return sim_cfg.cycle
     end
 
-    solvent_lambda_schedule = default_solvent_leg_lambda_schedule(sim_cfg.FT)
+    solvent_lambda_schedule = dense_solvent_leg_lambda_schedule(sim_cfg.FT; lambda_scheduler=:ele_scaled)
     return ThermodynamicCycleConfig(
         legs=[
             ThermodynamicLegConfig(
@@ -141,14 +201,18 @@ function resolved_cycle_config(sim_cfg::SimulationConfig)
                 coefficient=1.0,
                 is_vacuum=false,
                 include_pv=true,
-                probe_time=sim_cfg.awh_probe_time_solv,
-                lambda_schedule=solvent_lambda_schedule,
-                ensemble=:npt,
-            ),
-            ThermodynamicLegConfig(
-                name=:vacuum,
-                pdb=sim_cfg.pdb_vac,
-                coefficient=-1.0,
+            probe_time=sim_cfg.awh_probe_time_solv,
+            lambda_schedule=solvent_lambda_schedule,
+            ensemble=:npt,
+            probe_awh_seed_num_md_steps=1000,
+            lambda_scheduler=:ele_scaled,
+            coulomb_softcore_model=:gapsys_rf,
+            lj_softcore_model=:beutler,
+        ),
+        ThermodynamicLegConfig(
+            name=:vacuum,
+            pdb=sim_cfg.pdb_vac,
+            coefficient=-1.0,
                 is_vacuum=true,
                 include_pv=false,
                 probe_time=sim_cfg.awh_probe_time_vac,
@@ -191,6 +255,19 @@ function _validate_leg_ensemble(leg::ThermodynamicLegConfig)
     return nothing
 end
 
+function _validate_leg_alchemical_path(leg::ThermodynamicLegConfig)
+    if !isnothing(leg.lambda_scheduler) && !(leg.lambda_scheduler in (:default, :namd, :quarters, :ele_scaled))
+        throw(ArgumentError("Leg $(leg.name) has unsupported lambda_scheduler=$(leg.lambda_scheduler). Supported values are :default, :namd, :quarters, and :ele_scaled."))
+    end
+    if !isnothing(leg.coulomb_softcore_model) && !(leg.coulomb_softcore_model in (:beutler, :gapsys, :beutler_rf, :gapsys_rf))
+        throw(ArgumentError("Leg $(leg.name) has unsupported coulomb_softcore_model=$(leg.coulomb_softcore_model). Supported values are :beutler, :gapsys, :beutler_rf, and :gapsys_rf."))
+    end
+    if !isnothing(leg.lj_softcore_model) && !(leg.lj_softcore_model in (:beutler, :gapsys))
+        throw(ArgumentError("Leg $(leg.name) has unsupported lj_softcore_model=$(leg.lj_softcore_model). Supported values are :beutler and :gapsys."))
+    end
+    return nothing
+end
+
 """
     resolve_leg_state_schedule(leg, default_lambda_schedule, FT=Float32)
 
@@ -203,6 +280,7 @@ function resolve_leg_state_schedule(
     ::Type{FT}=Float32,
 ) where {FT <: AbstractFloat}
     _validate_leg_ensemble(leg)
+    _validate_leg_alchemical_path(leg)
     schedule_source = isnothing(leg.lambda_schedule) ? default_lambda_schedule : leg.lambda_schedule
     validate_lambda_schedule(schedule_source)
     lambda_values = FT.(collect(schedule_source))

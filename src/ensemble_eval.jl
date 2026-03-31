@@ -41,10 +41,47 @@ Evaluate the stored production frames under every λ state for a candidate
 parameter vector. When `compute_gradients=true`, the result also includes a
 parameter-name keyed dictionary of frame-by-frame gradients.
 """
-function evaluate_ensemble(logger, neighbors, awh_sim_prod, sys_base, 
+function evaluate_ensemble(logger, neighbors, awh_sim_prod, sys_base,
                            params::Vector{FT}, param_names::Vector{String},
                            atom_idxs, pairwise_idxs, specific_idxs, general_idxs;
-                           compute_gradients::Bool=true)  
+                           compute_gradients::Bool=true)
+    if compute_gradients
+        return with_compiler_safe_logger() do
+            _evaluate_ensemble_impl(
+                logger,
+                neighbors,
+                awh_sim_prod,
+                sys_base,
+                params,
+                param_names,
+                atom_idxs,
+                pairwise_idxs,
+                specific_idxs,
+                general_idxs;
+                compute_gradients=compute_gradients,
+            )
+        end
+    end
+
+    return _evaluate_ensemble_impl(
+        logger,
+        neighbors,
+        awh_sim_prod,
+        sys_base,
+        params,
+        param_names,
+        atom_idxs,
+        pairwise_idxs,
+        specific_idxs,
+        general_idxs;
+        compute_gradients=compute_gradients,
+    )
+end
+
+function _evaluate_ensemble_impl(logger, neighbors, awh_sim_prod, sys_base,
+                                 params::Vector{FT}, param_names::Vector{String},
+                                 atom_idxs, pairwise_idxs, specific_idxs, general_idxs;
+                                 compute_gradients::Bool)
     num_frames = length(logger.active_idx_history)  
     num_lambda = length(awh_sim_prod.state.partition.λ_atoms)  
     num_params = length(params)  

@@ -59,6 +59,7 @@ export default_simulation_config
 export default_optimization_config
 export default_cycle_config
 export default_solvent_leg_lambda_schedule
+export dense_solvent_leg_lambda_schedule
 export resolved_cycle_config
 export validate_cycle_config
 export validate_lambda_schedule

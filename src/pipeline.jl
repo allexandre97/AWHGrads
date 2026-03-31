@@ -13,6 +13,61 @@ function sync_runtime_aliases!(runtime::RuntimeState)
     return runtime
 end
 
+"""
+    macro_epoch_awh_start_state(runtime, leg_name, macro_epoch)
+
+Resolve the carry-over AWH state for one leg at the start of a macro epoch.
+AWH bias is only reused when there is a matching restart snapshot; a cold start
+from the PDB always starts from a fresh AWH state.
+"""
+function macro_epoch_awh_start_state(runtime::RuntimeState, leg_name::Symbol, macro_epoch::Int)
+    if macro_epoch <= 1
+        return (warm_start=false, restart_state=nothing, injected_bias=nothing)
+    end
+
+    restart_state = get(runtime.restart_cache, leg_name, nothing)
+    warm_start = !isnothing(restart_state)
+    injected_bias = warm_start ? get(runtime.active_bias, leg_name, nothing) : nothing
+    return (warm_start=warm_start, restart_state=restart_state, injected_bias=injected_bias)
+end
+
+function stage_b_retry_controls(
+    base_stageA_stable_blocks::Int,
+    base_stageB_cooldown_blocks::Int,
+    failures::Int,
+    stageA_streak_growth_factor::FT,
+    stageB_cooldown_growth_factor::FT,
+    stageA_max_streak::Int,
+    stageB_max_cooldown::Int,
+) where {FT <: AbstractFloat}
+    failure_count = max(0, failures)
+    base_streak = max(1, base_stageA_stable_blocks)
+    base_cooldown = max(0, base_stageB_cooldown_blocks)
+    streak_scale = max(one(FT), stageA_streak_growth_factor) ^ failure_count
+    cooldown_scale = max(one(FT), stageB_cooldown_growth_factor) ^ failure_count
+    target_streak = clamp(
+        round(Int, base_streak * streak_scale),
+        base_streak,
+        max(base_streak, stageA_max_streak),
+    )
+    cooldown_blocks = clamp(
+        round(Int, base_cooldown * cooldown_scale),
+        base_cooldown,
+        max(base_cooldown, stageB_max_cooldown),
+    )
+    return (target_streak=target_streak, cooldown_blocks=cooldown_blocks)
+end
+
+function scaled_probe_frame_cap(base_max_frames::Int, base_probe_steps::Int, current_probe_steps::Int)
+    if base_max_frames <= 0
+        return 0
+    end
+    base_steps = max(1, base_probe_steps)
+    current_steps = max(1, current_probe_steps)
+    scale = current_steps / base_steps
+    return max(base_max_frames, Int(ceil(base_max_frames * scale)))
+end
+
 
 time_to_steps_floor(duration) = Int(floor(uconvert(unit(Δt), duration) / Δt))
 time_to_steps_round(duration) = max(1, Int(round(uconvert(unit(Δt), duration) / Δt)))
@@ -192,47 +247,70 @@ function setup_macro_legs(
     epsilon_seed = FT(bounds_cfg.epsilon_floor)u"kJ/mol"
 
     for leg in cycle_cfg.legs
-        warm_start = macro_epoch > 1 && haskey(runtime.restart_cache, leg.name) && !isnothing(runtime.restart_cache[leg.name])
-        restart_state = warm_start ? runtime.restart_cache[leg.name] : nothing
+        start_state = macro_epoch_awh_start_state(runtime, leg.name, macro_epoch)
+        warm_start = start_state.warm_start
+        restart_state = start_state.restart_state
+        injected_bias = start_state.injected_bias
         state_schedule = state_schedules_by_leg[leg.name]
+        leg_awh_control = resolve_leg_awh_control(sim_cfg.awh_control, leg)
 
         logger = AWHEnsembleLogger(T_coord, T_vol, T_en, sim_cfg.production_log_interval)
         awh_leg, sys_leg = setup_alchemical_awh(
             leg.pdb,
             sim_cfg.solute_idx;
             lambda_values=state_schedule.lambda,
-            awh_control=sim_cfg.awh_control,
+            awh_control=leg_awh_control,
             is_vacuum=leg.is_vacuum,
             ensemble=leg.ensemble,
             logger=logger,
-            injected_bias=get(runtime.active_bias, leg.name, nothing),
+            injected_bias=injected_bias,
             optimized_params=theta_active,
             param_idxs=idxs_by_leg[leg.name],
             restart_state=restart_state,
             restart_active_idx=warm_start ? restart_state.active_idx : 1,
             warm_start=warm_start,
+            lambda_scheduler=leg.lambda_scheduler,
+            coulomb_softcore_model=leg.coulomb_softcore_model,
+            lj_softcore_model=leg.lj_softcore_model,
             sigma_seed=sigma_seed,
             epsilon_seed=epsilon_seed,
         )
         awh_by_leg[leg.name] = awh_leg
         sys_by_leg[leg.name] = sys_leg
 
+        cadence = resolve_awh_iteration_cadence(leg_awh_control)
+        @info "AWH cadence ($(leg.name)): λ_sample_every=$(cadence.n_md_steps) md_steps | bias_update_every=$(cadence.update_freq) samples ($(cadence.effective_bias_update_md_steps) md_steps) | stats_log_every=$(cadence.stats_log_every_updates) updates | update_mode=$(cadence.auto_update_freq ? :auto : :override)"
+        if !leg.is_vacuum
+            scheduler_name = normalize_lambda_scheduler_name(leg.lambda_scheduler)
+            coulomb_model = normalize_softcore_model_name(leg.coulomb_softcore_model)
+            lj_model = normalize_softcore_model_name(leg.lj_softcore_model)
+            @info "AWH path ($(leg.name)): scheduler=$scheduler_name | coulomb_softcore=$coulomb_model | lj_softcore=$lj_model"
+            λ_diag = solvent_lambda_schedule_diagnostics(state_schedule.lambda, leg.lambda_scheduler, FT)
+            n_charge = count(entry -> entry.stage == :charge, λ_diag)
+            n_lj = length(λ_diag) - n_charge
+            @info "AWH λ schedule ($(leg.name)): n_states=$(length(λ_diag)) | charge_windows=$n_charge | lj_windows=$n_lj"
+            for entry in λ_diag
+                @info "  λ$(entry.idx): global=$(round(entry.global_lambda, digits=5)) | elec=$(round(entry.elec_lambda, digits=5)) | lj=$(round(entry.lj_lambda, digits=5)) | stage=$(entry.stage)"
+            end
+        end
+
         leg_label = uppercasefirst(String(leg.name))
+        bias_reused = !isnothing(injected_bias)
         if warm_start
             restart_rmsd = coords_rmsd_nm(restart_state.coords, awh_leg.state.active_sys.coords)
             idx_match = restart_state.active_idx == awh_leg.state.active_idx
             if leg.is_vacuum
-                @info "Macro Start ($leg_label): warm_start=true | λ_prev=$(restart_state.active_idx) | λ_new=$(awh_leg.state.active_idx) | idx_match=$idx_match | restart_rmsd_nm=$(round(restart_rmsd, digits=6))"
+                @info "Macro Start ($leg_label): warm_start=true | bias_reused=$bias_reused | λ_prev=$(restart_state.active_idx) | λ_new=$(awh_leg.state.active_idx) | idx_match=$idx_match | restart_rmsd_nm=$(round(restart_rmsd, digits=6))"
             else
                 prev_vol = FT(ustrip(volume(restart_state.boundary)))
                 new_vol = FT(ustrip(volume(awh_leg.state.active_sys.boundary)))
-                @info "Macro Start ($leg_label): warm_start=true | λ_prev=$(restart_state.active_idx) | λ_new=$(awh_leg.state.active_idx) | idx_match=$idx_match | restart_rmsd_nm=$(round(restart_rmsd, digits=6)) | volume_ratio=$(round(new_vol / prev_vol, digits=6))"
+                @info "Macro Start ($leg_label): warm_start=true | bias_reused=$bias_reused | λ_prev=$(restart_state.active_idx) | λ_new=$(awh_leg.state.active_idx) | idx_match=$idx_match | restart_rmsd_nm=$(round(restart_rmsd, digits=6)) | volume_ratio=$(round(new_vol / prev_vol, digits=6))"
             end
             if restart_rmsd > restart_rmsd_tol_nm
                 @info "  [!] $leg_label restart RMSD above tolerance ($(restart_rmsd_tol_nm) nm)."
             end
         else
-            @info "Macro Start ($leg_label): warm_start=false (cold-start from PDB)."
+            @info "Macro Start ($leg_label): warm_start=false | bias_reused=false | awh_state_reset=true (cold-start from PDB)."
         end
     end
 
@@ -269,11 +347,23 @@ function run_readiness_loop!(
     awh_min_lambda_ess::Int,
     awh_split_tol_kT::FT,
     awh_parity_tol_kT::FT,
+    awh_parity_gate_mode::Symbol,
+    awh_parity_support_threshold::FT,
+    awh_stageB_support_allow_missing::Int,
+    awh_parity_near_pass_factor::FT,
     awh_tail_lag::Int,
     awh_min_round_trips::Int,
     awh_endpoint_target_ratio::FT,
     awh_stageA_stable_blocks::Int,
     awh_stageB_cooldown_blocks::Int,
+    awh_stageB_near_pass_cooldown_blocks::Int,
+    awh_stageB_probe_growth_factor::FT,
+    awh_stageB_probe_near_pass_scale::FT,
+    awh_stageB_probe_max_factor::FT,
+    awh_stageA_streak_growth_factor::FT,
+    awh_stageB_cooldown_growth_factor::FT,
+    awh_stageA_max_streak::Int,
+    awh_stageB_max_cooldown::Int,
     awh_control::AWHControlConfig,
     awh_probe_discard_fraction::Float64,
     beta_val::FT,
@@ -286,11 +376,14 @@ function run_readiness_loop!(
     stageB_stats_by_leg = Dict{Symbol, StageBStats}(leg.name => stageB_default for leg in cycle_cfg.legs)
     stageA_streak = Dict{Symbol, Int}(leg.name => 0 for leg in cycle_cfg.legs)
     stageB_cooldown = Dict{Symbol, Int}(leg.name => 0 for leg in cycle_cfg.legs)
+    stageB_consecutive_failures = Dict{Symbol, Int}(leg.name => 0 for leg in cycle_cfg.legs)
     spent_steps = Dict{Symbol, Int}(leg.name => 0 for leg in cycle_cfg.legs)
     leg_status = Dict{Symbol, Symbol}(leg.name => :active for leg in cycle_cfg.legs)
     split_gap_by_leg = Dict{Symbol, FT}(leg.name => FT(Inf) for leg in cycle_cfg.legs)
     parity_gap_by_leg = Dict{Symbol, FT}(leg.name => FT(Inf) for leg in cycle_cfg.legs)
-    cooldown_blocks = max(0, awh_stageB_cooldown_blocks)
+    near_pass_cooldown_blocks = max(0, awh_stageB_near_pass_cooldown_blocks)
+    base_probe_steps_by_leg = copy(probe_steps_by_leg)
+    current_probe_steps_by_leg = copy(probe_steps_by_leg)
 
     for leg in cycle_cfg.legs
         runtime.active_bias[leg.name] = extract_awh_data(awh_by_leg[leg.name])
@@ -322,7 +415,7 @@ function run_readiness_loop!(
                 continue
             end
 
-            awh_leg = awh_by_leg[name]
+            awh_leg = awh_by_leg[name]::AWHSimulation
             state_schedule = state_schedules_by_leg[name]
             remaining_steps = md_steps_budget - spent_steps[name]
             if remaining_steps <= 0
@@ -359,14 +452,31 @@ function run_readiness_loop!(
                 stageA_streak[name] = 0
             end
 
-            if stageA_streak[name] >= awh_stageA_stable_blocks
+            failures = stageB_consecutive_failures[name]
+            retry_controls = stage_b_retry_controls(
+                awh_stageA_stable_blocks,
+                awh_stageB_cooldown_blocks,
+                failures,
+                awh_stageA_streak_growth_factor,
+                awh_stageB_cooldown_growth_factor,
+                awh_stageA_max_streak,
+                awh_stageB_max_cooldown,
+            )
+            current_target_streak = retry_controls.target_streak
+
+            if stageA_streak[name] >= current_target_streak
                 if stageB_cooldown[name] > 0
                     @info "Stage B ($(name)) cooldown active: remaining_checks=$(stageB_cooldown[name]); skipping probe this block."
                     stageB_cooldown[name] -= 1
                 else
-                    probe_steps = probe_steps_by_leg[name]
-                    @info "Stage A ($(name)) reached stable streak ($(stageA_streak[name])/$(awh_stageA_stable_blocks)); entering Stage B probe | probe_steps=$probe_steps | probe_ns=$(round(steps_to_ns(probe_steps), digits=4))"
-                    stageB_stats_by_leg[name] = StageBStats(run_stage_b_probe(
+                    probe_steps = current_probe_steps_by_leg[name]
+                    effective_probe_max_frames = scaled_probe_frame_cap(
+                        probe_max_frames_by_leg[name],
+                        base_probe_steps_by_leg[name],
+                        probe_steps,
+                    )
+                    @info "Stage A ($(name)) reached stable streak ($(stageA_streak[name])/$(current_target_streak)); entering Stage B probe | probe_steps=$probe_steps | probe_ns=$(round(steps_to_ns(probe_steps), digits=4))"
+                    probe_stats = run_stage_b_probe(
                         awh_leg,
                         sys_by_leg[name],
                         theta_active,
@@ -377,19 +487,37 @@ function run_readiness_loop!(
                         beta_val,
                         awh_split_tol_kT,
                         awh_parity_tol_kT;
-                        md_steps_probe=probe_steps_by_leg[name],
+                        md_steps_probe=probe_steps,
                         leg_name=String(name),
+                        probe_num_md_steps=leg.probe_awh_seed_num_md_steps,
                         include_pv=leg.include_pv,
                         P0_energy_per_vol=leg.include_pv ? p0_energy_per_vol : zero(FT),
                         probe_frame_stride=probe_stride_by_leg[name],
                         probe_min_frames=probe_min_frames_by_leg[name],
-                        probe_max_frames=probe_max_frames_by_leg[name],
+                        probe_max_frames=effective_probe_max_frames,
                         awh_probe_discard_fraction=awh_probe_discard_fraction,
+                        parity_gate_mode=awh_parity_gate_mode,
+                        parity_support_threshold=awh_parity_support_threshold,
+                        support_allow_missing=awh_stageB_support_allow_missing,
+                        parity_near_pass_factor=awh_parity_near_pass_factor,
+                    )
+                    stageB_stats_by_leg[name] = StageBStats(merge(
+                        probe_stats,
+                        (
+                            n_accumulated_frames=probe_stats.n_frames,
+                            n_probe_segments=probe_stats.n_frames > 0 ? 1 : 0,
+                            accumulation_mode=:single_probe,
+                            support_switch_ready=false,
+                            n_evicted_frames=0,
+                        ),
                     ))
 
                     split_gap_by_leg[name] = stageB_stats_by_leg[name].split_gap
                     parity_gap_by_leg[name] = stageB_stats_by_leg[name].parity_gap
                     if stageB_stats_by_leg[name].ready
+                        stageB_consecutive_failures[name] = 0
+                        current_probe_steps_by_leg[name] = base_probe_steps_by_leg[name]
+                        stageB_cooldown[name] = 0
                         # Once a leg passes Stage B it is frozen for the rest of
                         # the macro epoch; the bias and restart snapshot are kept
                         # for later production/resimulation.
@@ -397,9 +525,34 @@ function run_readiness_loop!(
                         @info "$(uppercasefirst(String(name))) leg frozen after passing Stage B (split_gap=$(round(split_gap_by_leg[name], digits=4)) kT, parity_gap=$(round(parity_gap_by_leg[name], digits=4)) kT)."
                     else
                         stageA_streak[name] = 0
-                        stageB_cooldown[name] = cooldown_blocks
-                        if cooldown_blocks > 0
-                            @info "Stage B ($(name)) failed; scheduling cooldown for $cooldown_blocks stable-check opportunities."
+                        stageB_consecutive_failures[name] += 1
+                        retry_controls = stage_b_retry_controls(
+                            awh_stageA_stable_blocks,
+                            awh_stageB_cooldown_blocks,
+                            stageB_consecutive_failures[name],
+                            awh_stageA_streak_growth_factor,
+                            awh_stageB_cooldown_growth_factor,
+                            awh_stageA_max_streak,
+                            awh_stageB_max_cooldown,
+                        )
+                        probe_policy = stage_b_next_probe_policy(
+                            current_probe_steps_by_leg[name],
+                            base_probe_steps_by_leg[name],
+                            stageB_stats_by_leg[name],
+                            retry_controls.cooldown_blocks,
+                            near_pass_cooldown_blocks,
+                            awh_stageB_probe_growth_factor,
+                            awh_stageB_probe_near_pass_scale,
+                            awh_stageB_probe_max_factor,
+                        )
+                        current_probe_steps_by_leg[name] = probe_policy.next_probe_steps
+                        stageB_cooldown[name] = probe_policy.cooldown_blocks
+                        if probe_policy.policy == :grow
+                            @info "Stage B ($(name)) failed ($(stageB_stats_by_leg[name].failure_mode)); increasing next probe to $(probe_policy.next_probe_steps) steps ($(round(steps_to_ns(probe_policy.next_probe_steps), digits=4)) ns) and scheduling cooldown=$(probe_policy.cooldown_blocks)."
+                        elseif probe_policy.policy == :near_pass
+                            @info "Stage B ($(name)) near pass; retrying with probe=$(probe_policy.next_probe_steps) steps ($(round(steps_to_ns(probe_policy.next_probe_steps), digits=4)) ns) after cooldown=$(probe_policy.cooldown_blocks)."
+                        elseif stageB_cooldown[name] > 0
+                            @info "Stage B ($(name)) failed; scheduling cooldown for $(stageB_cooldown[name]) stable-check opportunities."
                         end
                     end
                 end
@@ -425,11 +578,16 @@ function run_readiness_loop!(
         for leg in cycle_cfg.legs
             name = leg.name
             statsA = stageA_stats_by_leg[name]
-            @info "  Stage A ($(name)): df=$(round(statsA.df_mean, digits=6)) (ok=$(statsA.df_ready)) | ess=$(round(statsA.lambda_ess, digits=1)) (ok=$(statsA.lambda_ess_ready)) | lin_neff=$(round(statsA.linear_neff, digits=1)) (ok=$(statsA.neff_ready)) | tau_int_est=$(round(statsA.tau_int_est, digits=2)) | rt=$(statsA.round_trips) (ok=$(statsA.round_trip_ready)) | endpt=($(round(statsA.endpoint_low, digits=3)), $(round(statsA.endpoint_high, digits=3))) (ok=$(statsA.endpoint_ready)) | n_hist=$(statsA.n_hist) | streak=$(stageA_streak[name]) | cooldown=$(stageB_cooldown[name])"
+            low_occ_msg = isempty(statsA.low_occupancy_states) ? "-" : join(statsA.low_occupancy_states, ",")
+            @info "  Stage A ($(name)): df=$(round(statsA.df_mean, digits=6)) (ok=$(statsA.df_ready)) | ess=$(round(statsA.lambda_ess, digits=1)) (ok=$(statsA.lambda_ess_ready)) | lin_neff=$(round(statsA.linear_neff, digits=1)) (ok=$(statsA.neff_ready)) | tau_int_est=$(round(statsA.tau_int_est, digits=2)) | switches=$(statsA.switch_count) | dwell_samples=(mean=$(round(statsA.mean_residence, digits=2)), med=$(round(statsA.median_residence, digits=2))) | rt=$(statsA.round_trips) (ok=$(statsA.round_trip_ready)) | endpt=($(round(statsA.endpoint_low, digits=3)), $(round(statsA.endpoint_high, digits=3))) (ok=$(statsA.endpoint_ready)) | occ_min=$(round(statsA.min_state_occupancy, digits=4)) | low_occ=$low_occ_msg | n_hist=$(statsA.n_hist) | streak=$(stageA_streak[name]) | cooldown=$(stageB_cooldown[name]) | failures=$(stageB_consecutive_failures[name])"
 
             statsB = stageB_stats_by_leg[name]
             if statsB.n_frames > 0
-                @info "  Stage B ($(name)): split_gap=$(round(statsB.split_gap, digits=4)) kT (ok=$(statsB.split_ready)) | parity_gap=$(round(statsB.parity_gap, digits=4)) kT (ok=$(statsB.parity_ready)) | frames=$(statsB.n_frames)"
+                n_states = length(state_schedules_by_leg[name].lambda)
+                @info "  Stage B ($(name)): split_gap=$(round(statsB.split_gap, digits=4)) kT (ok=$(statsB.split_ready)) | parity_gap=$(round(statsB.parity_gap, digits=4)) kT (ok=$(statsB.parity_ready)) | raw_parity=$(round(statsB.raw_parity_gap, digits=4)) | supported_parity=$(round(statsB.supported_parity_gap, digits=4)) | endpoint_parity=$(round(statsB.endpoint_parity_gap, digits=4)) (ok=$(statsB.endpoint_parity_ready)) | support_coverage=$(statsB.n_supported_states)/$(n_states) (required>=$(statsB.required_supported_states), ok=$(statsB.support_coverage_ready)) @ ess>=$(round(statsB.support_threshold, digits=1)) | failure=$(statsB.failure_mode) | near_pass=$(statsB.near_pass) | mode=$(statsB.accumulation_mode) | frames=$(statsB.n_frames) | accumulated_frames=$(statsB.n_accumulated_frames) | probe_segments=$(statsB.n_probe_segments)"
+                if !isempty(statsB.diagnostics)
+                    @info "    Stage B Diagnostics ($(name)): $(statsB.diagnostics)"
+                end
             end
         end
 
@@ -658,11 +816,23 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             opt_cfg.awh_min_lambda_ess,
             FT(opt_cfg.awh_split_tol_kT),
             FT(opt_cfg.awh_parity_tol_kT),
+            opt_cfg.awh_parity_gate_mode,
+            FT(opt_cfg.awh_parity_support_threshold),
+            opt_cfg.awh_stageB_support_allow_missing,
+            FT(opt_cfg.awh_parity_near_pass_factor),
             opt_cfg.awh_tail_lag,
             opt_cfg.awh_min_round_trips,
             FT(opt_cfg.awh_endpoint_target_ratio),
             opt_cfg.awh_stageA_stable_blocks,
             opt_cfg.awh_stageB_cooldown_blocks,
+            opt_cfg.awh_stageB_near_pass_cooldown_blocks,
+            FT(opt_cfg.awh_stageB_probe_growth_factor),
+            FT(opt_cfg.awh_stageB_probe_near_pass_scale),
+            FT(opt_cfg.awh_stageB_probe_max_factor),
+            FT(opt_cfg.awh_stageA_streak_growth_factor),
+            FT(opt_cfg.awh_stageB_cooldown_growth_factor),
+            opt_cfg.awh_stageA_max_streak,
+            opt_cfg.awh_stageB_max_cooldown,
             sim_cfg.awh_control,
             Float64(sim_cfg.awh_probe_discard_fraction),
             beta_val,

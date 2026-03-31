@@ -1,5 +1,8 @@
 using Logging
 
+const COMPILER_SAFE_LOGGER = NullLogger()
+const COMPILER_SAFE_LOGGER_LOCK = ReentrantLock()
+
 """
     TeeLogger(loggers::Vector{AbstractLogger})
 
@@ -9,25 +12,68 @@ struct TeeLogger <: AbstractLogger
     loggers::Vector{AbstractLogger}
 end
 
+_flush_logger_stream(::AbstractLogger) = nothing
+
+function _flush_logger_stream(logger::SimpleLogger)
+    isopen(logger.stream) && flush(logger.stream)
+    return nothing
+end
+
+function _flush_logger_stream(logger::ConsoleLogger)
+    isopen(logger.stream) && flush(logger.stream)
+    return nothing
+end
+
 Logging.shouldlog(l::TeeLogger, args...) = any(lg -> Logging.shouldlog(lg, args...), l.loggers)
 Logging.min_enabled_level(l::TeeLogger) = minimum(Logging.min_enabled_level, l.loggers)
-Logging.handle_message(l::TeeLogger, args...; kwargs...) = 
-    for lg in l.loggers; Logging.handle_message(lg, args...; kwargs...); end
+function Logging.handle_message(l::TeeLogger, args...; kwargs...)
+    for lg in l.loggers
+        Logging.handle_message(lg, args...; kwargs...)
+        _flush_logger_stream(lg)
+    end
+    flush(stdout)
+    flush(stderr)
+    return nothing
+end
 
 """
-    setup_logging(log_file::String="logs.log")
+    with_compiler_safe_logger(f; logger=NullLogger())
+
+Run `f()` with both the task-local logger and the global logger forced to
+`NullLogger()`. This prevents Enzyme/GPUCompiler and any worker tasks spawned
+inside `f()` from ever observing the repository's custom `TeeLogger`.
+"""
+function with_compiler_safe_logger(f::Function; logger::AbstractLogger=NullLogger())
+    lock(COMPILER_SAFE_LOGGER_LOCK)
+    previous_global_logger = global_logger()
+
+    try
+        global_logger(COMPILER_SAFE_LOGGER)
+        return with_logger(COMPILER_SAFE_LOGGER) do
+            f()
+        end
+    finally
+        global_logger(previous_global_logger)
+        unlock(COMPILER_SAFE_LOGGER_LOCK)
+    end
+end
+
+"""
+    setup_logging(log_file::String="logs.log"; append=false)
 
 Configure the global logger to write to both stdout and the specified file.
+By default the file is truncated so each run gets a clean log.
 """
-function setup_logging(log_file::String="logs.log")
-    file_io = open(log_file, "a")
+function setup_logging(log_file::String="logs.log"; append::Bool=false)
+    file_io = open(log_file, append ? "a" : "w")
     # SimpleLogger for the file, ConsoleLogger for stdout
     loggers = [
         ConsoleLogger(stdout, Logging.Info),
         SimpleLogger(file_io, Logging.Info)
     ]
     global_logger(TeeLogger(loggers))
-    @info "Logging initialized. Writing to $log_file and stdout."
+    mode = append ? :append : :truncate
+    @info "Logging initialized. Writing to $log_file and stdout. mode=$mode"
     return file_io
 end
 

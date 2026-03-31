@@ -23,9 +23,13 @@ Base.@kwdef struct AWHControlConfig
     reuse_neighbors::Bool = true
     # Lambda-sampling interval in MD steps.
     seed_num_md_steps::Int = 10
-    seed_log_freq::Int = 100
-    update_freq::Int = 100
-    coverage_threshold::Float64 = 0.8
+    # Target MD-step cadence for AWH bias updates when `update_freq` is left automatic.
+    bias_update_interval_md_steps::Int = 1000
+    # Log Molly's internal AWH stats every N bias updates.
+    stats_log_every_updates::Int = 1
+    # Optional low-level Molly override measured in lambda samples per bias update.
+    update_freq::Union{Nothing, Int} = nothing
+    coverage_threshold::Float64 = 1.0
     significant_weight::Float64 = 0.1
     initial_n_bias::Int = 100
     well_tempered_factor::Float64 = Inf
@@ -48,6 +52,12 @@ Base.@kwdef struct ThermodynamicLegConfig
     probe_time = Float32(0.5)u"ns"
     lambda_schedule::Union{Nothing, Vector{<:Real}} = nothing
     ensemble::Symbol = :npt
+    awh_seed_num_md_steps::Union{Nothing, Int} = nothing
+    awh_bias_update_interval_md_steps::Union{Nothing, Int} = nothing
+    probe_awh_seed_num_md_steps::Union{Nothing, Int} = nothing
+    lambda_scheduler::Union{Nothing, Symbol} = nothing
+    coulomb_softcore_model::Union{Nothing, Symbol} = nothing
+    lj_softcore_model::Union{Nothing, Symbol} = nothing
 end
 
 """
@@ -176,11 +186,24 @@ Base.@kwdef struct OptimizationConfig
     awh_min_lambda_ess::Int = 300
     awh_split_tol_kT = Float32(0.5)
     awh_parity_tol_kT = Float32(0.25)
+    awh_parity_gate_mode::Symbol = :support_aware_max
+    awh_parity_support_threshold = Float32(300)
+    awh_stageB_support_allow_missing::Int = 3
+    awh_parity_near_pass_factor = Float32(2.0)
     awh_tail_lag::Int = 10
     awh_min_round_trips::Int = 3
     awh_endpoint_target_ratio = Float32(0.3)
     awh_stageA_stable_blocks::Int = 2
     awh_stageB_cooldown_blocks::Int = 2
+    awh_stageB_near_pass_cooldown_blocks::Int = 0
+    awh_stageB_probe_growth_factor = Float32(1.5)
+    awh_stageB_probe_near_pass_scale = Float32(0.5)
+    awh_stageB_probe_max_factor = Float32(4.0)
+
+    awh_stageA_streak_growth_factor = Float32(1.5)
+    awh_stageB_cooldown_growth_factor = Float32(1.5)
+    awh_stageA_max_streak::Int = 10
+    awh_stageB_max_cooldown::Int = 10
 
     k_sigmoid = Float32(1.0)
 end
@@ -244,11 +267,16 @@ Base.@kwdef struct StageAStats
     lambda_ess_ready::Bool = false
     linear_neff::Any = 0.0
     neff_ready::Bool = false
+    switch_count::Int = 0
+    mean_residence::Any = 0.0
+    median_residence::Any = 0.0
     round_trips::Int = 0
     round_trip_ready::Bool = false
     endpoint_low::Any = 0.0
     endpoint_high::Any = 0.0
     endpoint_ready::Bool = false
+    min_state_occupancy::Any = 0.0
+    low_occupancy_states::Vector{Int} = Int[]
     n_hist::Int = 0
 end
 
@@ -261,11 +289,16 @@ StageAStats(nt::NamedTuple) = StageAStats(
     lambda_ess_ready = nt.lambda_ess_ready,
     linear_neff = nt.linear_neff,
     neff_ready = nt.neff_ready,
+    switch_count = hasproperty(nt, :switch_count) ? nt.switch_count : 0,
+    mean_residence = hasproperty(nt, :mean_residence) ? nt.mean_residence : 0.0,
+    median_residence = hasproperty(nt, :median_residence) ? nt.median_residence : 0.0,
     round_trips = nt.round_trips,
     round_trip_ready = nt.round_trip_ready,
     endpoint_low = nt.endpoint_low,
     endpoint_high = nt.endpoint_high,
     endpoint_ready = nt.endpoint_ready,
+    min_state_occupancy = hasproperty(nt, :min_state_occupancy) ? nt.min_state_occupancy : 0.0,
+    low_occupancy_states = hasproperty(nt, :low_occupancy_states) ? nt.low_occupancy_states : Int[],
     n_hist = nt.n_hist,
 )
 
@@ -281,9 +314,27 @@ Base.@kwdef struct StageBStats
     split_gap::Any = Inf
     parity_ready::Bool = false
     parity_gap::Any = Inf
+    raw_parity_gap::Any = Inf
+    supported_parity_gap::Any = Inf
+    endpoint_parity_gap::Any = Inf
+    endpoint_parity_ready::Bool = false
+    support_coverage_ready::Bool = false
     n_frames::Int = 0
     dG_half_1::Any = NaN
     dG_half_2::Any = NaN
+    n_accumulated_frames::Int = 0
+    n_probe_segments::Int = 0
+    diagnostics::String = ""
+    parity_worst_state_idx::Int = 0
+    parity_worst_state_residual::Any = NaN
+    n_supported_states::Int = 0
+    required_supported_states::Int = 0
+    support_threshold::Any = 0.0
+    failure_mode::Symbol = :not_checked
+    near_pass::Bool = false
+    accumulation_mode::Symbol = :single_probe
+    support_switch_ready::Bool = false
+    n_evicted_frames::Int = 0
 end
 
 StageBStats(nt::NamedTuple) = StageBStats(
@@ -292,7 +343,25 @@ StageBStats(nt::NamedTuple) = StageBStats(
     split_gap = nt.split_gap,
     parity_ready = nt.parity_ready,
     parity_gap = nt.parity_gap,
+    raw_parity_gap = hasproperty(nt, :raw_parity_gap) ? nt.raw_parity_gap : nt.parity_gap,
+    supported_parity_gap = hasproperty(nt, :supported_parity_gap) ? nt.supported_parity_gap : nt.parity_gap,
+    endpoint_parity_gap = hasproperty(nt, :endpoint_parity_gap) ? nt.endpoint_parity_gap : nt.parity_gap,
+    endpoint_parity_ready = hasproperty(nt, :endpoint_parity_ready) ? nt.endpoint_parity_ready : nt.parity_ready,
+    support_coverage_ready = hasproperty(nt, :support_coverage_ready) ? nt.support_coverage_ready : false,
     n_frames = nt.n_frames,
     dG_half_1 = nt.dG_half_1,
     dG_half_2 = nt.dG_half_2,
+    n_accumulated_frames = hasproperty(nt, :n_accumulated_frames) ? nt.n_accumulated_frames : nt.n_frames,
+    n_probe_segments = hasproperty(nt, :n_probe_segments) ? nt.n_probe_segments : (nt.n_frames > 0 ? 1 : 0),
+    diagnostics = hasproperty(nt, :diagnostics) ? nt.diagnostics : "",
+    parity_worst_state_idx = hasproperty(nt, :parity_worst_state_idx) ? nt.parity_worst_state_idx : 0,
+    parity_worst_state_residual = hasproperty(nt, :parity_worst_state_residual) ? nt.parity_worst_state_residual : NaN,
+    n_supported_states = hasproperty(nt, :n_supported_states) ? nt.n_supported_states : 0,
+    required_supported_states = hasproperty(nt, :required_supported_states) ? nt.required_supported_states : 0,
+    support_threshold = hasproperty(nt, :support_threshold) ? nt.support_threshold : 0.0,
+    failure_mode = hasproperty(nt, :failure_mode) ? nt.failure_mode : :not_checked,
+    near_pass = hasproperty(nt, :near_pass) ? nt.near_pass : false,
+    accumulation_mode = hasproperty(nt, :accumulation_mode) ? nt.accumulation_mode : :single_probe,
+    support_switch_ready = hasproperty(nt, :support_switch_ready) ? nt.support_switch_ready : false,
+    n_evicted_frames = hasproperty(nt, :n_evicted_frames) ? nt.n_evicted_frames : 0,
 )
