@@ -49,6 +49,26 @@ _reconstruct_list(l::InteractionList2Atoms, i) = InteractionList2Atoms(l.is, l.j
 _reconstruct_list(l::InteractionList3Atoms, i) = InteractionList3Atoms(l.is, l.js, l.ks, i, l.types)
 _reconstruct_list(l::InteractionList4Atoms, i) = InteractionList4Atoms(l.is, l.js, l.ks, l.ls, i, l.types)
 
+@inline function _rebuild_system_like(
+    sys_ref::System{D, AT, FT},
+    new_atoms,
+    coords_nounits,
+    box_nounits,
+    new_pairwise,
+    new_specific,
+    new_general,
+) where {D, AT, FT}
+    return System(
+        sys_ref;
+        atoms=new_atoms,
+        coords=coords_nounits,
+        boundary=box_nounits,
+        pairwise_inters=new_pairwise,
+        specific_inter_lists=new_specific,
+        general_inters=new_general,
+    )
+end
+
 # ==============================================================================
 # 2. CORE EVALUATION FUNCTIONS
 # ==============================================================================
@@ -74,32 +94,18 @@ function evaluate_frame_energy(params::Vector{FT}, sys_ref::System{D, AT, FT},
     new_specific = _update_specific(sys_ref.specific_inter_lists, params, specific_idxs)
     new_general  = _update_general(sys_ref.general_inters, params, general_idxs)
     
-    # 3. Build Final System (Stack-allocated, 0 primary heap allocations inside System)
-    sys_final = typeof(sys_ref)(
-        new_atoms,             
-        coords_nounits, 
+    # 3. Build Final System while mirroring Molly's stored field layout in one place.
+    sys_final = _rebuild_system_like(
+        sys_ref,
+        new_atoms,
+        coords_nounits,
         box_nounits,
-        sys_ref.velocities,
-        sys_ref.atoms_data,
-        sys_ref.topology,
-        new_pairwise,                 
-        new_specific, 
-        new_general,                  
-        sys_ref.constraints,
-        sys_ref.virtual_sites,
-        sys_ref.virtual_site_flags,
-        sys_ref.neighbor_finder,
-        sys_ref.loggers,
-        sys_ref.df,
-        sys_ref.force_units,
-        sys_ref.energy_units,
-        sys_ref.k,
-        sys_ref.masses,
-        sys_ref.total_mass,
-        sys_ref.data
+        new_pairwise,
+        new_specific,
+        new_general,
     )
 
-    return FT(potential_energy(sys_final, neighbors; n_threads=1))
+    return potential_energy(sys_final, neighbors; n_threads=1)
 end
 
 """
@@ -154,6 +160,19 @@ function awh_log_gibbs_weights(bias_data)
     return bias_data.f .+ bias_data.log_rho
 end
 
+function awh_log_gibbs_weights(bias_data, ::Type{FT}) where {FT <: AbstractFloat}
+    return FT.(awh_log_gibbs_weights(bias_data))
+end
+
+@inline _analysis_float_type(x::AbstractArray{T}) where {T <: AbstractFloat} = T
+@inline _analysis_float_type(::Type{T}) where {T <: AbstractFloat} = T
+@inline _analysis_float_type(x::T) where {T <: AbstractFloat} = T
+
+function promote_energy_analysis_type(args...)
+    Ts = map(_analysis_float_type, args)
+    return foldl(promote_type, Ts)
+end
+
 """
     reference_log_mixture_denominator(energies_ref, log_gibbs_weights, beta;
                                       volumes=FT[], P0_energy_per_vol=zero(FT))
@@ -167,12 +186,12 @@ where `g_ref = f_ref + logρ_ref` are the fixed AWH Gibbs log-weights and
 the trajectory.
 """
 function reference_log_mixture_denominator(
-    energies_ref::Matrix{FT},
-    log_gibbs_weights::Vector{FT},
-    beta::FT;
-    volumes::Vector{FT}=FT[],
-    P0_energy_per_vol::FT=zero(FT),
-) where {FT <: AbstractFloat}
+    energies_ref::AbstractMatrix{ET},
+    log_gibbs_weights::AbstractVector{GT},
+    beta::BT;
+    volumes::AbstractVector{VT}=BT[],
+    P0_energy_per_vol::PT=zero(BT),
+) where {ET <: AbstractFloat, GT <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat, PT <: AbstractFloat}
     M, num_lambda = size(energies_ref)
     if length(log_gibbs_weights) != num_lambda
         throw(ArgumentError("reference_log_mixture_denominator expected log_gibbs_weights length $num_lambda, got $(length(log_gibbs_weights))."))
@@ -184,19 +203,23 @@ function reference_log_mixture_denominator(
         throw(ArgumentError("reference_log_mixture_denominator received empty energies matrix."))
     end
 
-    pv_terms = zeros(FT, M)
+    AT = promote_energy_analysis_type(energies_ref, log_gibbs_weights, beta, volumes, P0_energy_per_vol)
+    beta_AT = AT(beta)
+    P0_AT = AT(P0_energy_per_vol)
+
+    pv_terms = zeros(AT, M)
     if !isempty(volumes)
         @inbounds for k in 1:M
-            pv_terms[k] = beta * P0_energy_per_vol * volumes[k]
+            pv_terms[k] = beta_AT * P0_AT * AT(volumes[k])
         end
     end
 
-    log_mixture_denom = zeros(FT, M)
-    scratch = zeros(FT, num_lambda)
+    log_mixture_denom = zeros(AT, M)
+    scratch = zeros(AT, num_lambda)
     @inbounds for k in 1:M
         pv_k = pv_terms[k]
         for j in 1:num_lambda
-            scratch[j] = log_gibbs_weights[j] - (beta * energies_ref[k, j] + pv_k)
+            scratch[j] = AT(log_gibbs_weights[j]) - (beta_AT * AT(energies_ref[k, j]) + pv_k)
         end
         max_log = maximum(scratch)
         log_mixture_denom[k] = max_log + log(sum(exp.(scratch .- max_log)))
@@ -217,13 +240,13 @@ and denominator, it cancels exactly; only the reduced-potential change at the
 physically sampled `λ_k` remains.
 """
 function compute_weights_and_ess(
-    energies_current::Matrix{FT}, 
-    energies_ref::Matrix{FT}, 
+    energies_current::AbstractMatrix{ETC}, 
+    energies_ref::AbstractMatrix{ETR}, 
     active_lambda_idx::Vector{Int}, 
-    beta::FT,
-    volumes::Vector{FT} = Float32[],
-    P0::FT = zero(FT)
-) where {FT <: AbstractFloat}
+    beta::BT,
+    volumes::AbstractVector{VT} = BT[],
+    P0::PT = zero(BT)
+) where {ETC <: AbstractFloat, ETR <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat, PT <: AbstractFloat}
     
     M = length(active_lambda_idx)
     if size(energies_current, 1) != M
@@ -242,16 +265,19 @@ function compute_weights_and_ess(
     if any(idx -> idx < 1 || idx > num_lambda, active_lambda_idx)
         throw(ArgumentError("compute_weights_and_ess got active λ indices outside valid range 1:$num_lambda."))
     end
-    log_W = zeros(FT, M)
+    AT = promote_energy_analysis_type(energies_current, energies_ref, beta, volumes, P0)
+    beta_AT = AT(beta)
+    P0_AT = AT(P0)
+    log_W = zeros(AT, M)
     
     for k in 1:M
         l_k = active_lambda_idx[k]
         
         # Include PV term if volumes and pressure are provided
-        pv_term = isempty(volumes) ? zero(FT) : beta * P0 * volumes[k]
+        pv_term = isempty(volumes) ? zero(AT) : beta_AT * P0_AT * AT(volumes[k])
         
-        u_k_n = beta * energies_current[k, l_k] + pv_term
-        u_k_0 = beta * energies_ref[k, l_k] + pv_term
+        u_k_n = beta_AT * AT(energies_current[k, l_k]) + pv_term
+        u_k_0 = beta_AT * AT(energies_ref[k, l_k]) + pv_term
         
         log_W[k] = -(u_k_n - u_k_0)
     end
@@ -262,7 +288,7 @@ function compute_weights_and_ess(
     Z_W = sum(W_unnorm)
     w_norm = W_unnorm ./ Z_W
     
-    ess = FT(1.0) / sum(w_norm .^ 2)
+    ess = one(AT) / sum(w_norm .^ 2)
     return w_norm, ess
 end
 
@@ -275,19 +301,21 @@ frame-by-frame energy gradients.
 """
 function compute_empirical_gradients_and_fim(
     param_names::Vector{String},
-    gradients_dict::Dict{String, Matrix{FT}}, 
-    w_norm::Vector{FT}, 
+    gradients_dict,
+    w_norm::AbstractVector{WT}, 
     active_lambda_idx::Vector{Int}, 
-    beta::FT
-) where {FT <: AbstractFloat}
+    beta::BT
+) where {WT <: AbstractFloat, BT <: AbstractFloat}
 
     P = length(param_names)
     M = length(w_norm)
     if length(active_lambda_idx) != M
         throw(ArgumentError("compute_empirical_gradients_and_fim expected active_lambda_idx length $M, got $(length(active_lambda_idx))."))
     end
+    AT = promote_energy_analysis_type(w_norm, beta)
+    beta_AT = AT(beta)
     
-    S = zeros(FT, P, M)
+    S = zeros(AT, P, M)
     for (i, p_key) in enumerate(param_names)
         grad_matrix = gradients_dict[p_key]
         if size(grad_matrix, 1) != M
@@ -299,21 +327,21 @@ function compute_empirical_gradients_and_fim(
         end
         for k in 1:M
             l_k = active_lambda_idx[k]
-            S[i, k] = beta * grad_matrix[k, l_k]
+            S[i, k] = beta_AT * AT(grad_matrix[k, l_k])
         end
     end
     
-    s_mean = zeros(FT, P)
+    s_mean = zeros(AT, P)
     for i in 1:P
         for k in 1:M
             s_mean[i] += w_norm[k] * S[i, k]
         end
     end
     
-    fim = zeros(FT, P, P)
+    fim = zeros(AT, P, P)
     for i in 1:P
         for j in 1:P
-            cov_ij = zero(FT)
+            cov_ij = zero(AT)
             for k in 1:M
                 cov_ij += w_norm[k] * S[i, k] * S[j, k]
             end
@@ -338,17 +366,17 @@ force-derived potential.
 """
 function compute_global_endpoint_gradients(
     param_names::Vector{String},
-    gradients_dict::Dict{String, Matrix{FT}},
-    energies_current::Matrix{FT},
-    energies_ref::Matrix{FT},
+    gradients_dict,
+    energies_current::AbstractMatrix{ETC},
+    energies_ref::AbstractMatrix{ETR},
     active_lambda_idx::Vector{Int},
     lambda_target_idx::Int,
-    beta::FT,
-    log_gibbs_weights::Vector{FT},
-    volumes::Vector{FT} = FT[],
-    P0_energy_per_vol::FT = zero(FT);
+    beta::BT,
+    log_gibbs_weights::AbstractVector{GT},
+    volumes::AbstractVector{VT} = BT[],
+    P0_energy_per_vol::PT = zero(BT);
     compute_gradients::Bool=true
-) where {FT <: AbstractFloat}
+) where {ETC <: AbstractFloat, ETR <: AbstractFloat, BT <: AbstractFloat, GT <: AbstractFloat, VT <: AbstractFloat, PT <: AbstractFloat}
 
 
     P = length(param_names)
@@ -366,7 +394,17 @@ function compute_global_endpoint_gradients(
     if any(idx -> idx < 1 || idx > num_lambda, active_lambda_idx)
         throw(ArgumentError("compute_global_endpoint_gradients got active λ indices outside valid range 1:$num_lambda."))
     end
-    log_W_target = zeros(FT, M)
+    AT = promote_energy_analysis_type(
+        energies_current,
+        energies_ref,
+        log_gibbs_weights,
+        beta,
+        volumes,
+        P0_energy_per_vol,
+    )
+    beta_AT = AT(beta)
+    P0_AT = AT(P0_energy_per_vol)
+    log_W_target = zeros(AT, M)
     log_mixture_denom = reference_log_mixture_denominator(
         energies_ref,
         log_gibbs_weights,
@@ -378,8 +416,8 @@ function compute_global_endpoint_gradients(
     # 1. Global MBAR weights to the requested target λ. The denominator uses
     # Molly's fixed AWH Gibbs log-weights g_ref = f_ref + logρ_ref.
     for k in 1:M
-        pv_term = isempty(volumes) ? zero(FT) : beta * P0_energy_per_vol * volumes[k]
-        u_k_target = beta * energies_current[k, lambda_target_idx] + pv_term
+        pv_term = isempty(volumes) ? zero(AT) : beta_AT * P0_AT * AT(volumes[k])
+        u_k_target = beta_AT * AT(energies_current[k, lambda_target_idx]) + pv_term
         log_W_target[k] = -u_k_target - log_mixture_denom[k]
     end
 
@@ -388,12 +426,12 @@ function compute_global_endpoint_gradients(
     w_lambda_global = W_unnorm ./ sum(W_unnorm)
 
     # 2. Globally weighted gradient expectation (thermodynamic gradient).
-    grad_F_lambda = zeros(FT, length(param_names))
+    grad_F_lambda = zeros(AT, length(param_names))
     if compute_gradients
         for (i, p_key) in enumerate(param_names)
             grad_matrix = gradients_dict[p_key]
             for k in 1:M
-                grad_F_lambda[i] += w_lambda_global[k] * (beta * grad_matrix[k, lambda_target_idx])
+                grad_F_lambda[i] += w_lambda_global[k] * (beta_AT * AT(grad_matrix[k, lambda_target_idx]))
             end
         end
     end
@@ -413,13 +451,13 @@ under a candidate parameter vector. `log_gibbs_weights` must be the fixed AWH
 Gibbs log-weights `f_ref + logρ_ref` used to sample λ.
 """
 function compute_full_mbar_profile(
-    energies_current::Matrix{FT},
-    energies_ref::Matrix{FT},
-    log_gibbs_weights::Vector{FT},
-    beta::FT;
-    volumes::Vector{FT}=FT[],
-    P0_energy_per_vol::FT=zero(FT)
-) where {FT <: AbstractFloat}
+    energies_current::AbstractMatrix{ETC},
+    energies_ref::AbstractMatrix{ETR},
+    log_gibbs_weights::AbstractVector{GT},
+    beta::BT;
+    volumes::AbstractVector{VT}=BT[],
+    P0_energy_per_vol::PT=zero(BT)
+) where {ETC <: AbstractFloat, ETR <: AbstractFloat, GT <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat, PT <: AbstractFloat}
     M, num_lambda = size(energies_current)
     if size(energies_ref) != (M, num_lambda)
         throw(ArgumentError("compute_full_mbar_profile expected energies_ref size $(M), $(num_lambda), got $(size(energies_ref))."))
@@ -434,10 +472,21 @@ function compute_full_mbar_profile(
         throw(ArgumentError("compute_full_mbar_profile received empty energies matrix."))
     end
 
-    pv_terms = zeros(FT, M)
+    AT = promote_energy_analysis_type(
+        energies_current,
+        energies_ref,
+        log_gibbs_weights,
+        beta,
+        volumes,
+        P0_energy_per_vol,
+    )
+    beta_AT = AT(beta)
+    P0_AT = AT(P0_energy_per_vol)
+
+    pv_terms = zeros(AT, M)
     if !isempty(volumes)
         @inbounds for k in 1:M
-            pv_terms[k] = beta * P0_energy_per_vol * volumes[k]
+            pv_terms[k] = beta_AT * P0_AT * AT(volumes[k])
         end
     end
     log_mixture_denom = reference_log_mixture_denominator(
@@ -448,12 +497,12 @@ function compute_full_mbar_profile(
         P0_energy_per_vol=P0_energy_per_vol,
     )
 
-    F_profile = zeros(FT, num_lambda)
-    log_W_target = zeros(FT, M)
+    F_profile = zeros(AT, num_lambda)
+    log_W_target = zeros(AT, M)
     @inbounds for λ in 1:num_lambda
         for k in 1:M
             pv_k = pv_terms[k]
-            log_W_target[k] = -(beta * energies_current[k, λ] + pv_k) - log_mixture_denom[k]
+            log_W_target[k] = -(beta_AT * AT(energies_current[k, λ]) + pv_k) - log_mixture_denom[k]
         end
         max_log_W = maximum(log_W_target)
         F_profile[λ] = -(max_log_W + log(sum(exp.(log_W_target .- max_log_W))))
@@ -472,12 +521,12 @@ used by Stage B accumulation where each probe segment can have a different
 frozen AWH reference bias.
 """
 function compute_full_mbar_profile_from_log_mixture_denom(
-    energies_current::Matrix{FT},
-    log_mixture_denom::Vector{FT},
-    beta::FT;
-    volumes::Vector{FT}=FT[],
-    P0_energy_per_vol::FT=zero(FT)
-) where {FT <: AbstractFloat}
+    energies_current::AbstractMatrix{ET},
+    log_mixture_denom::AbstractVector{DT},
+    beta::BT;
+    volumes::AbstractVector{VT}=BT[],
+    P0_energy_per_vol::PT=zero(BT)
+) where {ET <: AbstractFloat, DT <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat, PT <: AbstractFloat}
     M, num_lambda = size(energies_current)
     if length(log_mixture_denom) != M
         throw(ArgumentError("compute_full_mbar_profile_from_log_mixture_denom expected log_mixture_denom length $M, got $(length(log_mixture_denom))."))
@@ -489,19 +538,23 @@ function compute_full_mbar_profile_from_log_mixture_denom(
         throw(ArgumentError("compute_full_mbar_profile_from_log_mixture_denom received empty energies matrix."))
     end
 
-    pv_terms = zeros(FT, M)
+    AT = promote_energy_analysis_type(energies_current, log_mixture_denom, beta, volumes, P0_energy_per_vol)
+    beta_AT = AT(beta)
+    P0_AT = AT(P0_energy_per_vol)
+
+    pv_terms = zeros(AT, M)
     if !isempty(volumes)
         @inbounds for k in 1:M
-            pv_terms[k] = beta * P0_energy_per_vol * volumes[k]
+            pv_terms[k] = beta_AT * P0_AT * AT(volumes[k])
         end
     end
 
-    F_profile = zeros(FT, num_lambda)
-    log_W_target = zeros(FT, M)
+    F_profile = zeros(AT, num_lambda)
+    log_W_target = zeros(AT, M)
     @inbounds for λ in 1:num_lambda
         for k in 1:M
             pv_k = pv_terms[k]
-            log_W_target[k] = -(beta * energies_current[k, λ] + pv_k) - log_mixture_denom[k]
+            log_W_target[k] = -(beta_AT * AT(energies_current[k, λ]) + pv_k) - AT(log_mixture_denom[k])
         end
         max_log_W = maximum(log_W_target)
         F_profile[λ] = -(max_log_W + log(sum(exp.(log_W_target .- max_log_W))))
@@ -518,12 +571,12 @@ Compute a per-state effective sample size (ESS) for the MBAR target weights
 using precomputed reference mixture denominators.
 """
 function compute_state_reweighting_ess_from_log_mixture_denom(
-    energies_current::Matrix{FT},
-    log_mixture_denom::Vector{FT},
-    beta::FT;
-    volumes::Vector{FT}=FT[],
-    P0_energy_per_vol::FT=zero(FT)
-) where {FT <: AbstractFloat}
+    energies_current::AbstractMatrix{ET},
+    log_mixture_denom::AbstractVector{DT},
+    beta::BT;
+    volumes::AbstractVector{VT}=BT[],
+    P0_energy_per_vol::PT=zero(BT)
+) where {ET <: AbstractFloat, DT <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat, PT <: AbstractFloat}
     M, num_lambda = size(energies_current)
     if length(log_mixture_denom) != M
         throw(ArgumentError("compute_state_reweighting_ess_from_log_mixture_denom expected log_mixture_denom length $M, got $(length(log_mixture_denom))."))
@@ -535,24 +588,28 @@ function compute_state_reweighting_ess_from_log_mixture_denom(
         throw(ArgumentError("compute_state_reweighting_ess_from_log_mixture_denom received empty energies matrix."))
     end
 
-    pv_terms = zeros(FT, M)
+    AT = promote_energy_analysis_type(energies_current, log_mixture_denom, beta, volumes, P0_energy_per_vol)
+    beta_AT = AT(beta)
+    P0_AT = AT(P0_energy_per_vol)
+
+    pv_terms = zeros(AT, M)
     if !isempty(volumes)
         @inbounds for k in 1:M
-            pv_terms[k] = beta * P0_energy_per_vol * volumes[k]
+            pv_terms[k] = beta_AT * P0_AT * AT(volumes[k])
         end
     end
 
-    ess_by_state = zeros(FT, num_lambda)
-    log_W_target = zeros(FT, M)
+    ess_by_state = zeros(AT, num_lambda)
+    log_W_target = zeros(AT, M)
     @inbounds for λ in 1:num_lambda
         for k in 1:M
             pv_k = pv_terms[k]
-            log_W_target[k] = -(beta * energies_current[k, λ] + pv_k) - log_mixture_denom[k]
+            log_W_target[k] = -(beta_AT * AT(energies_current[k, λ]) + pv_k) - AT(log_mixture_denom[k])
         end
         max_log_W = maximum(log_W_target)
         w = exp.(log_W_target .- max_log_W)
         w ./= sum(w)
-        ess_by_state[λ] = one(FT) / sum(w .^ 2)
+        ess_by_state[λ] = one(AT) / sum(w .^ 2)
     end
 
     return ess_by_state
@@ -564,7 +621,11 @@ end
 Measure the maximum deviation between an MBAR-reconstructed free-energy profile
 and the AWH free-energy estimate after aligning them at `ref_idx`.
 """
-function compute_parity_gap(F_mbar::Vector{FT}, F_awh::Vector{FT}; ref_idx::Int=1) where {FT <: AbstractFloat}
+function compute_parity_gap(
+    F_mbar::AbstractVector{MT},
+    F_awh::AbstractVector{ATW};
+    ref_idx::Int=1,
+) where {MT <: AbstractFloat, ATW <: AbstractFloat}
     if length(F_mbar) != length(F_awh)
         throw(ArgumentError("compute_parity_gap expected vectors with equal length, got $(length(F_mbar)) and $(length(F_awh))."))
     end
@@ -575,7 +636,8 @@ function compute_parity_gap(F_mbar::Vector{FT}, F_awh::Vector{FT}; ref_idx::Int=
         throw(ArgumentError("compute_parity_gap got ref_idx=$ref_idx outside valid range 1:$(length(F_mbar))."))
     end
 
-    F_mbar_aligned = F_mbar .- F_mbar[ref_idx]
-    F_awh_aligned = F_awh .- F_awh[ref_idx]
+    PT = promote_energy_analysis_type(F_mbar, F_awh)
+    F_mbar_aligned = PT.(F_mbar) .- PT(F_mbar[ref_idx])
+    F_awh_aligned = PT.(F_awh) .- PT(F_awh[ref_idx])
     return maximum(abs.(F_mbar_aligned .- F_awh_aligned))
 end

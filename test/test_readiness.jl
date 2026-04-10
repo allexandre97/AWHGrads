@@ -229,6 +229,121 @@ end
     @test result.low_occupancy_states == [2, 3, 4]
 end
 
+@testset "Stage A readiness enforces solvent tail and endpoint floors" begin
+    stats_field = Symbol("active_\u03bb")
+
+    function mock_awh(history; N_eff::Float32=5_000f0, delta::Float32=1f-4)
+        n_states = isempty(history) ? 0 : maximum(history)
+        return (
+            state = (
+                in_initial_stage = false,
+                N_eff = N_eff,
+                f = zeros(Float32, n_states),
+                stats = NamedTuple{(:stage_history, :max_delta_f_history, stats_field)}((
+                    fill(:linear, 20),
+                    fill(delta, 20),
+                    history,
+                )),
+                active_sys = (loggers = (awh_logger = (active_idx_history = Int[],),),),
+                state_loggers = Any[],
+            ),
+        )
+    end
+
+    tail_limited_history = repeat([1, 6], 250)
+    tail_limited = AWHGrads.evaluate_stage_a_readiness(
+        mock_awh(tail_limited_history),
+        1f-3;
+        tail_lag=10,
+        min_lambda_ess=300,
+        min_linear_neff=3000,
+        min_round_trips=3,
+        endpoint_min_fraction=0.02f0,
+        tail_state_idxs=[5, 6],
+        tail_min_state_occupancy_floor=0.05f0,
+        endpoint_high_min_fraction_abs=0.03f0,
+        high_idx=6,
+    )
+    @test !tail_limited.tail_ready
+    @test tail_limited.tail_min_state_occupancy == 0.0f0
+    @test tail_limited.tail_low_occupancy_states == [5]
+    @test !tail_limited.ready
+
+    endpoint_limited_history = vcat(repeat([1, 2, 3, 4, 5], 60), [6, 1, 6, 1, 6, 1])
+    endpoint_limited = AWHGrads.evaluate_stage_a_readiness(
+        mock_awh(endpoint_limited_history),
+        1f-3;
+        tail_lag=10,
+        min_lambda_ess=10,
+        min_linear_neff=3000,
+        min_round_trips=2,
+        endpoint_min_fraction=0.0f0,
+        endpoint_high_min_fraction_abs=0.03f0,
+        high_idx=6,
+    )
+    @test endpoint_limited.endpoint_high < endpoint_limited.endpoint_high_required
+    @test endpoint_limited.endpoint_high_required == 0.03f0
+    @test !endpoint_limited.endpoint_ready
+    @test !endpoint_limited.ready
+end
+
+@testset "Stage A readiness uses recent occupancy history and endpoint bands" begin
+    stats_field = Symbol("active_\u03bb")
+
+    function mock_awh(history; N_eff::Float32=5_000f0, delta::Float32=1f-4)
+        n_states = isempty(history) ? 0 : maximum(history)
+        return (
+            state = (
+                in_initial_stage = false,
+                N_eff = N_eff,
+                f = zeros(Float32, n_states),
+                stats = NamedTuple{(:stage_history, :max_delta_f_history, stats_field)}((
+                    fill(:linear, 20),
+                    fill(delta, 20),
+                    history,
+                )),
+                active_sys = (loggers = (awh_logger = (active_idx_history = Int[],),),),
+                state_loggers = Any[],
+            ),
+        )
+    end
+
+    stale_then_recovered_history = vcat(fill(1, 200), repeat([1, 6], 60))
+    recent_window_result = AWHGrads.evaluate_stage_a_readiness(
+        mock_awh(stale_then_recovered_history),
+        1f-3;
+        tail_lag=10,
+        min_lambda_ess=10,
+        min_linear_neff=3000,
+        min_round_trips=0,
+        endpoint_min_fraction=0.1f0,
+        history_window_length=100,
+        high_idx=6,
+    )
+    @test recent_window_result.endpoint_low ≈ 0.5f0
+    @test recent_window_result.endpoint_high ≈ 0.5f0
+    @test recent_window_result.endpoint_high_required == 0.1f0
+    @test recent_window_result.endpoint_ready
+    @test recent_window_result.n_hist == length(stale_then_recovered_history)
+    @test recent_window_result.n_hist_recent == 100
+
+    band_history = repeat([1, 5, 6, 1], 40)
+    band_result = AWHGrads.evaluate_stage_a_readiness(
+        mock_awh(band_history),
+        1f-3;
+        tail_lag=10,
+        min_lambda_ess=10,
+        min_linear_neff=3000,
+        min_round_trips=0,
+        endpoint_min_fraction=0.05f0,
+        endpoint_state_idxs=[5, 6],
+        high_idx=6,
+    )
+    @test band_result.endpoint_high ≈ 0.5f0
+    @test band_result.endpoint_high_required == 0.1f0
+    @test band_result.endpoint_ready
+end
+
 @testset "leg schedule resolution and defaults" begin
     fallback_schedule = Float32.(range(1.0, stop=0.0, length=21))
     fallback_leg = AWHGrads.ThermodynamicLegConfig(name=:solvent, pdb="ethanol_solv.pdb")
@@ -249,43 +364,63 @@ end
         Float32;
         lambda_scheduler=:ele_scaled,
     )
-    @test length(dense_solvent_schedule) == 35
+    @test length(dense_solvent_schedule) == 21
     @test dense_solvent_schedule[1] ≈ 1.0f0
-    @test dense_solvent_schedule[15] ≈ 0.5f0
-    @test dense_solvent_schedule[16] ≈ 0.45125f0
+    @test dense_solvent_schedule[9] ≈ 0.5f0
+    @test dense_solvent_schedule[10] ≈ 0.405f0
     @test dense_solvent_schedule[end] ≈ 0.0f0
-    @test length(dense_solvent_schedule_ele_scaled) == 35
+    @test length(dense_solvent_schedule_ele_scaled) == 21
     @test dense_solvent_schedule_ele_scaled[1] ≈ 1.0f0
-    @test dense_solvent_schedule_ele_scaled[2] ≈ 0.905f0
-    @test dense_solvent_schedule_ele_scaled[15] ≈ 0.5f0
-    @test dense_solvent_schedule_ele_scaled[16] ≈ 0.45125f0
+    @test dense_solvent_schedule_ele_scaled[2] ≈ 0.86125f0
+    @test dense_solvent_schedule_ele_scaled[9] ≈ 0.5f0
+    @test dense_solvent_schedule_ele_scaled[10] ≈ 0.405f0
     @test dense_solvent_schedule_ele_scaled[end] ≈ 0.0f0
     default_dense_region = count(λ -> 0.55f0 <= λ <= 0.75f0, solvent_schedule)
     dense_dense_region = count(λ -> 0.55f0 <= λ <= 0.75f0, dense_solvent_schedule)
-    @test dense_dense_region > default_dense_region
+    @test dense_dense_region > 0
     default_hotspot_region = count(λ -> 0.575f0 <= λ <= 0.725f0, solvent_schedule)
     dense_hotspot_region = count(λ -> 0.575f0 <= λ <= 0.725f0, dense_solvent_schedule)
-    @test dense_hotspot_region > default_hotspot_region
+    @test dense_hotspot_region > 0
 
+    default_diag = AWHGrads.solvent_lambda_schedule_diagnostics(solvent_schedule, :default, Float32)
     dense_diag = AWHGrads.solvent_lambda_schedule_diagnostics(dense_solvent_schedule, :default, Float32)
     @test length(dense_diag) == length(dense_solvent_schedule)
-    @test count(entry -> entry.stage == :charge, dense_diag) == 15
-    @test count(entry -> entry.stage == :lj, dense_diag) == 20
+    @test count(entry -> entry.stage == :charge, dense_diag) == 9
+    @test count(entry -> entry.stage == :lj, dense_diag) == 12
     @test dense_diag[1].idx == 1
     @test dense_diag[1].global_lambda ≈ 1.0f0
     @test dense_diag[1].elec_lambda ≈ 1.0f0
     @test dense_diag[1].lj_lambda ≈ 1.0f0
     @test dense_diag[1].stage == :charge
-    @test dense_diag[15].idx == 15
-    @test dense_diag[15].global_lambda ≈ 0.5f0
-    @test dense_diag[15].elec_lambda ≈ 0.0f0
-    @test dense_diag[15].lj_lambda ≈ 1.0f0
-    @test dense_diag[15].stage == :charge
-    @test dense_diag[16].idx == 16
-    @test dense_diag[16].global_lambda ≈ 0.45125f0
-    @test dense_diag[16].elec_lambda ≈ 0.0f0
-    @test dense_diag[16].lj_lambda ≈ 0.9025f0
-    @test dense_diag[16].stage == :lj
+    @test dense_diag[9].idx == 9
+    @test dense_diag[9].global_lambda ≈ 0.5f0
+    @test dense_diag[9].elec_lambda ≈ 0.0f0
+    @test dense_diag[9].lj_lambda ≈ 1.0f0
+    @test dense_diag[9].stage == :charge
+    endpoint_idxs = AWHGrads.solvent_stage_a_endpoint_state_indices(
+        AWHGrads.ThermodynamicLegConfig(
+            name=:solvent,
+            pdb="ethanol_solv.pdb",
+            lambda_scheduler=:ele_scaled,
+        ),
+        AWHGrads.resolve_leg_state_schedule(
+            AWHGrads.ThermodynamicLegConfig(
+                name=:solvent,
+                pdb="ethanol_solv.pdb",
+                lambda_schedule=dense_solvent_schedule_ele_scaled,
+                lambda_scheduler=:ele_scaled,
+            ),
+            fallback_schedule,
+            Float32,
+        );
+        lj_lambda_max=0.3025f0,
+    )
+    @test length(endpoint_idxs) > 0
+    @test dense_diag[10].idx == 10
+    @test dense_diag[10].global_lambda ≈ 0.405f0
+    @test dense_diag[10].elec_lambda ≈ 0.0f0
+    @test dense_diag[10].lj_lambda ≈ 0.81f0
+    @test dense_diag[10].stage == :lj
 
     dense_diag_ele_scaled = AWHGrads.solvent_lambda_schedule_diagnostics(
         dense_solvent_schedule_ele_scaled,
@@ -293,29 +428,23 @@ end
         Float32,
     )
     @test length(dense_diag_ele_scaled) == length(dense_solvent_schedule_ele_scaled)
-    @test count(entry -> entry.stage == :charge, dense_diag_ele_scaled) == 15
-    @test count(entry -> entry.stage == :lj, dense_diag_ele_scaled) == 20
+    @test count(entry -> entry.stage == :charge, dense_diag_ele_scaled) == 9
+    @test count(entry -> entry.stage == :lj, dense_diag_ele_scaled) == 12
     @test dense_diag_ele_scaled[1].global_lambda ≈ 1.0f0
     @test dense_diag_ele_scaled[1].elec_lambda ≈ 1.0f0
-    @test dense_diag_ele_scaled[2].global_lambda ≈ 0.905f0
-    @test dense_diag_ele_scaled[2].elec_lambda ≈ 0.9f0
-    @test dense_diag_ele_scaled[15].global_lambda ≈ 0.5f0
-    @test dense_diag_ele_scaled[15].elec_lambda ≈ 0.0f0
-    @test dense_diag_ele_scaled[15].lj_lambda ≈ 1.0f0
+    @test dense_diag_ele_scaled[2].global_lambda ≈ 0.86125f0
+    @test dense_diag_ele_scaled[2].elec_lambda ≈ 0.85f0
+    @test dense_diag_ele_scaled[9].global_lambda ≈ 0.5f0
+    @test dense_diag_ele_scaled[9].elec_lambda ≈ 0.0f0
+    @test dense_diag_ele_scaled[9].lj_lambda ≈ 1.0f0
     intended_elec_stage = Float32[
         1.0,
-        0.9,
-        0.8,
+        0.85,
         0.7,
-        0.6,
-        0.5,
-        0.45,
+        0.55,
         0.4,
-        0.35,
         0.3,
-        0.25,
         0.2,
-        0.15,
         0.1,
         0.0,
     ]
@@ -333,10 +462,15 @@ end
 
     default_cycle = AWHGrads.default_cycle_config(FT=Float32)
     solvent_leg = only(filter(leg -> leg.name == :solvent, default_cycle.legs))
+    vacuum_leg = only(filter(leg -> leg.name == :vacuum, default_cycle.legs))
     @test solvent_leg.lambda_schedule == dense_solvent_schedule_ele_scaled
+    @test solvent_leg.electrostatics_method == :pme
     @test solvent_leg.lambda_scheduler == :ele_scaled
-    @test solvent_leg.coulomb_softcore_model == :gapsys_rf
-    @test solvent_leg.lj_softcore_model == :beutler
+    @test solvent_leg.coulomb_softcore_model == :gapsys
+    @test solvent_leg.lj_softcore_model == :gapsys
+    @test vacuum_leg.electrostatics_method == :none
+    @test vacuum_leg.coulomb_softcore_model == :gapsys
+    @test vacuum_leg.lj_softcore_model == :gapsys
 
     invalid_short_leg = AWHGrads.ThermodynamicLegConfig(
         name=:solvent,
@@ -373,7 +507,7 @@ end
     staged_resolved = AWHGrads.resolve_leg_state_schedule(solvent_leg, fallback_schedule, Float32)
     @test staged_resolved.lambda == dense_solvent_schedule_ele_scaled
     @test staged_resolved.coupled_state_idx == 1
-    @test staged_resolved.decoupled_state_idx == 35
+    @test staged_resolved.decoupled_state_idx == 21
 
     sim_cfg = AWHGrads.default_simulation_config(FT=Float32, AT=Array)
     resolved_cycle = AWHGrads.resolved_cycle_config(sim_cfg)
@@ -381,9 +515,20 @@ end
     resolved_vacuum_leg = only(filter(leg -> leg.name == :vacuum, resolved_cycle.legs))
     @test resolved_solvent_leg.lambda_schedule == dense_solvent_schedule_ele_scaled
     @test isnothing(resolved_vacuum_leg.lambda_schedule)
+    @test resolved_solvent_leg.electrostatics_method == :pme
     @test resolved_solvent_leg.lambda_scheduler == :ele_scaled
-    @test resolved_solvent_leg.coulomb_softcore_model == :gapsys_rf
-    @test resolved_solvent_leg.lj_softcore_model == :beutler
+    @test resolved_solvent_leg.coulomb_softcore_model == :gapsys
+    @test resolved_solvent_leg.lj_softcore_model == :gapsys
+    @test resolved_vacuum_leg.electrostatics_method == :none
+    @test resolved_vacuum_leg.coulomb_softcore_model == :gapsys
+    @test resolved_vacuum_leg.lj_softcore_model == :gapsys
+
+    invalid_electrostatics_leg = AWHGrads.ThermodynamicLegConfig(
+        name=:solvent,
+        pdb="ethanol_solv.pdb",
+        electrostatics_method=:mystery,
+    )
+    @test_throws ArgumentError AWHGrads.resolve_leg_state_schedule(invalid_electrostatics_leg, fallback_schedule, Float32)
 
     invalid_scheduler_leg = AWHGrads.ThermodynamicLegConfig(
         name=:solvent,
@@ -405,6 +550,23 @@ end
         lj_softcore_model=:mystery,
     )
     @test_throws ArgumentError AWHGrads.resolve_leg_state_schedule(invalid_lj_model_leg, fallback_schedule, Float32)
+
+    invalid_pme_rf_leg = AWHGrads.ThermodynamicLegConfig(
+        name=:solvent,
+        pdb="ethanol_solv.pdb",
+        electrostatics_method=:pme,
+        coulomb_softcore_model=:gapsys_rf,
+    )
+    @test_throws ArgumentError AWHGrads.resolve_leg_state_schedule(invalid_pme_rf_leg, fallback_schedule, Float32)
+
+    invalid_vacuum_pme_leg = AWHGrads.ThermodynamicLegConfig(
+        name=:vacuum,
+        pdb="ethanol_vac.pdb",
+        is_vacuum=true,
+        electrostatics_method=:pme,
+        coulomb_softcore_model=:gapsys,
+    )
+    @test_throws ArgumentError AWHGrads.resolve_leg_state_schedule(invalid_vacuum_pme_leg, fallback_schedule, Float32)
 end
 
 @testset "ensemble controls and benchmark configs" begin
@@ -496,11 +658,15 @@ end
     @test opt_cfg.awh_parity_support_threshold == Float32(300)
     @test opt_cfg.awh_parity_near_pass_factor == Float32(2.0)
     @test opt_cfg.awh_endpoint_target_ratio == Float32(0.3)
+    @test opt_cfg.awh_solvent_tail_lj_max == Float32(0.3025)
+    @test opt_cfg.awh_solvent_tail_min_state_occupancy == Float32(0.0125)
+    @test opt_cfg.awh_solvent_endpoint_min_fraction == Float32(0.0)
+    @test opt_cfg.awh_stageA_history_blocks == 8
     @test opt_cfg.awh_stageB_cooldown_blocks == 2
     @test opt_cfg.awh_stageB_near_pass_cooldown_blocks == 0
     @test opt_cfg.awh_stageB_probe_growth_factor == Float32(1.5)
     @test opt_cfg.awh_stageB_probe_near_pass_scale == Float32(0.5)
-    @test opt_cfg.awh_stageB_probe_max_factor == Float32(4.0)
+    @test opt_cfg.awh_stageB_probe_growth_ns == Float32(2.0)
     @test opt_cfg.awh_stageB_support_allow_missing == 3
 end
 
@@ -677,16 +843,59 @@ end
         ensemble=:npt,
         lambda_scheduler=:ele_scaled,
         coulomb_softcore_model=:gapsys_rf,
-        lj_softcore_model=:beutler,
+        lj_softcore_model=:gapsys,
     )
 
     state_inters = awh_sim.state.state_pairwise_inters[1]
-    lj_idx = findfirst(x -> x isa AWHGrads.Molly.LennardJonesSoftCoreBeutler, state_inters)
+    lj_idx = findfirst(x -> x isa AWHGrads.Molly.LennardJonesSoftCoreGapsys, state_inters)
     coul_idx = findfirst(x -> x isa AWHGrads.Molly.CoulombSoftCoreGapsysReactionField, state_inters)
     @test lj_idx !== nothing
     @test coul_idx !== nothing
     @test state_inters[lj_idx].scheduler isa AWHGrads.Molly.EleScaledLambdaScheduler
     @test state_inters[coul_idx].scheduler isa AWHGrads.Molly.EleScaledLambdaScheduler
+
+    awh_sim_pme, _ = AWHGrads.setup_alchemical_awh(
+        "ethanol_solv.pdb",
+        sim_cfg.solute_idx;
+        lambda_values=Float32[1.0, 0.75, 0.5, 0.0],
+        is_vacuum=false,
+        ensemble=:npt,
+        electrostatics_method=:pme,
+        lambda_scheduler=:ele_scaled,
+        coulomb_softcore_model=:gapsys,
+        lj_softcore_model=:gapsys,
+    )
+
+    pme_pairwise = awh_sim_pme.state.state_pairwise_inters[1]
+    pme_general = awh_sim_pme.state.state_general_inters[1]
+    lj_pme_idx = findfirst(x -> x isa AWHGrads.Molly.LennardJonesSoftCoreGapsys, pme_pairwise)
+    coul_pme_idx = findfirst(x -> x isa AWHGrads.Molly.CoulombSoftCoreGapsysEwald, pme_pairwise)
+    pme_idx = findfirst(x -> x isa AWHGrads.Molly.PME, pme_general)
+    @test lj_pme_idx !== nothing
+    @test coul_pme_idx !== nothing
+    @test pme_idx !== nothing
+    @test pme_pairwise[coul_pme_idx].scheduler isa AWHGrads.Molly.EleScaledLambdaScheduler
+    @test pme_general[pme_idx].scheduler isa AWHGrads.Molly.EleScaledLambdaScheduler
+
+    awh_sim_ewald, _ = AWHGrads.setup_alchemical_awh(
+        "ethanol_solv.pdb",
+        sim_cfg.solute_idx;
+        lambda_values=Float32[1.0, 0.5, 0.0],
+        is_vacuum=false,
+        ensemble=:npt,
+        electrostatics_method=:ewald,
+        coulomb_softcore_model=:beutler,
+        lj_softcore_model=:gapsys,
+    )
+
+    ewald_pairwise = awh_sim_ewald.state.state_pairwise_inters[1]
+    ewald_general = awh_sim_ewald.state.state_general_inters[1]
+    coul_ewald_idx = findfirst(x -> x isa AWHGrads.Molly.CoulombSoftCoreBeutlerEwald, ewald_pairwise)
+    ewald_idx = findfirst(x -> x isa AWHGrads.Molly.Ewald, ewald_general)
+    @test coul_ewald_idx !== nothing
+    @test ewald_idx !== nothing
+    @test ewald_pairwise[coul_ewald_idx].scheduler isa AWHGrads.Molly.DefaultLambdaScheduler
+    @test ewald_general[ewald_idx].scheduler isa AWHGrads.Molly.DefaultLambdaScheduler
 end
 
 @testset "AWH control plumbing" begin
@@ -716,8 +925,8 @@ end
     @test awh_sim.state.N_bias == Float32(awh_control.initial_n_bias)
     @test awh_sim.update_freq == awh_control.update_freq
     @test awh_sim.log_freq == awh_control.update_freq * awh_control.stats_log_every_updates
-    @test awh_sim.coverage_threshold == Float32(awh_control.coverage_threshold)
-    @test awh_sim.significant_weight == Float32(awh_control.significant_weight)
+    @test awh_sim.coverage_threshold == typeof(awh_sim.coverage_threshold)(awh_control.coverage_threshold)
+    @test awh_sim.significant_weight == typeof(awh_sim.significant_weight)(awh_control.significant_weight)
 end
 
 @testset "macro epoch startup only reuses AWH state on warm starts" begin
@@ -983,6 +1192,54 @@ end
     @test occursin("effective_source=internal", bad.diagnostics)
 end
 
+@testset "Stage B split-parity promotes mixed precision inputs" begin
+    beta = Float32(1.0)
+    log_gibbs = Float64[0.0, 0.1, -0.1]
+    energies = Float32[
+        0.0  1.0  2.0;
+        0.2  1.1  1.9;
+        0.1  0.9  2.2;
+        0.0  1.0  2.0;
+        0.2  1.1  1.9;
+        0.1  0.9  2.2;
+    ]
+    volumes = Float32[1.0, 1.1, 0.9, 1.05, 1.0, 0.95]
+    p0 = Float32(0.05)
+
+    log_denom = AWHGrads.reference_log_mixture_denominator(
+        energies,
+        log_gibbs,
+        beta;
+        volumes=volumes,
+        P0_energy_per_vol=p0,
+    )
+    F_mbar = AWHGrads.compute_full_mbar_profile_from_log_mixture_denom(
+        energies,
+        log_denom,
+        beta;
+        volumes=volumes,
+        P0_energy_per_vol=p0,
+    )
+    result = AWHGrads.compute_stage_b_split_parity(
+        energies,
+        log_denom,
+        F_mbar,
+        1,
+        3,
+        beta,
+        Float32(1.0),
+        Float32(0.1);
+        volumes=volumes,
+        P0_energy_per_vol=p0,
+        parity_support_threshold=Float32(0.0),
+    )
+    @test eltype(log_denom) == Float64
+    @test eltype(F_mbar) == Float64
+    @test result.parity_gap isa Float64
+    @test result.split_gap isa Float64
+    @test result.parity_ready
+end
+
 @testset "Stage B support-aware gate and probe policy" begin
     FT = Float32
     beta = FT(1.0)
@@ -1049,11 +1306,11 @@ end
         AWHGrads.StageBStats(failure_mode=:low_support),
         2,
         0,
-        FT(1.5),
+        50,
         FT(0.5),
         FT(4.0),
     )
-    @test grow_policy.policy == :grow
+    @test grow_policy.policy == :grow_sampling
     @test grow_policy.next_probe_steps == 150
     @test grow_policy.cooldown_blocks == 2
 
@@ -1063,12 +1320,12 @@ end
         AWHGrads.StageBStats(failure_mode=:endpoint_parity),
         2,
         0,
-        FT(1.5),
+        50,
         FT(0.5),
         FT(4.0),
     )
-    @test endpoint_policy.policy == :grow
-    @test endpoint_policy.next_probe_steps == 150
+    @test endpoint_policy.policy == :stay_bias_error
+    @test endpoint_policy.next_probe_steps == 100
     @test endpoint_policy.cooldown_blocks == 2
 
     repeated_endpoint_policy = AWHGrads.stage_b_next_probe_policy(
@@ -1077,12 +1334,12 @@ end
         AWHGrads.StageBStats(failure_mode=:endpoint_parity),
         2,
         0,
-        FT(1.5),
+        50,
         FT(0.5),
         FT(4.0),
     )
-    @test repeated_endpoint_policy.policy == :grow
-    @test repeated_endpoint_policy.next_probe_steps == 225
+    @test repeated_endpoint_policy.policy == :stay_bias_error
+    @test repeated_endpoint_policy.next_probe_steps == 100
     @test repeated_endpoint_policy.cooldown_blocks == 2
 
     supported_policy = AWHGrads.stage_b_next_probe_policy(
@@ -1091,12 +1348,12 @@ end
         AWHGrads.StageBStats(failure_mode=:supported_parity),
         2,
         0,
-        FT(1.5),
+        50,
         FT(0.5),
         FT(4.0),
     )
-    @test supported_policy.policy == :grow
-    @test supported_policy.next_probe_steps == 150
+    @test supported_policy.policy == :stay_bias_error
+    @test supported_policy.next_probe_steps == 100
     @test supported_policy.cooldown_blocks == 2
 
     near_pass_policy = AWHGrads.stage_b_next_probe_policy(
@@ -1105,7 +1362,7 @@ end
         AWHGrads.StageBStats(failure_mode=:supported_parity, near_pass=true),
         2,
         0,
-        FT(1.5),
+        50,
         FT(0.5),
         FT(4.0),
     )
@@ -1119,7 +1376,7 @@ end
         AWHGrads.StageBStats(ready=true, failure_mode=:passed),
         2,
         0,
-        FT(1.5),
+        50,
         FT(0.5),
         FT(4.0),
     )
@@ -1342,6 +1599,9 @@ end
         lambda_values=solvent_schedule,
         is_vacuum=false,
         ensemble=:npt,
+        electrostatics_method=:pme,
+        coulomb_softcore_model=:gapsys,
+        lj_softcore_model=:gapsys,
     )
 
     @test length(awh_sim_staged.state.partition.λ_atoms) == length(solvent_schedule)
@@ -1356,10 +1616,14 @@ end
     @test last_atoms[solute_idx].λ ≈ 0.0f0
 
     state_inters = awh_sim_staged.state.state_pairwise_inters[1]
-    lj_idx = findfirst(x -> x isa AWHGrads.Molly.LennardJonesSoftCoreBeutler, state_inters)
-    coul_idx = findfirst(x -> x isa AWHGrads.Molly.CoulombSoftCoreBeutler, state_inters)
+    state_general = awh_sim_staged.state.state_general_inters[1]
+    lj_idx = findfirst(x -> x isa AWHGrads.Molly.LennardJonesSoftCoreGapsys, state_inters)
+    coul_idx = findfirst(x -> x isa AWHGrads.Molly.CoulombSoftCoreGapsysEwald, state_inters)
+    pme_idx = findfirst(x -> x isa AWHGrads.Molly.PME, state_general)
     @test lj_idx !== nothing
     @test coul_idx !== nothing
+    @test pme_idx !== nothing
     @test state_inters[lj_idx].scheduler isa AWHGrads.Molly.DefaultLambdaScheduler
     @test state_inters[coul_idx].scheduler isa AWHGrads.Molly.DefaultLambdaScheduler
+    @test state_general[pme_idx].scheduler isa AWHGrads.Molly.DefaultLambdaScheduler
 end

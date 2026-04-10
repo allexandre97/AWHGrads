@@ -67,7 +67,7 @@ function resolve_leg_awh_control(
         update_freq=awh_control.update_freq,
         coverage_threshold=awh_control.coverage_threshold,
         significant_weight=awh_control.significant_weight,
-        initial_n_bias=awh_control.initial_n_bias,
+        initial_n_bias=isnothing(leg.awh_initial_n_bias) ? awh_control.initial_n_bias : leg.awh_initial_n_bias,
         well_tempered_factor=awh_control.well_tempered_factor,
         coverage_type=awh_control.coverage_type,
     )
@@ -93,8 +93,43 @@ function awh_simulation_control_kwargs(awh_control::AWHControlConfig)
 end
 
 normalize_lambda_scheduler_name(value::Union{Nothing, Symbol}) = isnothing(value) ? :default : value
-normalize_softcore_model_name(value::Union{Nothing, Symbol}) = isnothing(value) ? :beutler : value
-uses_reaction_field_coulomb_model(value::Union{Nothing, Symbol}) = normalize_softcore_model_name(value) in (:beutler_rf, :gapsys_rf)
+normalize_softcore_model_name(value::Union{Nothing, Symbol}) = isnothing(value) ? :gapsys : value
+normalize_reaction_field_coulomb_model_name(value::Union{Nothing, Symbol}) = isnothing(value) ? :gapsys_rf : value
+uses_reaction_field_coulomb_model(value::Union{Nothing, Symbol}) = normalize_reaction_field_coulomb_model_name(value) in (:beutler_rf, :gapsys_rf)
+
+function normalize_electrostatics_method_name(
+    value::Union{Nothing, Symbol},
+    is_vacuum::Bool=false,
+    coulomb_softcore_model::Union{Nothing, Symbol}=nothing,
+)
+    if !isnothing(value)
+        return value
+    end
+    if is_vacuum
+        return :none
+    end
+    return uses_reaction_field_coulomb_model(coulomb_softcore_model) ? :cutoff : :none
+end
+
+function normalize_reaction_field_coulomb_model_name(value::Union{Nothing, Symbol}, ::Val{:cutoff})
+    model_name = normalize_reaction_field_coulomb_model_name(value)
+    if model_name == :beutler
+        return :beutler_rf
+    elseif model_name == :gapsys
+        return :gapsys_rf
+    end
+    return model_name
+end
+
+function normalize_ewald_coulomb_model_name(value::Union{Nothing, Symbol})
+    model_name = normalize_softcore_model_name(value)
+    if model_name == :beutler_rf
+        return :beutler
+    elseif model_name == :gapsys_rf
+        return :gapsys
+    end
+    return model_name
+end
 
 function resolve_lambda_scheduler(value::Union{Nothing, Symbol})
     scheduler_name = normalize_lambda_scheduler_name(value)
@@ -115,11 +150,15 @@ function build_lj_softcore_interaction(
     awh_control::AWHControlConfig,
     scheduler,
     model::Union{Nothing, Symbol},
+    is_vacuum::Bool=false,
 )
     model_name = normalize_softcore_model_name(model)
+    # Vacuum systems on CPU need a finite cutoff for the neighbor finder to work correctly with exclusions.
+    # For others, we MUST respect the reference interaction's cutoff to match AWH's neighbor-list truncation.
+    cutoff = is_vacuum ? DistanceCutoff(5.0u"nm") : lj_0.cutoff
     if model_name == :beutler
         return LennardJonesSoftCoreBeutler(
-            cutoff=lj_0.cutoff,
+            cutoff=cutoff,
             α=FT(awh_control.lj_softcore_alpha),
             use_neighbors=lj_0.use_neighbors,
             shortcut=lj_0.shortcut,
@@ -130,7 +169,7 @@ function build_lj_softcore_interaction(
         )
     elseif model_name == :gapsys
         return LennardJonesSoftCoreGapsys(
-            cutoff=lj_0.cutoff,
+            cutoff=cutoff,
             α=FT(awh_control.lj_softcore_alpha),
             use_neighbors=lj_0.use_neighbors,
             shortcut=lj_0.shortcut,
@@ -148,11 +187,18 @@ function build_coulomb_softcore_interaction(
     awh_control::AWHControlConfig,
     scheduler,
     model::Union{Nothing, Symbol},
+    is_vacuum::Bool=false,
 )
     model_name = normalize_softcore_model_name(model)
+    if model_name == :beutler_rf
+        model_name = :beutler
+    elseif model_name == :gapsys_rf
+        model_name = :gapsys
+    end
+    cutoff = is_vacuum ? DistanceCutoff(5.0u"nm") : cl_0.cutoff
     if model_name == :beutler
         return CoulombSoftCoreBeutler(
-            cutoff=cl_0.cutoff,
+            cutoff=cutoff,
             α=FT(awh_control.coul_softcore_alpha),
             use_neighbors=cl_0.use_neighbors,
             scheduler=scheduler,
@@ -161,7 +207,7 @@ function build_coulomb_softcore_interaction(
         )
     elseif model_name == :gapsys
         return CoulombSoftCoreGapsys(
-            cutoff=cl_0.cutoff,
+            cutoff=cutoff,
             α=FT(awh_control.coul_softcore_alpha),
             σQ=FT(1.0)u"nm",
             use_neighbors=cl_0.use_neighbors,
@@ -178,23 +224,25 @@ function build_coulomb_softcore_interaction(
     awh_control::AWHControlConfig,
     scheduler,
     model::Union{Nothing, Symbol},
+    is_vacuum::Bool=false,
 )
-    model_name = normalize_softcore_model_name(model)
+    model_name = normalize_reaction_field_coulomb_model_name(model, Val(:cutoff))
+    cutoff = is_vacuum ? DistanceCutoff(5.0u"nm") : cl_0.dist_cutoff
     if model_name == :beutler_rf
         return CoulombSoftCoreBeutlerReactionField(
-            dist_cutoff=cl_0.dist_cutoff,
+            dist_cutoff=cutoff isa NoCutoff ? 100.0u"nm" : cutoff, # RFC needs a distance, but we won't use it if neighbors are off
             solvent_dielectric=cl_0.solvent_dielectric,
             α=FT(awh_control.coul_softcore_alpha),
             use_neighbors=cl_0.use_neighbors,
-            σ_mixing=LorentzMixing(),
-            ϵ_mixing=GeometricMixing(),
+            σ_mixing=Molly.LorentzMixing(),
+            ϵ_mixing=Molly.GeometricMixing(),
             scheduler=scheduler,
             weight_special=cl_0.weight_special,
             coulomb_const=cl_0.coulomb_const,
         )
     elseif model_name == :gapsys_rf
         return CoulombSoftCoreGapsysReactionField(
-            dist_cutoff=cl_0.dist_cutoff,
+            dist_cutoff=cutoff isa NoCutoff ? 100.0u"nm" : cutoff,
             solvent_dielectric=cl_0.solvent_dielectric,
             α=FT(awh_control.coul_softcore_alpha),
             σQ=FT(1.0)u"nm",
@@ -205,6 +253,44 @@ function build_coulomb_softcore_interaction(
         )
     end
     throw(ArgumentError("Reaction-field Coulomb base requires an RF soft-core model, got `$model_name`."))
+end
+
+function build_coulomb_softcore_interaction(
+    cl_0::CoulombEwald,
+    awh_control::AWHControlConfig,
+    scheduler,
+    model::Union{Nothing, Symbol},
+    is_vacuum::Bool=false,
+)
+    model_name = normalize_ewald_coulomb_model_name(model)
+    cutoff = is_vacuum ? DistanceCutoff(5.0u"nm") : cl_0.dist_cutoff
+    if model_name == :beutler
+        return CoulombSoftCoreBeutlerEwald(
+            dist_cutoff=cutoff isa NoCutoff ? 100.0u"nm" : cutoff,
+            error_tol=cl_0.error_tol,
+            α=FT(awh_control.coul_softcore_alpha),
+            use_neighbors=cl_0.use_neighbors,
+            σ_mixing=Molly.LorentzMixing(),
+            ϵ_mixing=Molly.GeometricMixing(),
+            scheduler=scheduler,
+            weight_special=cl_0.weight_special,
+            coulomb_const=cl_0.coulomb_const,
+            approximate_erfc=cl_0.approximate_erfc,
+        )
+    elseif model_name == :gapsys
+        return CoulombSoftCoreGapsysEwald(
+            dist_cutoff=cutoff isa NoCutoff ? 100.0u"nm" : cutoff,
+            error_tol=cl_0.error_tol,
+            α=FT(awh_control.coul_softcore_alpha),
+            σQ=FT(1.0)u"nm",
+            use_neighbors=cl_0.use_neighbors,
+            scheduler=scheduler,
+            weight_special=cl_0.weight_special,
+            coulomb_const=cl_0.coulomb_const,
+            approximate_erfc=cl_0.approximate_erfc,
+        )
+    end
+    throw(ArgumentError("Ewald/PME Coulomb base requires a plain soft-core model, got `$model_name`."))
 end
 
 """
@@ -221,6 +307,68 @@ function awh_coupling_methods(is_vacuum::Bool, ensemble::Symbol)
         return (thermostat, barostat)
     end
     throw(ArgumentError("Unsupported ensemble=$ensemble. Supported values are :npt and :nvt."))
+end
+
+function resolve_base_nonbonded_method(
+    electrostatics_method::Union{Nothing, Symbol},
+    is_vacuum::Bool,
+    coulomb_softcore_model::Union{Nothing, Symbol},
+)
+    method_name = normalize_electrostatics_method_name(
+        electrostatics_method,
+        is_vacuum,
+        coulomb_softcore_model,
+    )
+    if method_name in (:none, :cutoff, :ewald, :pme)
+        return method_name
+    end
+    throw(ArgumentError("Unsupported electrostatics method `$method_name`."))
+end
+
+rebuild_general_interaction(inter, scheduler) = inter
+
+function rebuild_general_interaction(inter::Molly.Ewald, scheduler)
+    return Molly.Ewald(
+        inter.dist_cutoff,
+        inter.error_tol,
+        deepcopy(inter.excluded_pairs),
+        scheduler,
+    )
+end
+
+function rebuild_general_interaction(inter::Molly.PME, scheduler)
+    return Molly.PME(
+        inter.dist_cutoff,
+        inter.error_tol,
+        inter.order,
+        inter.ϵr,
+        deepcopy(inter.excluded_pairs),
+        inter.α,
+        inter.mesh_dims,
+        inter.grid_indices,
+        inter.grid_fractions,
+        inter.bsplines_θ,
+        inter.bsplines_dθ,
+        inter.bsplines_moduli_x,
+        inter.bsplines_moduli_y,
+        inter.bsplines_moduli_z,
+        inter.charge_grid,
+        inter.charge_grid_buffer,
+        inter.excluded_buffer_Fs,
+        inter.excluded_buffer_Es,
+        inter.recip_conv_buffer,
+        inter.virial_buffer,
+        nothing,
+        nothing,
+        inter.fft_plan,
+        inter.bfft_plan,
+        scheduler,
+        inter.grad_safe,
+    )
+end
+
+function rebuild_state_general_interactions(general_inters::Tuple, scheduler)
+    return Tuple(rebuild_general_interaction(inter, scheduler) for inter in general_inters)
 end
 
 """
@@ -284,16 +432,26 @@ function setup_alchemical_awh(
     restart_state=nothing,
     restart_active_idx::Int=1,
     warm_start::Bool=false,
+    electrostatics_method::Union{Nothing, Symbol}=nothing,
     lambda_scheduler::Union{Nothing, Symbol}=nothing,
     coulomb_softcore_model::Union{Nothing, Symbol}=nothing,
     lj_softcore_model::Union{Nothing, Symbol}=nothing,
     sigma_seed=nothing,
     epsilon_seed=nothing,
+    array_type::Type{<:AbstractArray} = AT,
+    nonbonded_energy_type=nonbonded_energy_type,
 )
     # Start from the reference PDB and optionally attach an AWH logger.
-    base_nonbonded_method = (uses_reaction_field_coulomb_model(coulomb_softcore_model) && !is_vacuum) ? :cutoff : :none
+    base_nonbonded_method = resolve_base_nonbonded_method(
+        electrostatics_method,
+        is_vacuum,
+        coulomb_softcore_model,
+    )
+    nf_type = nothing
     sys_raw = System(
-        pdb_file, ff; array_type=AT, nonbonded_method=base_nonbonded_method,
+        pdb_file, ff; array_type=array_type, nonbonded_method=base_nonbonded_method,
+        neighbor_finder_type=nf_type,
+        nonbonded_energy_type=nonbonded_energy_type,
         loggers=isnothing(logger) ? NamedTuple() : (awh_logger=logger,)  
     )
 
@@ -325,7 +483,7 @@ function setup_alchemical_awh(
         push!(seeded_atoms, Atom(a.index, a.atom_type, a.mass, a.charge, new_sigma, new_eps, a.λ, a.alch_role))
     end
     
-    sys_base = System(sys_raw; atoms=Molly.to_device([seeded_atoms...], AT))
+    sys_base = System(sys_raw; atoms=Molly.to_device([seeded_atoms...], array_type))
 
     coupling_methods = awh_coupling_methods(is_vacuum, ensemble)
     integrator = VelocityVerlet(Δt, coupling_methods, 100)
@@ -348,13 +506,13 @@ function setup_alchemical_awh(
 
     p_inters = sys_base.pairwise_inters 
     idx_lj   = findfirst(x -> x isa LennardJones, p_inters)  
-    idx_coul = findfirst(x -> x isa Coulomb || x isa CoulombReactionField, p_inters)
+    idx_coul = findfirst(x -> x isa Coulomb || x isa CoulombReactionField || x isa CoulombEwald, p_inters)
     
     lj_0 = p_inters[idx_lj]  
     cl_0 = p_inters[idx_coul]  
     scheduler = resolve_lambda_scheduler(lambda_scheduler)
-    lj_sc = build_lj_softcore_interaction(lj_0, awh_control, scheduler, lj_softcore_model)
-    coul_sc = build_coulomb_softcore_interaction(cl_0, awh_control, scheduler, coulomb_softcore_model)
+    lj_sc = build_lj_softcore_interaction(lj_0, awh_control, scheduler, lj_softcore_model, is_vacuum)
+    coul_sc = build_coulomb_softcore_interaction(cl_0, awh_control, scheduler, coulomb_softcore_model, is_vacuum)
 
     thermo_states = ThermoState[]  
 
@@ -373,8 +531,9 @@ function setup_alchemical_awh(
 
         sys_w = System(
             deepcopy(sys_base);
-            atoms = Molly.to_device([acopy...], AT),  
+            atoms = Molly.to_device([acopy...], array_type),  
             pairwise_inters = (coul_sc, lj_sc),
+            general_inters = rebuild_state_general_interactions(sys_base.general_inters, scheduler),
             loggers = isnothing(logger) ? NamedTuple() : (awh_logger=logger,)
         )
         push!(thermo_states, ThermoState(sys_w, deepcopy(integrator)))  

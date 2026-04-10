@@ -3,6 +3,20 @@ using Molly
 using Unitful
 # No need for using AWHGrads here as it is included in runtests.jl
 
+@testset "mixed precision defaults" begin
+    @test AWHGrads.default_nonbonded_energy_type(Float32) == Float64
+    @test AWHGrads.default_nonbonded_energy_type(Float64) == Float64
+
+    sim_cfg = AWHGrads.default_simulation_config()
+    @test sim_cfg.FT == Float32
+    @test sim_cfg.nonbonded_energy_type == Float64
+    @test AWHGrads.effective_nonbonded_energy_type(sim_cfg) == Float64
+    @test AWHGrads.default_energy_analysis_type(sim_cfg) == Float64
+
+    _, _, T_en = AWHGrads.awh_logger_value_types(sim_cfg)
+    @test T_en == typeof(Float64(1.0)u"kJ * mol^-1")
+end
+
 @testset "pipeline orchestration" begin
     FT = Float32
 
@@ -47,10 +61,10 @@ end
         false,
     )
 
-    @test [block.name for block in solute_blocks] == ["Solute[c3]", "Solute[oh]"]
-    @test [block.kind for block in solute_blocks] == [:solute, :solute]
-    @test [block.global_indices for block in solute_blocks] == [[1, 2], [3, 4]]
-    @test [block.trainable_indices for block in solute_blocks] == [[1, 2], [3, 4]]
+    @test [block.name for block in solute_blocks] == ["Solute"]
+    @test [block.kind for block in solute_blocks] == [:solute]
+    @test [block.global_indices for block in solute_blocks] == [[1, 2, 3, 4]]
+    @test [block.trainable_indices for block in solute_blocks] == [[1, 2, 3, 4]]
 
     all_indices = collect(1:length(param_names))
     all_trainable_map = Dict(idx => idx for idx in all_indices)
@@ -74,4 +88,31 @@ end
     @test AWHGrads.line_search_residual_acceptable(FT(10.0), FT(10.9), FT(0.1))
     @test !AWHGrads.line_search_residual_acceptable(FT(10.0), FT(11.2), FT(0.1))
     @test AWHGrads.default_optimization_config().max_inner_epochs == 10
+end
+
+@testset "Molly dispersion correction unit stripping" begin
+    inter = Molly.LJDispersionCorrection(1.25f0u"kJ*nm^3/mol")
+    stripped = ustrip(inter)
+
+    @test stripped isa Molly.LJDispersionCorrection
+    @test stripped.factor == 1.25f0
+end
+
+@testset "Molly System reconstruction forwards launch_config" begin
+    sys = Molly.System("ethanol_vac.pdb", AWHGrads.ff; array_type=Array, nonbonded_method=:none)
+    sys_nounits = ustrip(Molly.from_device(sys))
+
+    rebuilt = AWHGrads._rebuild_system_like(
+        sys_nounits,
+        sys_nounits.atoms,
+        sys_nounits.coords,
+        sys_nounits.boundary,
+        sys_nounits.pairwise_inters,
+        sys_nounits.specific_inter_lists,
+        sys_nounits.general_inters,
+    )
+
+    @test rebuilt.launch_config == sys_nounits.launch_config
+    @test rebuilt.coords == sys_nounits.coords
+    @test rebuilt.general_inters == sys_nounits.general_inters
 end

@@ -152,17 +152,18 @@ Estimate a leg free energy as the difference between the two endpoint free
 energies reconstructed from the reference ensemble.
 """
 function estimate_leg_dg_from_reference(
-    energies::Matrix{FT},
+    energies::AbstractMatrix{ET},
     active_lambda_idx::Vector{Int},
-    log_gibbs_weights::Vector{FT},
+    log_gibbs_weights::AbstractVector{GT},
     coupled_state_idx::Int,
     decoupled_state_idx::Int,
-    beta::FT;
-    volumes::Vector{FT}=FT[],
-    P0_energy_per_vol::FT=zero(FT)
-) where {FT <: AbstractFloat}
+    beta::BT;
+    volumes::AbstractVector{VT}=BT[],
+    P0_energy_per_vol::PT=zero(BT)
+) where {ET <: AbstractFloat, GT <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat, PT <: AbstractFloat}
+    AT = promote_energy_analysis_type(energies, log_gibbs_weights, beta, volumes, P0_energy_per_vol)
     dummy_names = String[]
-    dummy_grads = Dict{String, Matrix{FT}}()
+    dummy_grads = Dict{String, Matrix{AT}}()
     _, F_1 = compute_global_endpoint_gradients(
         dummy_names, dummy_grads, energies, energies, active_lambda_idx, coupled_state_idx,
         beta, log_gibbs_weights, volumes, P0_energy_per_vol; compute_gradients=false
@@ -348,6 +349,20 @@ function state_occupancy_fractions(active_idx_history::Vector{Int}, n_states::In
 end
 
 """
+    recent_active_idx_history(active_idx_history, history_window_length)
+
+Return the most recent `history_window_length` λ-history entries. Non-positive
+window lengths keep the full history.
+"""
+function recent_active_idx_history(active_idx_history::Vector{Int}, history_window_length::Int)
+    if history_window_length <= 0 || length(active_idx_history) <= history_window_length
+        return copy(active_idx_history)
+    end
+    first_idx = length(active_idx_history) - history_window_length + 1
+    return copy(@view active_idx_history[first_idx:end])
+end
+
+"""
     count_lambda_switches(active_idx_history)
 
 Count the number of λ-state changes in an active-index history.
@@ -438,6 +453,11 @@ function evaluate_stage_a_readiness(
     min_linear_neff::Int,
     min_round_trips::Int,
     endpoint_min_fraction::FT,
+    history_window_length::Int=0,
+    tail_state_idxs::Vector{Int}=Int[],
+    endpoint_state_idxs::Vector{Int}=Int[],
+    tail_min_state_occupancy_floor::FT=zero(FT),
+    endpoint_high_min_fraction_abs::FT=zero(FT),
     low_idx::Int=1,
     high_idx::Int
 ) where {FT <: AbstractFloat}
@@ -445,32 +465,44 @@ function evaluate_stage_a_readiness(
     neff_ready = !awh_sim.state.in_initial_stage && linear_neff >= FT(min_linear_neff)
 
     # Stage A deliberately mixes bias-stability and trajectory-mixing criteria:
-    # a flat bias alone is not enough if λ exploration is still poor.
-    idx_history = get_awh_active_idx_history(awh_sim)
-    lambda_ess = estimate_lambda_history_ess(idx_history, FT)
-    tau_int_est = isempty(idx_history) ? zero(FT) : FT(length(idx_history)) / lambda_ess
+    # a flat bias alone is not enough if λ exploration is still poor. λ-history
+    # ESS remains cumulative, but occupancy-style gates focus on recent behavior.
+    idx_history_full = get_awh_active_idx_history(awh_sim)
+    idx_history_recent = recent_active_idx_history(idx_history_full, history_window_length)
+    lambda_ess = estimate_lambda_history_ess(idx_history_full, FT)
+    tau_int_est = isempty(idx_history_full) ? zero(FT) : FT(length(idx_history_full)) / lambda_ess
     lambda_ess_ready = lambda_ess >= FT(min_lambda_ess)
-    round_trips = count_full_round_trips(idx_history, low_idx, high_idx)
+    round_trips = count_full_round_trips(idx_history_full, low_idx, high_idx)
     round_trip_ready = round_trips >= min_round_trips
 
-    endpoint_low, endpoint_high = endpoint_occupancy_fractions(idx_history, low_idx, high_idx)
-    endpoint_ready = endpoint_low >= endpoint_min_fraction && endpoint_high >= endpoint_min_fraction
+    endpoint_low, _ = endpoint_occupancy_fractions(idx_history_recent, low_idx, high_idx)
     n_states = if hasproperty(awh_sim.state, :f)
         length(awh_sim.state.f)
     elseif hasproperty(awh_sim.state, :rho)
         length(awh_sim.state.rho)
-    elseif isempty(idx_history)
+    elseif isempty(idx_history_full)
         max(low_idx, high_idx)
     else
-        max(high_idx, maximum(idx_history))
+        max(high_idx, maximum(idx_history_full))
     end
-    occupancies = state_occupancy_fractions(idx_history, n_states, FT)
+    occupancies = state_occupancy_fractions(idx_history_recent, n_states, FT)
+    valid_endpoint_state_idxs = sort(unique(filter(idx -> 1 <= idx <= length(occupancies), isempty(endpoint_state_idxs) ? [high_idx] : endpoint_state_idxs)))
+    endpoint_high = isempty(valid_endpoint_state_idxs) ? zero(FT) : sum(occupancies[valid_endpoint_state_idxs])
+    endpoint_high_required = max(endpoint_min_fraction * FT(max(1, length(valid_endpoint_state_idxs))), endpoint_high_min_fraction_abs)
+    endpoint_ready = endpoint_low >= endpoint_min_fraction && endpoint_high >= endpoint_high_required
     low_occupancy_threshold = FT(0.01)
     min_state_occupancy = isempty(occupancies) ? zero(FT) : minimum(occupancies)
     low_occupancy_states = findall(x -> x < low_occupancy_threshold, occupancies)
-    residence_summary = residence_length_summary(idx_history, FT)
+    valid_tail_state_idxs = sort(unique(filter(idx -> 1 <= idx <= length(occupancies), tail_state_idxs)))
+    tail_occupancy = isempty(valid_tail_state_idxs) ? zero(FT) : sum(occupancies[valid_tail_state_idxs])
+    tail_min_state_occupancy = isempty(valid_tail_state_idxs) ? one(FT) : minimum(occupancies[valid_tail_state_idxs])
+    tail_low_occupancy_states = isempty(valid_tail_state_idxs) ? Int[] : [
+        idx for idx in valid_tail_state_idxs if occupancies[idx] < tail_min_state_occupancy_floor
+    ]
+    tail_ready = isempty(valid_tail_state_idxs) || tail_min_state_occupancy >= tail_min_state_occupancy_floor
+    residence_summary = residence_length_summary(idx_history_recent, FT)
 
-    ready = df_ready && lambda_ess_ready && round_trip_ready && endpoint_ready
+    ready = df_ready && lambda_ess_ready && round_trip_ready && endpoint_ready && tail_ready
     return (
         ready = ready,
         df_ready = df_ready,
@@ -487,10 +519,16 @@ function evaluate_stage_a_readiness(
         round_trip_ready = round_trip_ready,
         endpoint_low = endpoint_low,
         endpoint_high = endpoint_high,
+        endpoint_high_required = endpoint_high_required,
         endpoint_ready = endpoint_ready,
+        tail_occupancy = tail_occupancy,
+        tail_min_state_occupancy = tail_min_state_occupancy,
+        tail_ready = tail_ready,
+        tail_low_occupancy_states = tail_low_occupancy_states,
         min_state_occupancy = min_state_occupancy,
         low_occupancy_states = low_occupancy_states,
-        n_hist = length(idx_history)
+        n_hist = length(idx_history_full),
+        n_hist_recent = length(idx_history_recent)
     )
 end
 
@@ -665,7 +703,7 @@ end
 """
     stage_b_next_probe_policy(current_probe_steps, base_probe_steps, stats,
                               cooldown_blocks, near_pass_cooldown_blocks,
-                              probe_growth_factor, probe_near_pass_scale,
+                              probe_growth_steps, probe_near_pass_scale,
                               probe_max_factor)
 
 Choose the next probe size and cooldown policy after a Stage B decision.
@@ -676,7 +714,7 @@ function stage_b_next_probe_policy(
     stats::StageBStats,
     cooldown_blocks::Int,
     near_pass_cooldown_blocks::Int,
-    probe_growth_factor::FT,
+    probe_growth_steps::Int,
     probe_near_pass_scale::FT,
     probe_max_factor::FT,
 ) where {FT <: AbstractFloat}
@@ -697,12 +735,23 @@ function stage_b_next_probe_policy(
         )
     end
 
-    if stats.failure_mode in (:low_support, :split, :raw_parity, :supported_parity, :endpoint_parity)
-        grown_steps = max(current_steps, Int(ceil(current_steps * max(one(FT), probe_growth_factor))))
+    # Sampling errors: Grow the probe to increase precision.
+    if stats.failure_mode in (:low_support, :split)
+        grown_steps = current_steps + probe_growth_steps
         return (
             next_probe_steps=clamp(grown_steps, 1, max_steps),
             cooldown_blocks=max(0, cooldown_blocks),
-            policy=:grow,
+            policy=:grow_sampling,
+        )
+    end
+
+    # Bias errors: Do NOT grow the probe. Stay at current size and let Stage A growth
+    # (triggered by failed=true) fix the bias.
+    if stats.failure_mode in (:raw_parity, :supported_parity, :endpoint_parity)
+        return (
+            next_probe_steps=current_steps,
+            cooldown_blocks=max(0, cooldown_blocks),
+            policy=:stay_bias_error,
         )
     end
 
@@ -722,24 +771,53 @@ Evaluate Stage B split-half and MBAR/AWH parity checks for an arbitrary probe
 dataset.
 """
 function compute_stage_b_split_parity(
-    energies::Matrix{FT},
-    log_mixture_denom::Vector{FT},
-    F_awh_profile::Vector{FT},
+    energies::AbstractMatrix{ET},
+    log_mixture_denom::AbstractVector{DT},
+    F_awh_profile::AbstractVector{ATW},
     coupled_state_idx::Int,
     decoupled_state_idx::Int,
-    beta::FT,
-    awh_split_tol_kT::FT,
-    awh_parity_tol_kT::FT;
-    volumes::Vector{FT}=FT[],
-    P0_energy_per_vol::FT=zero(FT),
+    beta::BT,
+    awh_split_tol_kT::ST,
+    awh_parity_tol_kT::PTT;
+    volumes::AbstractVector{VT}=BT[],
+    P0_energy_per_vol::PV=zero(BT),
     parity_diag_top_k::Int=3,
     parity_gate_mode::Symbol=:support_aware_max,
-    parity_support_threshold::FT=zero(FT),
-    parity_near_pass_factor::FT=FT(2),
+    parity_support_threshold::SP=zero(BT),
+    parity_near_pass_factor::NP=BT(2),
     support_allow_missing::Int=0,
-) where {FT <: AbstractFloat}
+) where {
+    ET <: AbstractFloat,
+    DT <: AbstractFloat,
+    ATW <: AbstractFloat,
+    BT <: AbstractFloat,
+    ST <: AbstractFloat,
+    PTT <: AbstractFloat,
+    VT <: AbstractFloat,
+    PV <: AbstractFloat,
+    SP <: AbstractFloat,
+    NP <: AbstractFloat,
+}
     gate_mode = validate_stage_b_parity_gate_mode(parity_gate_mode)
     n_frames, n_states = size(energies)
+    AT = promote_energy_analysis_type(
+        energies,
+        log_mixture_denom,
+        F_awh_profile,
+        beta,
+        awh_split_tol_kT,
+        awh_parity_tol_kT,
+        volumes,
+        P0_energy_per_vol,
+        parity_support_threshold,
+        parity_near_pass_factor,
+    )
+    beta_AT = AT(beta)
+    split_tol_AT = AT(awh_split_tol_kT)
+    parity_tol_AT = AT(awh_parity_tol_kT)
+    P0_AT = AT(P0_energy_per_vol)
+    parity_support_threshold_AT = AT(parity_support_threshold)
+    parity_near_pass_factor_AT = AT(parity_near_pass_factor)
     if n_states == 0
         throw(ArgumentError("compute_stage_b_split_parity received an empty state dimension."))
     end
@@ -765,22 +843,22 @@ function compute_stage_b_split_parity(
         return (
             ready = false,
             split_ready = false,
-            split_gap = FT(Inf),
+            split_gap = AT(Inf),
             parity_ready = false,
-            parity_gap = FT(Inf),
-            raw_parity_gap = FT(Inf),
-            supported_parity_gap = FT(Inf),
-            endpoint_parity_gap = FT(Inf),
+            parity_gap = AT(Inf),
+            raw_parity_gap = AT(Inf),
+            supported_parity_gap = AT(Inf),
+            endpoint_parity_gap = AT(Inf),
             endpoint_parity_ready = false,
             n_frames = n_frames,
-            dG_half_1 = FT(NaN),
-            dG_half_2 = FT(NaN),
+            dG_half_1 = AT(NaN),
+            dG_half_2 = AT(NaN),
             diagnostics = "insufficient frames for split/parity (n_frames=$n_frames)",
             parity_worst_state_idx = 0,
-            parity_worst_state_residual = FT(NaN),
+            parity_worst_state_residual = AT(NaN),
             parity_top_state_idxs = Int[],
             n_supported_states = 0,
-            support_threshold = parity_support_threshold,
+            support_threshold = parity_support_threshold_AT,
             support_coverage_ready = false,
             required_supported_states = required_supported_states,
             failure_mode = :not_checked,
@@ -793,22 +871,22 @@ function compute_stage_b_split_parity(
         return (
             ready = false,
             split_ready = false,
-            split_gap = FT(Inf),
+            split_gap = AT(Inf),
             parity_ready = false,
-            parity_gap = FT(Inf),
-            raw_parity_gap = FT(Inf),
-            supported_parity_gap = FT(Inf),
-            endpoint_parity_gap = FT(Inf),
+            parity_gap = AT(Inf),
+            raw_parity_gap = AT(Inf),
+            supported_parity_gap = AT(Inf),
+            endpoint_parity_gap = AT(Inf),
             endpoint_parity_ready = false,
             n_frames = n_frames,
-            dG_half_1 = FT(NaN),
-            dG_half_2 = FT(NaN),
+            dG_half_1 = AT(NaN),
+            dG_half_2 = AT(NaN),
             diagnostics = "empty split ranges (n_frames=$n_frames)",
             parity_worst_state_idx = 0,
-            parity_worst_state_residual = FT(NaN),
+            parity_worst_state_residual = AT(NaN),
             parity_top_state_idxs = Int[],
             n_supported_states = 0,
-            support_threshold = parity_support_threshold,
+            support_threshold = parity_support_threshold_AT,
             support_coverage_ready = false,
             required_supported_states = required_supported_states,
             failure_mode = :not_checked,
@@ -816,58 +894,58 @@ function compute_stage_b_split_parity(
         )
     end
 
-    volumes_half_1 = isempty(volumes) ? FT[] : volumes[half_1]
-    volumes_half_2 = isempty(volumes) ? FT[] : volumes[half_2]
-    volumes_full = isempty(volumes) ? FT[] : volumes
+    volumes_half_1 = isempty(volumes) ? AT[] : AT.(volumes[half_1])
+    volumes_half_2 = isempty(volumes) ? AT[] : AT.(volumes[half_2])
+    volumes_full = isempty(volumes) ? AT[] : AT.(volumes)
 
     F_half_1 = compute_full_mbar_profile_from_log_mixture_denom(
         energies[half_1, :],
         log_mixture_denom[half_1],
-        beta;
+        beta_AT;
         volumes=volumes_half_1,
-        P0_energy_per_vol=P0_energy_per_vol,
+        P0_energy_per_vol=P0_AT,
     )
     F_half_2 = compute_full_mbar_profile_from_log_mixture_denom(
         energies[half_2, :],
         log_mixture_denom[half_2],
-        beta;
+        beta_AT;
         volumes=volumes_half_2,
-        P0_energy_per_vol=P0_energy_per_vol,
+        P0_energy_per_vol=P0_AT,
     )
     dG_half_1 = F_half_1[coupled_state_idx] - F_half_1[decoupled_state_idx]
     dG_half_2 = F_half_2[coupled_state_idx] - F_half_2[decoupled_state_idx]
 
     split_gap = abs(dG_half_1 - dG_half_2)
-    split_ready = split_gap <= awh_split_tol_kT
+    split_ready = split_gap <= split_tol_AT
 
     F_mbar_profile = compute_full_mbar_profile_from_log_mixture_denom(
         energies,
         log_mixture_denom,
-        beta;
+        beta_AT;
         volumes=volumes_full,
-        P0_energy_per_vol=P0_energy_per_vol,
+        P0_energy_per_vol=P0_AT,
     )
     F_mbar_aligned = F_mbar_profile .- F_mbar_profile[coupled_state_idx]
-    F_awh_aligned = F_awh_profile .- F_awh_profile[coupled_state_idx]
+    F_awh_aligned = AT.(F_awh_profile) .- AT(F_awh_profile[coupled_state_idx])
     parity_residual = F_mbar_aligned .- F_awh_aligned
     raw_parity_gap = maximum(abs.(parity_residual))
 
     ess_by_state = compute_state_reweighting_ess_from_log_mixture_denom(
         energies,
         log_mixture_denom,
-        beta;
+        beta_AT;
         volumes=volumes_full,
-        P0_energy_per_vol=P0_energy_per_vol,
+        P0_energy_per_vol=P0_AT,
     )
-    support_threshold = max(zero(FT), parity_support_threshold)
+    support_threshold = max(zero(AT), parity_support_threshold_AT)
     support_mask = ess_by_state .>= support_threshold
     n_supported_states = count(support_mask)
     support_coverage_ready = n_supported_states >= required_supported_states
-    supported_parity_gap = n_supported_states > 0 ? maximum(abs.(parity_residual[support_mask])) : FT(Inf)
+    supported_parity_gap = n_supported_states > 0 ? maximum(abs.(parity_residual[support_mask])) : AT(Inf)
 
     endpoint_idxs = unique([coupled_state_idx, decoupled_state_idx])
     endpoint_parity_gap = maximum(abs.(parity_residual[endpoint_idxs]))
-    endpoint_parity_ready = endpoint_parity_gap <= awh_parity_tol_kT
+    endpoint_parity_ready = endpoint_parity_gap <= parity_tol_AT
     endpoint_worst_local_idx = argmax(abs.(parity_residual[endpoint_idxs]))
     endpoint_worst_idx = endpoint_idxs[endpoint_worst_local_idx]
     endpoint_worst_residual = parity_residual[endpoint_worst_idx]
@@ -878,14 +956,14 @@ function compute_stage_b_split_parity(
         max(supported_parity_gap, endpoint_parity_gap)
     end
 
-    supported_parity_ready = n_supported_states > 0 && supported_parity_gap <= awh_parity_tol_kT
+    supported_parity_ready = n_supported_states > 0 && supported_parity_gap <= parity_tol_AT
     parity_ready_core = if gate_mode == :raw_max
-        raw_parity_gap <= awh_parity_tol_kT
+        raw_parity_gap <= parity_tol_AT
     else
         support_coverage_ready && supported_parity_ready
     end
     parity_ready = parity_ready_core && endpoint_parity_ready
-    passed_raw_only = gate_mode == :support_aware_max && parity_ready && raw_parity_gap > awh_parity_tol_kT
+    passed_raw_only = gate_mode == :support_aware_max && parity_ready && raw_parity_gap > parity_tol_AT
 
     diagnostics, parity_worst_state_idx, parity_worst_state_residual, parity_top_state_idxs = summarize_stage_b_parity_gate(
         parity_residual,
@@ -899,7 +977,7 @@ function compute_stage_b_split_parity(
     diagnostics *= " | endpoint_worst=λ$(endpoint_worst_idx) Δ=$(round(endpoint_worst_residual, digits=4))"
     diagnostics *= " | gate=$(gate_mode) raw=$(round(raw_parity_gap, digits=4)) endpoint=$(round(endpoint_parity_gap, digits=4)) effective=$(round(parity_gap, digits=4)) effective_source=$(effective_source)"
 
-    near_pass_threshold = awh_parity_tol_kT * max(one(FT), parity_near_pass_factor)
+    near_pass_threshold = parity_tol_AT * max(one(AT), parity_near_pass_factor_AT)
     near_pass = !parity_ready && !passed_raw_only && split_ready && endpoint_parity_ready && support_coverage_ready && supported_parity_gap <= near_pass_threshold
 
     failure_mode = if !split_ready
@@ -933,6 +1011,7 @@ function compute_stage_b_split_parity(
         parity_worst_state_idx = parity_worst_state_idx,
         parity_worst_state_residual = parity_worst_state_residual,
         parity_top_state_idxs = parity_top_state_idxs,
+        parity_residual = parity_residual,
         n_supported_states = n_supported_states,
         support_threshold = support_threshold,
         support_coverage_ready = support_coverage_ready,
@@ -960,42 +1039,60 @@ function run_stage_b_probe(
     idxs,
     coupled_state_idx::Int,
     decoupled_state_idx::Int,
-    beta::FT,
-    awh_split_tol_kT::FT,
-    awh_parity_tol_kT::FT;
+    beta::BT,
+    awh_split_tol_kT::ST,
+    awh_parity_tol_kT::PTT;
     md_steps_probe::Int,
     leg_name::String,
     probe_num_md_steps::Union{Nothing, Int}=nothing,
     include_pv::Bool=false,
-    P0_energy_per_vol::FT=zero(FT),
+    P0_energy_per_vol::PV=zero(BT),
     probe_frame_stride::Int=1,
     probe_min_frames::Int=2,
     probe_max_frames::Int=0,
     awh_probe_discard_fraction::Real=0.0,
     parity_gate_mode::Symbol=:support_aware_max,
-    parity_support_threshold::FT=zero(FT),
-    parity_near_pass_factor::FT=FT(2),
+    parity_support_threshold::SP=zero(BT),
+    parity_near_pass_factor::NP=BT(2),
     support_allow_missing::Int=0,
-) where {FT <: AbstractFloat}
+    probe_tail_state_idxs::Vector{Int}=Int[],
+    probe_tail_min_state_occupancy_floor::FT=zero(FT),
+) where {
+    FT <: AbstractFloat,
+    BT <: AbstractFloat,
+    ST <: AbstractFloat,
+    PTT <: AbstractFloat,
+    PV <: AbstractFloat,
+    SP <: AbstractFloat,
+    NP <: AbstractFloat,
+}
+    ET = promote_energy_analysis_type(
+        beta,
+        awh_split_tol_kT,
+        awh_parity_tol_kT,
+        P0_energy_per_vol,
+        parity_support_threshold,
+        parity_near_pass_factor,
+    )
     if md_steps_probe <= 0
         @info "Stage B ($(leg_name)) skipped: md_steps_probe <= 0 (md_steps_probe=$md_steps_probe)."
         return (
             ready = false,
             split_ready = false,
-            split_gap = FT(Inf),
+            split_gap = ET(Inf),
             parity_ready = false,
-            parity_gap = FT(Inf),
+            parity_gap = ET(Inf),
             n_frames = 0,
-            dG_half_1 = FT(NaN),
-            dG_half_2 = FT(NaN),
+            dG_half_1 = ET(NaN),
+            dG_half_2 = ET(NaN),
             diagnostics = "",
             parity_worst_state_idx = 0,
-            parity_worst_state_residual = FT(NaN),
+            parity_worst_state_residual = ET(NaN),
             support_coverage_ready = false,
             required_supported_states = 0,
-            probe_energies = zeros(FT, 0, 0),
-            probe_log_mixture_denom = FT[],
-            probe_volumes = FT[],
+            probe_energies = zeros(ET, 0, 0),
+            probe_log_mixture_denom = ET[],
+            probe_volumes = ET[],
         )
     end
 
@@ -1019,20 +1116,20 @@ function run_stage_b_probe(
         return (
             ready = false,
             split_ready = false,
-            split_gap = FT(Inf),
+            split_gap = ET(Inf),
             parity_ready = false,
-            parity_gap = FT(Inf),
+            parity_gap = ET(Inf),
             n_frames = n_frames_raw,
-            dG_half_1 = FT(NaN),
-            dG_half_2 = FT(NaN),
+            dG_half_1 = ET(NaN),
+            dG_half_2 = ET(NaN),
             diagnostics = "",
             parity_worst_state_idx = 0,
-            parity_worst_state_residual = FT(NaN),
+            parity_worst_state_residual = ET(NaN),
             support_coverage_ready = false,
             required_supported_states = 0,
-            probe_energies = zeros(FT, 0, 0),
-            probe_log_mixture_denom = FT[],
-            probe_volumes = FT[],
+            probe_energies = zeros(ET, 0, 0),
+            probe_log_mixture_denom = ET[],
+            probe_volumes = ET[],
         )
     end
 
@@ -1053,20 +1150,20 @@ function run_stage_b_probe(
         return (
             ready = false,
             split_ready = false,
-            split_gap = FT(Inf),
+            split_gap = ET(Inf),
             parity_ready = false,
-            parity_gap = FT(Inf),
+            parity_gap = ET(Inf),
             n_frames = n_frames,
-            dG_half_1 = FT(NaN),
-            dG_half_2 = FT(NaN),
+            dG_half_1 = ET(NaN),
+            dG_half_2 = ET(NaN),
             diagnostics = "",
             parity_worst_state_idx = 0,
-            parity_worst_state_residual = FT(NaN),
+            parity_worst_state_residual = ET(NaN),
             support_coverage_ready = false,
             required_supported_states = 0,
-            probe_energies = zeros(FT, 0, 0),
-            probe_log_mixture_denom = FT[],
-            probe_volumes = FT[],
+            probe_energies = zeros(ET, 0, 0),
+            probe_log_mixture_denom = ET[],
+            probe_volumes = ET[],
         )
     end
 
@@ -1090,7 +1187,7 @@ function run_stage_b_probe(
     # must use the fixed log-weights g_ref = f_ref + logρ_ref in the mixture
     # denominator, matching `process_sample` in Molly's AWH implementation.
     log_gibbs_weights = awh_log_gibbs_weights(bias_data)
-    volumes_probe = include_pv ? FT.(ustrip.(logger_probe.volume_history)) : FT[]
+    volumes_probe = include_pv ? ET.(ustrip.(logger_probe.volume_history)) : ET[]
     log_mixture_denom = include_pv ?
         reference_log_mixture_denominator(
             u_probe_ref,
@@ -1116,7 +1213,7 @@ function run_stage_b_probe(
             awh_split_tol_kT,
             awh_parity_tol_kT,
             volumes=volumes_probe,
-            P0_energy_per_vol=include_pv ? P0_energy_per_vol : zero(FT),
+            P0_energy_per_vol=include_pv ? P0_energy_per_vol : zero(ET),
             parity_gate_mode=parity_gate_mode,
             parity_support_threshold=parity_support_threshold,
             parity_near_pass_factor=parity_near_pass_factor,
@@ -1133,17 +1230,40 @@ function run_stage_b_probe(
     parity_ready = split_parity.parity_ready
     probe_residence = residence_length_summary(logger_probe.active_idx_history, FT)
     probe_occupancies = state_occupancy_fractions(logger_probe.active_idx_history, size(u_probe_ref, 2), FT)
+    probe_endpoint_low, probe_endpoint_high = endpoint_occupancy_fractions(
+        logger_probe.active_idx_history,
+        coupled_state_idx,
+        decoupled_state_idx,
+    )
     hotspot_occ_entries = String[]
     for idx in split_parity.parity_top_state_idxs
         if 1 <= idx <= length(probe_occupancies)
             push!(hotspot_occ_entries, "λ$(idx)=$(round(probe_occupancies[idx], digits=4))")
         end
     end
+    valid_tail_state_idxs = sort(unique(filter(idx -> 1 <= idx <= length(probe_occupancies), probe_tail_state_idxs)))
+    tail_occupancy = isempty(valid_tail_state_idxs) ? zero(FT) : sum(probe_occupancies[valid_tail_state_idxs])
+    tail_min_state_occupancy = isempty(valid_tail_state_idxs) ? zero(FT) : minimum(probe_occupancies[valid_tail_state_idxs])
+    tail_low_occupancy_states = isempty(valid_tail_state_idxs) ? Int[] : [
+        idx for idx in valid_tail_state_idxs if probe_occupancies[idx] < probe_tail_min_state_occupancy_floor
+    ]
+    parity_residual = hasproperty(split_parity, :parity_residual) ? split_parity.parity_residual : ET[]
+    tail_residual_entries = isempty(valid_tail_state_idxs) || isempty(parity_residual) ? String[] : [
+        "λ$(idx)=$(round(parity_residual[idx], digits=4))" for idx in valid_tail_state_idxs
+    ]
     diagnostics = split_parity.diagnostics *
         " | probe_switches=$(probe_residence.switch_count)" *
         " | probe_dwell_samples=(mean=$(round(probe_residence.mean_residence, digits=2)), med=$(round(probe_residence.median_residence, digits=2)))"
     if !isempty(hotspot_occ_entries)
         diagnostics *= " | probe_occ=[" * join(hotspot_occ_entries, "; ") * "]"
+    end
+    diagnostics *= " | probe_endpt=(low=$(round(probe_endpoint_low, digits=4)), high=$(round(probe_endpoint_high, digits=4)))"
+    if !isempty(valid_tail_state_idxs)
+        tail_low_msg = isempty(tail_low_occupancy_states) ? "-" : join(["λ$(idx)" for idx in tail_low_occupancy_states], ",")
+        diagnostics *= " | probe_tail=(total=$(round(tail_occupancy, digits=4)), min=$(round(tail_min_state_occupancy, digits=4)), low=$tail_low_msg)"
+    end
+    if !isempty(tail_residual_entries)
+        diagnostics *= " | tail_resid=[" * join(tail_residual_entries, "; ") * "]"
     end
     parity_worst_state_idx = split_parity.parity_worst_state_idx
     parity_worst_state_residual = split_parity.parity_worst_state_residual

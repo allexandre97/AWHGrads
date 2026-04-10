@@ -20,10 +20,10 @@ reference energies and optional `pV` term.
 """
 function compute_leg_weights_and_ess(
     leg::LegArtifacts,
-    energies_current::Matrix{FT},
-    beta_val::FT,
-    volumes::Vector{FT},
-) where {FT <: AbstractFloat}
+    energies_current::AbstractMatrix{ET},
+    beta_val::BT,
+    volumes::AbstractVector{VT},
+) where {ET <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat}
     idx_history = leg.logger_prod.active_idx_history
     if leg.include_pv
         return compute_weights_and_ess(
@@ -32,7 +32,7 @@ function compute_leg_weights_and_ess(
             idx_history,
             beta_val,
             volumes,
-            FT(leg.p0_energy_per_vol),
+            leg.p0_energy_per_vol,
         )
     end
     return compute_weights_and_ess(
@@ -55,12 +55,12 @@ the trainable `ϕ` parameters.
 function compute_leg_endpoint_state(
     leg::LegArtifacts,
     trainable_param_names::Vector{String},
-    gradients_phi::Dict{String, Matrix{FT}},
-    energies_current::Matrix{FT},
-    beta_val::FT,
-    volumes::Vector{FT};
+    gradients_phi,
+    energies_current::AbstractMatrix{ET},
+    beta_val::BT,
+    volumes::AbstractVector{VT};
     compute_gradients::Bool=true,
-) where {FT <: AbstractFloat}
+) where {ET <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat}
     idx_history = leg.logger_prod.active_idx_history
     # Endpoint MBAR conditions on arbitrary λ targets, so the denominator must
     # use Molly's fixed AWH Gibbs log-weights g_ref = f_ref + logρ_ref.
@@ -77,7 +77,7 @@ function compute_leg_endpoint_state(
             beta_val,
             log_gibbs_weights,
             volumes,
-            FT(leg.p0_energy_per_vol);
+            leg.p0_energy_per_vol;
             compute_gradients=compute_gradients,
         )
         grad_F_0, F_0 = compute_global_endpoint_gradients(
@@ -90,7 +90,7 @@ function compute_leg_endpoint_state(
             beta_val,
             log_gibbs_weights,
             volumes,
-            FT(leg.p0_energy_per_vol);
+            leg.p0_energy_per_vol;
             compute_gradients=compute_gradients,
         )
     else
@@ -131,25 +131,13 @@ end
 
 
 """
-    optimization_block_key(param_name)
-
-Recover the atom-type label used to group solute-only optimization into smaller
-`σ`/`ϵ` blocks. Nonstandard parameter names fall back to their full name.
-"""
-function optimization_block_key(param_name::AbstractString)
-    match_data = match(r"^atom_(.+)_(σ|ϵ)$", param_name)
-    return isnothing(match_data) ? String(param_name) : String(match_data.captures[1])
-end
-
-
-"""
     optimization_active_blocks(param_names, trainable_param_indices,
                                trainable_position_map, solute_param_indices,
                                solvent_param_indices, optimize_solvent)
 
 Build the ordered list of parameter blocks visited by the inner optimization
-loop. When `optimize_solvent=false`, the solute block is split by atom type to
-reduce Fisher ill-conditioning and overly aggressive clipping.
+loop. When `optimize_solvent=false`, the full trainable solute vector is
+updated together.
 """
 function optimization_active_blocks(
     param_names::Vector{String},
@@ -180,29 +168,17 @@ function optimization_active_blocks(
             )
         end
     else
-        grouped_indices = Dict{String, Vector{Int}}()
-        block_order = String[]
-        for idx_global in trainable_param_indices
-            block_key = optimization_block_key(param_names[idx_global])
-            if !haskey(grouped_indices, block_key)
-                grouped_indices[block_key] = Int[]
-                push!(block_order, block_key)
-            end
-            push!(grouped_indices[block_key], idx_global)
-        end
-        for block_key in block_order
-            global_indices = grouped_indices[block_key]
-            trainable_indices = [trainable_position_map[idx] for idx in global_indices]
-            push!(
-                blocks,
-                OptimizationBlock(
-                    name="Solute[$block_key]",
-                    kind=:solute,
-                    global_indices=global_indices,
-                    trainable_indices=trainable_indices,
-                ),
-            )
-        end
+        global_indices = [idx for idx in trainable_param_indices if haskey(trainable_position_map, idx)]
+        trainable_indices = [trainable_position_map[idx] for idx in global_indices]
+        isempty(global_indices) || push!(
+            blocks,
+            OptimizationBlock(
+                name="Solute",
+                kind=:solute,
+                global_indices=global_indices,
+                trainable_indices=trainable_indices,
+            ),
+        )
     end
 
     isempty(blocks) && throw(ArgumentError("No optimization blocks were constructed."))
@@ -210,17 +186,45 @@ function optimization_active_blocks(
 end
 
 
-line_search_noise_tolerance(error_residual::FT, tolerance_fraction::FT) where {FT <: AbstractFloat} =
-    tolerance_fraction * abs(error_residual)
+function line_search_noise_tolerance(
+    error_residual::RT,
+    tolerance_fraction::TT,
+) where {RT <: AbstractFloat, TT <: AbstractFloat}
+    AT = promote_energy_analysis_type(error_residual, tolerance_fraction)
+    return AT(tolerance_fraction) * abs(AT(error_residual))
+end
 
 
 function line_search_residual_acceptable(
-    error_residual::FT,
-    error_residual_prop::FT,
-    tolerance_fraction::FT,
-) where {FT <: AbstractFloat}
+    error_residual::RT,
+    error_residual_prop::PT,
+    tolerance_fraction::TT,
+) where {RT <: AbstractFloat, PT <: AbstractFloat, TT <: AbstractFloat}
     noise_tolerance = line_search_noise_tolerance(error_residual, tolerance_fraction)
-    return abs(error_residual_prop) <= abs(error_residual) + noise_tolerance
+    AT = promote_energy_analysis_type(error_residual, error_residual_prop, tolerance_fraction)
+    return abs(AT(error_residual_prop)) <= abs(AT(error_residual)) + noise_tolerance
+end
+
+function optimization_analysis_type(
+    leg_artifacts::Vector{LegArtifacts},
+    ::Type{FT},
+    beta_val::BT,
+    dG_std_corr::DT,
+    dG_exp::ET,
+) where {FT <: AbstractFloat, BT <: AbstractFloat, DT <: AbstractFloat, ET <: AbstractFloat}
+    AT = promote_energy_analysis_type(FT, beta_val, dG_std_corr, dG_exp)
+    for leg in leg_artifacts
+        if leg.u_ref !== nothing
+            AT = promote_type(AT, eltype(leg.u_ref))
+        end
+        if leg.active_bias !== nothing
+            AT = promote_type(AT, eltype(awh_log_gibbs_weights(leg.active_bias)))
+        end
+        if leg.include_pv
+            AT = promote_type(AT, typeof(leg.p0_energy_per_vol))
+        end
+    end
+    return AT
 end
 
 
@@ -249,11 +253,11 @@ function run_optimization_phase!(
     theta_min::Vector{FT},
     theta_max::Vector{FT},
     phi_0::Vector{FT},
-    beta_val::FT,
-    dG_std_corr::FT,
-    dG_exp::FT,
+    beta_val::BT,
+    dG_std_corr::DT,
+    dG_exp::ETD,
     opt_cfg::OptimizationConfig,
-) where {FT <: AbstractFloat}
+) where {FT <: AbstractFloat, BT <: AbstractFloat, DT <: AbstractFloat, ETD <: AbstractFloat}
     if isempty(leg_artifacts)
         throw(ArgumentError("run_optimization_phase! requires at least one leg artifact."))
     end
@@ -264,8 +268,10 @@ function run_optimization_phase!(
         throw(ArgumentError("OptimizationConfig.max_inner_epochs must be positive."))
     end
 
-    theoretical_ess_ratio = exp(FT(-2.0) * opt_cfg.kl_target)
-    ess_threshold_ratio = opt_cfg.ess_threshold_scale * theoretical_ess_ratio
+    AT = optimization_analysis_type(leg_artifacts, FT, beta_val, dG_std_corr, dG_exp)
+
+    theoretical_ess_ratio = exp(AT(-2.0) * AT(opt_cfg.kl_target))
+    ess_threshold_ratio = AT(opt_cfg.ess_threshold_scale) * theoretical_ess_ratio
     active_blocks = optimization_active_blocks(
         param_names,
         trainable_param_indices,
@@ -275,23 +281,23 @@ function run_optimization_phase!(
         opt_cfg.optimize_solvent,
     )
 
-    ess_thresholds = Dict{Symbol, FT}()
-    N_base = Dict{Symbol, FT}()
+    ess_thresholds = Dict{Symbol, AT}()
+    N_base = Dict{Symbol, AT}()
     for leg in leg_artifacts
-        M_leg = FT(length(leg.logger_prod.active_idx_history))
-        if M_leg <= zero(FT)
+        M_leg = AT(length(leg.logger_prod.active_idx_history))
+        if M_leg <= zero(AT)
             throw(ArgumentError("Leg $(leg.name) has no production frames."))
         end
         ess_thresholds[leg.name] = M_leg * ess_threshold_ratio
-        N_base[leg.name] = FT(leg.awh_prod.initial_sampl_n + leg.awh_prod.state.N_eff)
+        N_base[leg.name] = AT(leg.awh_prod.initial_sampl_n + leg.awh_prod.state.N_eff)
     end
 
     tiny_alpha_hits = 0
     phase2_exit_reason = :running
-    macro_start_residual = FT(NaN)
-    macro_end_residual = FT(NaN)
-    best_macro_abs_residual = FT(Inf)
-    best_macro_residual = FT(NaN)
+    macro_start_residual = AT(NaN)
+    macro_end_residual = AT(NaN)
+    best_macro_abs_residual = AT(Inf)
+    best_macro_residual = AT(NaN)
     best_macro_epoch = 0
     phi_best_macro = copy(phi_active)
     theta_best_macro = copy(theta_active)
@@ -313,15 +319,15 @@ function run_optimization_phase!(
 
         chain_rule_multiplier = get_chain_rule_multiplier(theta_active, theta_min, theta_max, opt_cfg.k_sigmoid)
 
-        fim_joint = zeros(FT, length(trainable_param_names), length(trainable_param_names))
-        grad_cycle = zeros(FT, length(trainable_param_names))
-        dG_pred = dG_std_corr
+        fim_joint = zeros(AT, length(trainable_param_names), length(trainable_param_names))
+        grad_cycle = zeros(AT, length(trainable_param_names))
+        dG_pred = AT(dG_std_corr)
 
-        ess_current = Dict{Symbol, FT}()
-        N_active = Dict{Symbol, FT}()
-        leg_dG_current = Dict{Symbol, FT}()
+        ess_current = Dict{Symbol, AT}()
+        N_active = Dict{Symbol, AT}()
+        leg_dG_current = Dict{Symbol, AT}()
         leg_grads_phi = Dict{Symbol, Dict{String, Matrix{FT}}}()
-        leg_volumes_cache = Dict{Symbol, Vector{FT}}()
+        leg_volumes_cache = Dict{Symbol, Vector{AT}}()
 
         ess_threshold_broken = false
 
@@ -344,11 +350,11 @@ function run_optimization_phase!(
                 grads_eval_phi[p_key] = grads_eval_theta[p_key] .* chain_rule_multiplier[i]
             end
 
-            volumes = leg_volumes(leg, FT)
+            volumes = leg_volumes(leg, AT)
             _, ess_leg = compute_leg_weights_and_ess(leg, u_eval, beta_val, volumes)
             ess_current[leg.name] = ess_leg
 
-            M_leg = FT(length(leg.logger_prod.active_idx_history))
+            M_leg = AT(length(leg.logger_prod.active_idx_history))
             N_active[leg.name] = N_base[leg.name] * (ess_leg / M_leg)
 
             if ess_leg < ess_thresholds[leg.name]
@@ -376,7 +382,7 @@ function run_optimization_phase!(
                 compute_gradients=true,
             )
 
-            coeff = FT(leg.coefficient)
+            coeff = AT(leg.coefficient)
             grad_cycle .+= coeff .* grad_dG_leg
             dG_pred += coeff * dG_leg
 
@@ -396,15 +402,15 @@ function run_optimization_phase!(
             macro_start_residual = error_residual
         end
 
-        dL_dE = abs(error_residual) <= opt_cfg.huber_delta ? error_residual : opt_cfg.huber_delta * sign(error_residual)
+        dL_dE = abs(error_residual) <= AT(opt_cfg.huber_delta) ? error_residual : AT(opt_cfg.huber_delta) * sign(error_residual)
         grad_loss = dL_dE .* grad_cycle
 
         grad_loss_active = grad_loss[active_trainable_indices]
         fim_active = fim_joint[active_trainable_indices, active_trainable_indices]
 
         fim_diag = diag(fim_active)
-        variance_threshold = maximum(fim_diag) * FT(1e-5)
-        D_vec = [d > variance_threshold ? FT(1.0) / sqrt(d) : zero(FT) for d in fim_diag]
+        variance_threshold = maximum(fim_diag) * AT(1e-5)
+        D_vec = [d > variance_threshold ? one(AT) / sqrt(d) : zero(AT) for d in fim_diag]
         D_mat = Diagonal(D_vec)
 
         fim_corr = D_mat * fim_active * D_mat
@@ -415,19 +421,19 @@ function run_optimization_phase!(
         decomp = eigen(Symmetric(fim_corr))
         vals, vecs = decomp.values, decomp.vectors
 
-        eigenvalue_tol = maximum(vals) * opt_cfg.eigenvalue_tol_scale
-        inv_vals = [v > eigenvalue_tol ? FT(1.0) / v : zero(FT) for v in vals]
+        eigenvalue_tol = maximum(vals) * AT(opt_cfg.eigenvalue_tol_scale)
+        inv_vals = [v > eigenvalue_tol ? one(AT) / v : zero(AT) for v in vals]
         fim_corr_inv = vecs * Diagonal(inv_vals) * transpose(vecs)
 
         base_step_scaled = fim_corr_inv * grad_loss_scaled
         base_step_active = D_vec .* base_step_scaled
 
-        estimated_KL = FT(0.5) * dot(base_step_active, fim_active * base_step_active)
-        if estimated_KL > opt_cfg.kl_target
-            kl_scaling = sqrt(opt_cfg.kl_target / estimated_KL)
+        estimated_KL = AT(0.5) * dot(base_step_active, fim_active * base_step_active)
+        if estimated_KL > AT(opt_cfg.kl_target)
+            kl_scaling = sqrt(AT(opt_cfg.kl_target) / estimated_KL)
             update_direction_active = base_step_active * kl_scaling
         else
-            kl_scaling = FT(1.0)
+            kl_scaling = one(AT)
             update_direction_active = base_step_active
         end
 
@@ -435,7 +441,7 @@ function run_optimization_phase!(
         fim_cond_raw = cond(fim_corr)
 
         max_phi_update = maximum(abs.(update_direction_active))
-        max_allowed_phi_step = block.kind == :solute ? opt_cfg.max_phi_step_solute : opt_cfg.max_phi_step_solvent
+        max_allowed_phi_step = block.kind == :solute ? AT(opt_cfg.max_phi_step_solute) : AT(opt_cfg.max_phi_step_solvent)
 
         if max_phi_update > max_allowed_phi_step
             clip_scaling = max_allowed_phi_step / max_phi_update
@@ -443,19 +449,19 @@ function run_optimization_phase!(
             @info "  [!] Step clipped by infinity-norm (Scaling: $(round(clip_scaling, digits=4)))"
         end
 
-        update_direction_train = zeros(FT, length(trainable_param_indices))
+        update_direction_train = zeros(AT, length(trainable_param_indices))
         update_direction_train[active_trainable_indices] = update_direction_active
-        update_direction = zeros(FT, length(param_names))
+        update_direction = zeros(AT, length(param_names))
         for (i_local, i_global) in enumerate(trainable_param_indices)
             update_direction[i_global] = update_direction_train[i_local]
         end
 
-        alpha = FT(1.0)
+        alpha = one(AT)
         phi_prop = copy(phi_active)
         theta_prop = copy(theta_active)
         line_search_success = false
         accepted_residual = error_residual
-        ess_prop = Dict{Symbol, FT}()
+        ess_prop = Dict{Symbol, AT}()
 
         # Backtracking line search enforces both residual improvement and a
         # minimum effective sample size under the proposed reweighting.
@@ -463,7 +469,7 @@ function run_optimization_phase!(
             phi_prop .= phi_active .- alpha .* update_direction
             theta_prop .= map_phi_to_theta(phi_prop, theta_min, theta_max, phi_0, opt_cfg.k_sigmoid)
 
-            dG_pred_prop = dG_std_corr
+            dG_pred_prop = AT(dG_std_corr)
             ess_ok = true
 
             for leg in leg_artifacts
@@ -494,13 +500,13 @@ function run_optimization_phase!(
                     volumes;
                     compute_gradients=false,
                 )
-                dG_pred_prop += FT(leg.coefficient) * dG_leg_prop
+                dG_pred_prop += AT(leg.coefficient) * dG_leg_prop
             end
 
             error_residual_prop = dG_pred_prop - dG_exp
             ess_msg = join(
                 [
-                    "$(leg.name)=$(round(get(ess_prop, leg.name, zero(FT)), digits=1))"
+                    "$(leg.name)=$(round(get(ess_prop, leg.name, zero(AT)), digits=1))"
                     for leg in leg_artifacts
                 ],
                 " | ",
@@ -510,7 +516,7 @@ function run_optimization_phase!(
             if ess_ok && line_search_residual_acceptable(
                 error_residual,
                 error_residual_prop,
-                FT(opt_cfg.line_search_noise_tolerance_fraction),
+                AT(opt_cfg.line_search_noise_tolerance_fraction),
             )
                 line_search_success = true
                 phi_active .= phi_prop
@@ -519,11 +525,11 @@ function run_optimization_phase!(
                 @info "    -> Line search converged."
                 break
             else
-                alpha *= FT(0.5)
+                alpha *= AT(0.5)
             end
         end
 
-        if alpha <= opt_cfg.tiny_alpha_cutoff
+        if alpha <= AT(opt_cfg.tiny_alpha_cutoff)
             tiny_alpha_hits += 1
         else
             tiny_alpha_hits = 0
@@ -567,7 +573,7 @@ function run_optimization_phase!(
             break
         end
 
-        if !line_search_success || actual_max_phi_step < opt_cfg.min_phi_step
+        if !line_search_success || actual_max_phi_step < AT(opt_cfg.min_phi_step)
             @info "  [!] Line search failed or step vanished. Triggering Phase 3 resimulation."
             phase2_exit_reason = :step_vanish
             break

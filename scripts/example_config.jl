@@ -14,13 +14,14 @@ sim_cfg = AWHGrads.simulation_config_with(
     base_sim;
     device_id=1,
     lambda_schedule=lambda_schedule,
+    nonbonded_energy_type=AWHGrads.default_nonbonded_energy_type(base_sim.FT),
     cycle=custom_cycle,
     solute_idx=1:9,
     force_field=AWHGrads.ForceFieldConfig(
         xml_files=["tip3p_standard.xml", "gaff.xml", "ethanol.xml"],
     ),
     awh_control=AWHGrads.AWHControlConfig(
-        lj_softcore_alpha=0.85,
+        lj_softcore_alpha=1.5,
         coul_softcore_alpha=0.3,
         bias_update_interval_md_steps=1000,
         stats_log_every_updates=1,

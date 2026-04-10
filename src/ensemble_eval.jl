@@ -7,6 +7,32 @@ function steps_to_ns(n_steps::Int)
     return FT(ustrip(u"ns", n_steps * Δt))
 end
 
+function _reconstruct_with_cpu_neighbors(inter)
+    if inter isa LennardJonesSoftCoreBeutler
+        return LennardJonesSoftCoreBeutler(inter.cutoff, inter.α, true, inter.shortcut, inter.σ_mixing, inter.ϵ_mixing, inter.λ_mixing, inter.scheduler, inter.weight_special)
+    elseif inter isa LennardJonesSoftCoreGapsys
+        return LennardJonesSoftCoreGapsys(inter.cutoff, inter.α, true, inter.shortcut, inter.σ_mixing, inter.ϵ_mixing, inter.λ_mixing, inter.scheduler, inter.weight_special)
+    elseif inter isa CoulombSoftCoreBeutler
+        return CoulombSoftCoreBeutler(inter.cutoff, inter.α, true, inter.σ_mixing, inter.ϵ_mixing, inter.λ_mixing, inter.scheduler, inter.weight_special, inter.coulomb_const)
+    elseif inter isa CoulombSoftCoreGapsys
+        return CoulombSoftCoreGapsys(inter.cutoff, inter.α, inter.σQ, true, inter.λ_mixing, inter.scheduler, inter.weight_special, inter.coulomb_const)
+    elseif inter isa CoulombSoftCoreBeutlerReactionField
+        return CoulombSoftCoreBeutlerReactionField(inter.dist_cutoff, inter.solvent_dielectric, inter.α, true, inter.σ_mixing, inter.ϵ_mixing, inter.λ_mixing, inter.scheduler, inter.weight_special, inter.coulomb_const)
+    elseif inter isa CoulombSoftCoreGapsysReactionField
+        return CoulombSoftCoreGapsysReactionField(inter.dist_cutoff, inter.solvent_dielectric, inter.α, inter.σQ, true, inter.λ_mixing, inter.scheduler, inter.weight_special, inter.coulomb_const)
+    elseif inter isa CoulombSoftCoreBeutlerEwald
+        return CoulombSoftCoreBeutlerEwald(inter.dist_cutoff, inter.error_tol, inter.α, true, inter.σ_mixing, inter.ϵ_mixing, inter.λ_mixing, inter.scheduler, inter.weight_special, inter.coulomb_const, inter.α_ewald, inter.approximate_erfc)
+    elseif inter isa CoulombSoftCoreGapsysEwald
+        return CoulombSoftCoreGapsysEwald(inter.dist_cutoff, inter.error_tol, inter.α, inter.σQ, true, inter.λ_mixing, inter.scheduler, inter.weight_special, inter.coulomb_const, inter.α_ewald, inter.approximate_erfc)
+    end
+    return inter
+end
+
+function _fix_interactions_for_cpu(sys::System)
+    new_p_inters = map(_reconstruct_with_cpu_neighbors, sys.pairwise_inters)
+    return System(sys; pairwise_inters=new_p_inters)
+end
+
 """
     precompute_neighbors(logger, sys)
 
@@ -19,13 +45,18 @@ function precompute_neighbors(logger, sys)
     neighbors = []  
     num_frames = length(logger.active_idx_history)  
 
-    for f_idx in 1:num_frames  
-        coords = logger.coords_history[f_idx]  
-        vol    = logger.volume_history[f_idx]  
-        side   = cbrt(ustrip(vol)) * unit(vol)^(1/3)  
-        box    = CubicBoundary(side, side, side)  
+    nf = sys.neighbor_finder
+    for f_idx in 1:num_frames
+        coords = logger.coords_history[f_idx]
+        vol    = logger.volume_history[f_idx]
+        if Molly.has_infinite_boundary(sys.boundary)
+            box = sys.boundary
+        else
+            side = cbrt(ustrip(vol)) * unit(vol)^(1/3)
+            box  = CubicBoundary(side, side, side)
+        end
 
-        sys_temp = System(sys; coords = coords, boundary = box)  
+        sys_temp = System(sys; coords = coords, boundary = box, neighbor_finder = nf)
         nbrs = find_neighbors(sys_temp)  
         push!(neighbors, nbrs)  
     end
@@ -86,37 +117,49 @@ function _evaluate_ensemble_impl(logger, neighbors, awh_sim_prod, sys_base,
     num_lambda = length(awh_sim_prod.state.partition.λ_atoms)  
     num_params = length(params)  
     
-    energies = zeros(FT, num_frames, num_lambda)  
-    gradients_raw = compute_gradients ? [zeros(FT, num_frames, num_lambda) for _ in 1:num_params] : nothing
-    
-    # Each λ window gets a CPU-side template stripped of units so Enzyme sees a
-    # stable, allocation-light function signature.
-    cpu_templates = Vector{System}(undef, num_lambda)  
-    for l in 1:num_lambda  
-        sys_template_gpu = System(
-            sys_base;  
-            atoms = awh_sim_prod.state.partition.λ_atoms[l],  
-            pairwise_inters = awh_sim_prod.state.state_pairwise_inters[l],  
-            specific_inter_lists = awh_sim_prod.state.state_specific_inter_lists[l],  
-            general_inters = awh_sim_prod.state.state_general_inters[l]  
+    # Store the templates still on GPU/in their original state.
+    # We will convert them to CPU for each thread to ensure fresh, thread-safe FFTW plans for PME.
+    raw_templates = Vector{System}(undef, num_lambda)
+    for l in 1:num_lambda
+        raw_templates[l] = System(
+            sys_base;
+            atoms = awh_sim_prod.state.partition.λ_atoms[l],
+            pairwise_inters = awh_sim_prod.state.state_pairwise_inters[l],
+            specific_inter_lists = awh_sim_prod.state.state_specific_inter_lists[l],
+            general_inters = awh_sim_prod.state.state_general_inters[l]
         )
-        sys_cpu = Molly.from_device(sys_template_gpu)  
-        sys_nounits = ustrip(sys_cpu)  
-        cpu_templates[l] = Molly.from_device(sys_nounits)  
     end
 
-    # Thread-local scratch buffers avoid races while keeping the per-frame loop
-    # free of repeated allocations.
-    n_threads = Threads.nthreads()  
-    thread_templates = [deepcopy(cpu_templates) for _ in 1:n_threads]  
-    thread_params    = [deepcopy(params) for _ in 1:n_threads] 
-    thread_grads     = compute_gradients ? [zeros(FT, num_params) for _ in 1:n_threads] : nothing
+    n_threads = Threads.nthreads()
+    # Create unique CPU templates for each thread to ensure thread-safe FFTW plans.
+    # This also applies our interaction fixes (use_neighbors=true for CPU).
+    thread_templates = [Vector{System}(undef, num_lambda) for _ in 1:n_threads]
+    for tid in 1:n_threads
+        for l in 1:num_lambda
+            sys_cpu = Molly.from_device(raw_templates[l])
+            sys_fixed = _fix_interactions_for_cpu(sys_cpu)
+            # Reconstruct with the same nonbonded energy type after stripping units.
+            unitless_sys = ustrip(sys_fixed)
+            thread_templates[tid][l] = System(unitless_sys; nonbonded_energy_type=sys_fixed.nonbonded_energy_type)
+        end
+    end
+
+    energy_type = num_lambda > 0 ? Molly.nonbonded_energy_type(thread_templates[1][1]) : FT
+    energies = zeros(energy_type, num_frames, num_lambda)
+    gradients_raw = compute_gradients ? [zeros(FT, num_frames, num_lambda) for _ in 1:num_params] : nothing
+
+    thread_params = [deepcopy(params) for _ in 1:n_threads] 
+    thread_grads  = compute_gradients ? [zeros(FT, num_params) for _ in 1:n_threads] : nothing
     
     if num_frames > 0 && num_lambda > 0  
         dummy_coords = ustrip.(logger.coords_history[1])  
         dummy_vol = ustrip(logger.volume_history[1])  
-        dummy_side = cbrt(dummy_vol)  
-        dummy_box = CubicBoundary(dummy_side, dummy_side, dummy_side)  
+        if Molly.has_infinite_boundary(sys_base.boundary)
+            dummy_box = sys_base.boundary
+        else
+            dummy_side = cbrt(dummy_vol)  
+            dummy_box = CubicBoundary(dummy_side, dummy_side, dummy_side)  
+        end
         
         for l in 1:num_lambda  
             evaluate_frame_energy(thread_params[1], thread_templates[1][l], dummy_coords, dummy_box, neighbors[1],   
@@ -133,8 +176,12 @@ function _evaluate_ensemble_impl(logger, neighbors, awh_sim_prod, sys_base,
             tid = Threads.threadid()  
             coords = ustrip.(logger.coords_history[k])  
             vol = ustrip(logger.volume_history[k])  
-            side_length = cbrt(vol)  
-            box = CubicBoundary(side_length, side_length, side_length)  
+            if Molly.has_infinite_boundary(sys_base.boundary)
+                box = sys_base.boundary
+            else
+                side_length = cbrt(vol)  
+                box = CubicBoundary(side_length, side_length, side_length)  
+            end
             nbrs = neighbors[k]  
             
             p_local = thread_params[tid]  
@@ -161,7 +208,7 @@ function _evaluate_ensemble_impl(logger, neighbors, awh_sim_prod, sys_base,
         end
         GC.enable(true)
         GC.gc(false)
-    end  
+    end
     
     gradients = Dict{String, Matrix{FT}}()  
     if compute_gradients

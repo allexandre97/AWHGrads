@@ -18,7 +18,7 @@ Collects the low-level AWH and soft-core parameters passed into each
 the linear stage is initialized.
 """
 Base.@kwdef struct AWHControlConfig
-    lj_softcore_alpha::Float64 = 0.85
+    lj_softcore_alpha::Float64 = 1.5
     coul_softcore_alpha::Float64 = 0.3
     reuse_neighbors::Bool = true
     # Lambda-sampling interval in MD steps.
@@ -49,12 +49,14 @@ Base.@kwdef struct ThermodynamicLegConfig
     coefficient::Float64 = 1.0
     is_vacuum::Bool = false
     include_pv::Bool = false
-    probe_time = Float32(0.5)u"ns"
+    probe_time = Float32(3.0)u"ns"
     lambda_schedule::Union{Nothing, Vector{<:Real}} = nothing
     ensemble::Symbol = :npt
     awh_seed_num_md_steps::Union{Nothing, Int} = nothing
     awh_bias_update_interval_md_steps::Union{Nothing, Int} = nothing
+    awh_initial_n_bias::Union{Nothing, Int} = nothing
     probe_awh_seed_num_md_steps::Union{Nothing, Int} = nothing
+    electrostatics_method::Union{Nothing, Symbol} = nothing
     lambda_scheduler::Union{Nothing, Symbol} = nothing
     coulomb_softcore_model::Union{Nothing, Symbol} = nothing
     lj_softcore_model::Union{Nothing, Symbol} = nothing
@@ -117,6 +119,7 @@ Base.@kwdef struct SimulationConfig
     device_id::Int = 1
     FT::DataType = Float32
     AT::Any = CuArray
+    nonbonded_energy_type::Any = default_nonbonded_energy_type(Float32)
 
     # Integrator timestep and thermodynamic state.
     Δt = Float32(1)u"fs"
@@ -195,12 +198,24 @@ Base.@kwdef struct OptimizationConfig
     awh_tail_lag::Int = 10
     awh_min_round_trips::Int = 3
     awh_endpoint_target_ratio = Float32(0.3)
+    awh_solvent_tail_lj_max = Float32(0.3025)
+    awh_solvent_tail_min_state_occupancy = Float32(0.0125)
+    # Optional absolute lower bound for solvent endpoint-band occupancy.
+    awh_solvent_endpoint_min_fraction = Float32(0.0)
+    # Number of recent Stage A blocks used for occupancy-based readiness metrics.
+    awh_stageA_history_blocks::Int = 8
     awh_stageA_stable_blocks::Int = 2
     awh_stageB_cooldown_blocks::Int = 2
     awh_stageB_near_pass_cooldown_blocks::Int = 0
     awh_stageB_probe_growth_factor = Float32(1.5)
     awh_stageB_probe_near_pass_scale = Float32(0.5)
     awh_stageB_probe_max_factor = Float32(4.0)
+    awh_stageB_probe_growth_ns = Float32(2.0)
+
+    awh_min_initial_df_threshold = Float32(0.1)
+    awh_min_initial_state_occupancy = Float32(0.01)
+    awh_stageB_soften_failures_threshold::Int = 3
+    awh_stageB_soften_factor = Float32(0.5)
 
     awh_stageA_streak_growth_factor = Float32(1.5)
     awh_stageB_cooldown_growth_factor = Float32(1.5)
@@ -275,11 +290,18 @@ Base.@kwdef struct StageAStats
     round_trips::Int = 0
     round_trip_ready::Bool = false
     endpoint_low::Any = 0.0
+    # For staged solvent legs this is the summed occupancy of the endpoint band.
     endpoint_high::Any = 0.0
+    endpoint_high_required::Any = 0.0
     endpoint_ready::Bool = false
+    tail_occupancy::Any = 0.0
+    tail_min_state_occupancy::Any = 0.0
+    tail_ready::Bool = true
+    tail_low_occupancy_states::Vector{Int} = Int[]
     min_state_occupancy::Any = 0.0
     low_occupancy_states::Vector{Int} = Int[]
     n_hist::Int = 0
+    n_hist_recent::Int = 0
 end
 
 StageAStats(nt::NamedTuple) = StageAStats(
@@ -298,10 +320,16 @@ StageAStats(nt::NamedTuple) = StageAStats(
     round_trip_ready = nt.round_trip_ready,
     endpoint_low = nt.endpoint_low,
     endpoint_high = nt.endpoint_high,
+    endpoint_high_required = hasproperty(nt, :endpoint_high_required) ? nt.endpoint_high_required : nt.endpoint_high,
     endpoint_ready = nt.endpoint_ready,
+    tail_occupancy = hasproperty(nt, :tail_occupancy) ? nt.tail_occupancy : 0.0,
+    tail_min_state_occupancy = hasproperty(nt, :tail_min_state_occupancy) ? nt.tail_min_state_occupancy : 0.0,
+    tail_ready = hasproperty(nt, :tail_ready) ? nt.tail_ready : true,
+    tail_low_occupancy_states = hasproperty(nt, :tail_low_occupancy_states) ? nt.tail_low_occupancy_states : Int[],
     min_state_occupancy = hasproperty(nt, :min_state_occupancy) ? nt.min_state_occupancy : 0.0,
     low_occupancy_states = hasproperty(nt, :low_occupancy_states) ? nt.low_occupancy_states : Int[],
     n_hist = nt.n_hist,
+    n_hist_recent = hasproperty(nt, :n_hist_recent) ? nt.n_hist_recent : nt.n_hist,
 )
 
 """

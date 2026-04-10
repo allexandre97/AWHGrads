@@ -17,6 +17,9 @@ cycle_cfg = AWHGrads.ThermodynamicCycleConfig(
             include_pv=true,
             probe_time=base_sim.awh_probe_time_solv,
             ensemble=:npt,
+            electrostatics_method=:pme,
+            coulomb_softcore_model=:gapsys,
+            lj_softcore_model=:gapsys,
         ),
         AWHGrads.ThermodynamicLegConfig(
             name=:vacuum,
@@ -25,6 +28,9 @@ cycle_cfg = AWHGrads.ThermodynamicCycleConfig(
             is_vacuum=true,
             include_pv=false,
             probe_time=base_sim.awh_probe_time_vac,
+            electrostatics_method=:none,
+            coulomb_softcore_model=:gapsys,
+            lj_softcore_model=:gapsys,
         ),
     ],
     include_standard_state_correction=true,
@@ -35,6 +41,7 @@ sim_cfg = AWHGrads.simulation_config_with(
     base_sim;
     device_id=1,
     lambda_schedule=lambda_schedule,
+    nonbonded_energy_type=AWHGrads.default_nonbonded_energy_type(base_sim.FT),
     cycle=cycle_cfg,
     solute_idx=1:9,
     force_field=AWHGrads.ForceFieldConfig(
