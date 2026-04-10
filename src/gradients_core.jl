@@ -2,6 +2,7 @@ using Enzyme
 using Molly
 
 Enzyme.API.looseTypeAnalysis!(true)
+Enzyme.API.strictAliasing!(false)
 
 # ==============================================================================
 # 1. PURELY FUNCTIONAL HELPERS (ENZYME-STABLE)
@@ -49,6 +50,17 @@ _reconstruct_list(l::InteractionList2Atoms, i) = InteractionList2Atoms(l.is, l.j
 _reconstruct_list(l::InteractionList3Atoms, i) = InteractionList3Atoms(l.is, l.js, l.ks, i, l.types)
 _reconstruct_list(l::InteractionList4Atoms, i) = InteractionList4Atoms(l.is, l.js, l.ks, l.ls, i, l.types)
 
+@inline function _enzyme_gradient_system(sys_ref::System{D, AT, FT}) where {D, AT, FT}
+    if Molly.nonbonded_energy_type(sys_ref) === FT
+        return sys_ref
+    end
+    return System(
+        sys_ref;
+        nonbonded_energy_type=FT,
+        launch_config=Molly.CUDALaunchConfig(),
+    )
+end
+
 @inline function _rebuild_system_like(
     sys_ref::System{D, AT, FT},
     new_atoms,
@@ -58,14 +70,33 @@ _reconstruct_list(l::InteractionList4Atoms, i) = InteractionList4Atoms(l.is, l.j
     new_specific,
     new_general,
 ) where {D, AT, FT}
-    return System(
-        sys_ref;
-        atoms=new_atoms,
-        coords=coords_nounits,
-        boundary=box_nounits,
-        pairwise_inters=new_pairwise,
-        specific_inter_lists=new_specific,
-        general_inters=new_general,
+    new_masses = convert(typeof(sys_ref.masses), mass.(new_atoms))
+    new_total_mass = convert(typeof(sys_ref.total_mass), sum(new_masses))
+
+    return typeof(sys_ref)(
+        new_atoms,
+        coords_nounits,
+        box_nounits,
+        sys_ref.velocities,
+        sys_ref.atoms_data,
+        sys_ref.topology,
+        new_pairwise,
+        new_specific,
+        new_general,
+        sys_ref.constraints,
+        sys_ref.virtual_sites,
+        sys_ref.virtual_site_flags,
+        sys_ref.neighbor_finder,
+        sys_ref.loggers,
+        sys_ref.df,
+        sys_ref.force_units,
+        sys_ref.energy_units,
+        sys_ref.k,
+        new_masses,
+        new_total_mass,
+        sys_ref.data,
+        sys_ref.nonbonded_energy_type,
+        Molly.CUDALaunchConfig(),
     )
 end
 
@@ -120,25 +151,27 @@ function evaluate_frame_gradients(sys_ref::System{D, AT, FT},
                                   coords_nounits, box_nounits, neighbors, 
                                   params::Vector{FT}, grads_enzyme::Vector{FT}, 
                                   atom_idxs, pairwise_idxs, specific_idxs, general_idxs) where {D, AT, FT}
-    
-    fill!(grads_enzyme, zero(FT))
-    
-    result = autodiff(
-        set_runtime_activity(ReverseWithPrimal), 
-        evaluate_frame_energy, 
-        Active, 
-        Duplicated(params, grads_enzyme), 
-        Const(sys_ref),
-        Const(coords_nounits), 
-        Const(box_nounits),
-        Const(neighbors),
-        Const(atom_idxs),
-        Const(pairwise_idxs),
-        Const(specific_idxs),
-        Const(general_idxs)
-    )
-    
-    return result[2]
+    sys_grad = _enzyme_gradient_system(sys_ref)
+    return with_compiler_safe_logger() do
+        fill!(grads_enzyme, zero(FT))
+
+        result = autodiff(
+            set_runtime_activity(ReverseWithPrimal), 
+            evaluate_frame_energy, 
+            Active, 
+            Duplicated(params, grads_enzyme), 
+            Const(sys_grad),
+            Const(coords_nounits), 
+            Const(box_nounits),
+            Const(neighbors),
+            Const(atom_idxs),
+            Const(pairwise_idxs),
+            Const(specific_idxs),
+            Const(general_idxs)
+        )
+
+        return result[2]
+    end
 end
 
 # ==============================================================================

@@ -57,6 +57,7 @@ export SimulationConfig
 export OptimizationConfig
 export ForceFieldConfig
 export AWHControlConfig
+export EnsembleEvalConfig
 export ThermodynamicLegConfig
 export ThermodynamicCycleConfig
 export ParameterBoundsConfig

@@ -146,6 +146,7 @@ function default_simulation_config(; FT::DataType=Float32, AT=CuArray, device_id
         parameter_reference_leg=nothing,
         parameter_bounds=ParameterBoundsConfig(),
         awh_control=AWHControlConfig(),
+        ensemble_eval=EnsembleEvalConfig(),
     )
 end
 

@@ -54,6 +54,7 @@ function build_example_configs()
         # Float64 nonbonded potential-energy accumulation.
         nonbonded_energy_type=AWHGrads.default_nonbonded_energy_type(base_sim.FT),
         awh_budget_time=base_sim.FT(60)u"ns",
+        production_log_interval=500,
         awh_probe_reweight_stride_solv=2,
         awh_probe_reweight_min_frames_solv=2000,
         awh_probe_reweight_max_frames_solv=6000,

@@ -1420,6 +1420,20 @@ end
         restored_current, restored_global = restored_loggers
         @test restored_current === tee
         @test restored_global === tee
+
+        nested_loggers = Logging.with_logger(tee) do
+            AWHGrads.with_compiler_safe_logger() do
+                fetch(Threads.@spawn begin
+                    AWHGrads.with_compiler_safe_logger() do
+                        (Logging.current_logger(), Logging.global_logger())
+                    end
+                end)
+            end
+        end
+
+        nested_current, nested_global = nested_loggers
+        @test nested_current isa Logging.NullLogger
+        @test nested_global isa Logging.NullLogger
     finally
         Logging.global_logger(original_global_logger)
     end

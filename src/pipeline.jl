@@ -813,6 +813,7 @@ function collect_production_artifacts!(
     param_names::Vector{String},
     md_steps_prod::Int,
     p0_energy_per_vol::PT,
+    eval_cfg::EnsembleEvalConfig,
 ) where {FT <: AbstractFloat, PT <: AbstractFloat}
     for leg in cycle_cfg.legs
         runtime.active_bias[leg.name] = extract_awh_data(awh_by_leg[leg.name])
@@ -839,16 +840,21 @@ function collect_production_artifacts!(
 
         logger_prod = get_production_logger(awh_prod, String(name))
         neighbors = precompute_neighbors(logger_prod, awh_prod.state.active_sys)
-        u_ref, _ = evaluate_ensemble(
+        eval_cache = build_ensemble_eval_cache(
             logger_prod,
             neighbors,
             awh_prod,
             sys_by_leg[name],
+            eval_cfg,
+        )
+        u_ref, _ = evaluate_ensemble(
+            eval_cache,
             theta_active,
             param_names,
             idxs_by_leg[name]...;
             compute_gradients=false,
         )
+        @info "Production artifact ($(name)): frames=$(length(logger_prod.active_idx_history)) | λ_states=$(length(awh_prod.state.partition.λ_atoms)) | eval_threads=$(eval_cache.config.threads) | lambda_tile=$(eval_cache.config.lambda_tile) | eval_schedule=$(eval_cache.config.schedule)"
 
         push!(artifacts, LegArtifacts(
             name=name,
@@ -865,6 +871,7 @@ function collect_production_artifacts!(
             sys_base=sys_by_leg[name],
             active_bias=bias_data,
             idxs=idxs_by_leg[name],
+            eval_cache=eval_cache,
         ))
     end
 
@@ -1056,6 +1063,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             param_names,
             md_steps_prod,
             p0_energy_per_vol,
+            sim_cfg.ensemble_eval,
         )
 
         GC.gc()

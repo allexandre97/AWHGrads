@@ -8,7 +8,38 @@ function leg_volumes(leg::LegArtifacts, ::Type{FT}) where {FT <: AbstractFloat}
     if !leg.include_pv
         return FT[]
     end
+    if !isnothing(leg.eval_cache) && !isnothing(leg.eval_cache.frame_cache)
+        return FT.(leg.eval_cache.frame_cache.volumes)
+    end
     return FT.(ustrip.(leg.logger_prod.volume_history))
+end
+
+function evaluate_leg_ensemble(
+    leg::LegArtifacts,
+    params::Vector{FT},
+    param_names::Vector{String};
+    compute_gradients::Bool=true,
+) where {FT <: AbstractFloat}
+    if !isnothing(leg.eval_cache)
+        return evaluate_ensemble(
+            leg.eval_cache,
+            params,
+            param_names,
+            leg.idxs...;
+            compute_gradients=compute_gradients,
+        )
+    end
+
+    return evaluate_ensemble(
+        leg.logger_prod,
+        leg.neighbors,
+        leg.awh_prod,
+        leg.sys_base,
+        params,
+        param_names,
+        leg.idxs...;
+        compute_gradients=compute_gradients,
+    )
 end
 
 
@@ -332,14 +363,10 @@ function run_optimization_phase!(
         ess_threshold_broken = false
 
         for leg in leg_artifacts
-            u_eval, grads_eval_theta = evaluate_ensemble(
-                leg.logger_prod,
-                leg.neighbors,
-                leg.awh_prod,
-                leg.sys_base,
+            u_eval, grads_eval_theta = evaluate_leg_ensemble(
+                leg,
                 theta_active,
                 param_names,
-                leg.idxs...;
                 compute_gradients=true,
             )
 
@@ -473,14 +500,10 @@ function run_optimization_phase!(
             ess_ok = true
 
             for leg in leg_artifacts
-                u_prop, _ = evaluate_ensemble(
-                    leg.logger_prod,
-                    leg.neighbors,
-                    leg.awh_prod,
-                    leg.sys_base,
+                u_prop, _ = evaluate_leg_ensemble(
+                    leg,
                     theta_prop,
                     param_names,
-                    leg.idxs...;
                     compute_gradients=false,
                 )
 

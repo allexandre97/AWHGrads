@@ -98,8 +98,15 @@ end
     @test stripped.factor == 1.25f0
 end
 
-@testset "Molly System reconstruction forwards launch_config" begin
-    sys = Molly.System("ethanol_vac.pdb", AWHGrads.ff; array_type=Array, nonbonded_method=:none)
+@testset "Molly System reconstruction bypasses launch_config forwarding" begin
+    custom_launch = Molly.CUDALaunchConfig(force_block_y=4)
+    sys = Molly.System(
+        "ethanol_vac.pdb",
+        AWHGrads.ff;
+        array_type=Array,
+        nonbonded_method=:none,
+        launch_config=custom_launch,
+    )
     sys_nounits = ustrip(Molly.from_device(sys))
 
     rebuilt = AWHGrads._rebuild_system_like(
@@ -112,7 +119,10 @@ end
         sys_nounits.general_inters,
     )
 
-    @test rebuilt.launch_config == sys_nounits.launch_config
+    @test sys_nounits.launch_config == custom_launch
+    @test rebuilt.launch_config == Molly.CUDALaunchConfig()
     @test rebuilt.coords == sys_nounits.coords
     @test rebuilt.general_inters == sys_nounits.general_inters
+    @test rebuilt.masses == sys_nounits.masses
+    @test rebuilt.total_mass == sys_nounits.total_mass
 end

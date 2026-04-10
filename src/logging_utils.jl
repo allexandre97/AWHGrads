@@ -3,6 +3,8 @@ using Logging
 const COMPILER_SAFE_LOGGER = NullLogger()
 const COMPILER_SAFE_LOGGER_LOCK = ReentrantLock()
 
+_is_compiler_safe_logger(logger::AbstractLogger) = logger isa NullLogger
+
 """
     TeeLogger(loggers::Vector{AbstractLogger})
 
@@ -44,16 +46,30 @@ Run `f()` with both the task-local logger and the global logger forced to
 inside `f()` from ever observing the repository's custom `TeeLogger`.
 """
 function with_compiler_safe_logger(f::Function; logger::AbstractLogger=NullLogger())
+    if _is_compiler_safe_logger(global_logger())
+        return with_logger(logger) do
+            f()
+        end
+    end
+
     lock(COMPILER_SAFE_LOGGER_LOCK)
     previous_global_logger = global_logger()
 
     try
+        if _is_compiler_safe_logger(previous_global_logger)
+            return with_logger(logger) do
+                f()
+            end
+        end
+
         global_logger(COMPILER_SAFE_LOGGER)
         return with_logger(COMPILER_SAFE_LOGGER) do
             f()
         end
     finally
-        global_logger(previous_global_logger)
+        if !_is_compiler_safe_logger(previous_global_logger)
+            global_logger(previous_global_logger)
+        end
         unlock(COMPILER_SAFE_LOGGER_LOCK)
     end
 end

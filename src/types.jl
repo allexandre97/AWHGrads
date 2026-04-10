@@ -107,6 +107,23 @@ Base.@kwdef struct ParameterBoundsConfig
 end
 
 """
+    EnsembleEvalConfig
+
+Controls the offline ensemble-evaluation pass used during Stage B analysis and
+the optimization phase. These knobs trade off wall-clock throughput against the
+temporary working-set size of the CPU replay.
+"""
+Base.@kwdef struct EnsembleEvalConfig
+    threads::Int = Threads.nthreads()
+    lambda_tile::Int = 4
+    schedule::Symbol = :dynamic
+    cache_unitless_frames::Bool = true
+    cache_unitless_templates::Bool = true
+    progress::Bool = false
+    progress_interval_seconds::Float64 = 30.0
+end
+
+"""
     SimulationConfig
 
 Top-level runtime configuration for simulation, AWH sampling, and thermodynamic
@@ -157,6 +174,7 @@ Base.@kwdef struct SimulationConfig
     parameter_reference_leg::Union{Nothing, Symbol} = nothing
     parameter_bounds::ParameterBoundsConfig = ParameterBoundsConfig()
     awh_control::AWHControlConfig = AWHControlConfig()
+    ensemble_eval::EnsembleEvalConfig = EnsembleEvalConfig()
 end
 
 """
@@ -267,6 +285,7 @@ Base.@kwdef mutable struct LegArtifacts
     sys_base::Any = nothing
     active_bias::Any = nothing
     idxs::Any = nothing
+    eval_cache::Any = nothing
 end
 
 """
