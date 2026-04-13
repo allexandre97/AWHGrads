@@ -1,376 +1,839 @@
-% theory.tex
-\section{The Accelerated Weight Histogram (AWH) Estimator}
+\section{Frozen-Bias Reference Ensemble}
 
-The goal is to optimize a set of molecular mechanics force field parameters $\theta$ such that the computed free energy differences match experimental targets.
-The AWH method dynamically flattens the free energy landscape along a reaction coordinate $\lambda$ to ensure rigorous phase space coverage.
-The AWH method updates the free energy along a $\lambda$ coordinate such that: 
-\begin{equation}
-    F_{\lambda}^{t+1} = F_{\lambda}^t + \Delta F_{\lambda}
-    \label{eq:F_update}
-\end{equation}
-
-where the update term is:
-\begin{equation}
-    \Delta F_{\lambda} = - \ln \frac{N \cdot \rho_{\lambda} + n \cdot w_{\lambda}\left(\theta\right)}{N \cdot \rho_{\lambda} + n \cdot \rho_{\lambda}}
-    \label{eq:DeltaF}
-\end{equation}
-
-Here $N$ is the total number of samples collected during the AWH run, and $n$ is the number of samples collected since the last free energy update (effectively always 1).
-The term $\rho_{\lambda}$ represents the target sampling distribution. The parameters $\theta$ are the model (force field) parameters, and $w_{\lambda}\left(\theta\right)$ are the reweighting AWH weights.
-These weights are defined as the normalized probability of observing a state under the bias: 
-\begin{equation}
-    w_{\lambda}(\theta) = \frac{\rho_{\lambda} \cdot \exp\left[ F_{\lambda}^{t} - \beta_{\lambda} \cdot U_\lambda\left(\theta\right) \right]}{\sum_{k \in\Lambda} \rho_{k} \cdot \exp\left[ F_{k}^{t} - \beta_{k} \cdot U_k\left(\theta\right) \right]}
-    \label{eq:weights}
-\end{equation}
-
-To map this to an optimization framework, we define a loss function based on the deviation from an experimental free energy difference $\widetilde{\Delta G}$.
-Let the error residual be $\mathcal{E}(\theta)$: 
-\begin{equation}
-    \mathcal{E}(\theta) = \Delta G \left(\theta\right) - \widetilde{\Delta G}
-    \label{eq:error}
-\end{equation}
-where $\Delta G \left(\theta\right) = F_{\lambda=1}\left(\theta\right) - F_{\lambda = 0} \left(\theta\right)$.
-
-\section{First-Order Gradients of the Free Energy}
-
-To minimize the loss $\mathcal{L}(\mathcal{E})$, we compute the gradient with respect to the parameters $\theta$.
-By the chain rule: 
-\begin{equation}
-    \nabla_{\theta}\mathcal{L} = \frac{d\mathcal{L}}{d\mathcal{E}} \cdot \nabla_{\theta} \mathcal{E}(\theta) = \frac{d\mathcal{L}}{d\mathcal{E}} \cdot \left[ \nabla_{\theta} F_{\lambda=1}\left(\theta\right) - \nabla_{\theta} F_{\lambda = 0} \left(\theta\right) \right]
-    \label{eq:chain_rule}
-\end{equation}
-
-Rather than differentiating the algorithmic AWH update rule---which yields a vanishing gradient as the effective sample size $N \to \infty$---we derive the exact analytical gradient directly from the fundamental statistical mechanics definition of the free energy.
-In the canonical (NVT) ensemble, the dimensionless free energy $F_\lambda(\theta)$ of a state $\lambda$ is defined via the configurational partition function $Z_\lambda(\theta)$:
-\begin{equation}
-    F_\lambda(\theta) = - \ln Z_\lambda(\theta) = - \ln \int \exp\left(-\beta_\lambda U_\lambda(\theta, \mathbf{x})\right) d\mathbf{x}
-    \label{eq:F_def}
-\end{equation}
-
-We seek the gradient $\nabla_\theta F_\lambda(\theta)$.
-Applying the derivative to the natural logarithm yields:
-\begin{equation}
-    \nabla_\theta F_\lambda(\theta) = -\frac{1}{Z_\lambda(\theta)} \nabla_\theta Z_\lambda(\theta)
-    \label{eq:grad_F_step1}
-\end{equation}
-
-We then compute the gradient of the partition function.
-By applying the Leibniz integral rule, we move the gradient operator inside the integral over the phase space $\mathbf{x}$:
-\begin{align}
-    \nabla_\theta Z_\lambda(\theta) &= \nabla_\theta \int \exp\left(-\beta_\lambda U_\lambda(\theta, \mathbf{x})\right) d\mathbf{x} \nonumber \\
-    &= \int \nabla_\theta \exp\left(-\beta_\lambda U_\lambda(\theta, \mathbf{x})\right) d\mathbf{x} \nonumber \\
-    &= \int -\beta_\lambda \nabla_\theta U_\lambda(\theta, \mathbf{x}) \exp\left(-\beta_\lambda U_\lambda(\theta, \mathbf{x})\right) d\mathbf{x}
-    \label{eq:grad_Z_step}
-\end{align}
-
-Substituting Equation \ref{eq:grad_Z_step} back into Equation \ref{eq:grad_F_step1}, we obtain:
-\begin{align}
-    \nabla_\theta F_\lambda(\theta) &= -\frac{1}{Z_\lambda(\theta)} \int -\beta_\lambda \nabla_\theta U_\lambda(\theta, \mathbf{x}) \exp\left(-\beta_\lambda U_\lambda(\theta, \mathbf{x})\right) d\mathbf{x} \nonumber \\
-    &= \int \beta_\lambda \nabla_\theta U_\lambda(\theta, \mathbf{x}) \frac{\exp\left(-\beta_\lambda U_\lambda(\theta, \mathbf{x})\right)}{Z_\lambda(\theta)} d\mathbf{x}
-    \label{eq:grad_F_step3}
-\end{align}
-
-We recognize the term $\frac{\exp\left(-\beta_\lambda U_\lambda(\theta, \mathbf{x})\right)}{Z_\lambda(\theta)}$ as the exact normalized probability density of the canonical ensemble at state $\lambda$.
-Therefore, the integral is simply the canonical expectation value of the energy gradient:
-\begin{equation}
-    \nabla_\theta F_\lambda(\theta) = \langle \beta_\lambda \nabla_\theta U_\lambda \rangle_\lambda
-    \label{eq:grad_F_canonical}
-\end{equation}
-
-\section{Extension to the Isothermal-Isobaric (NPT) Ensemble}
-
-In practical molecular dynamics simulations, properties are frequently computed in the isothermal-isobaric (NPT) ensemble.
-Here, the macroscopic volume $V$ fluctuates, and the relevant thermodynamic potential is the Gibbs free energy $G$, defined by the isobaric partition function $\Delta$:
-\begin{equation}
-    G_\lambda(\theta) = - \ln \Delta_\lambda(\theta) = - \ln \int_0^\infty dV \int d\mathbf{x} \exp\left(-\beta_\lambda \left[ U_\lambda(\theta, \mathbf{x}) + P V \right]\right)
-    \label{eq:G_def}
-\end{equation}
-where $P$ is the applied external pressure.
-Following the exact same differentiation steps as the NVT derivation:
-\begin{equation}
-    \nabla_\theta G_\lambda(\theta) = -\frac{1}{\Delta_\lambda(\theta)} \nabla_\theta \Delta_\lambda(\theta)
-    \label{eq:grad_G_step1}
-\end{equation}
-When the derivative operator acts on the integrand, the pressure-volume term $PV$ vanishes because $P$ and $V$ do not depend on the force field parameters $\theta$:
-\begin{align}
-    \nabla_\theta \Delta_\lambda(\theta) &= \int_0^\infty dV \int d\mathbf{x} \nabla_\theta \exp\left(-\beta_\lambda \left[ U_\lambda(\theta, \mathbf{x}) + P V \right]\right) \nonumber \\
-    &= \int_0^\infty dV \int d\mathbf{x} -\beta_\lambda \nabla_\theta U_\lambda(\theta, \mathbf{x}) \exp\left(-\beta_\lambda \left[ U_\lambda(\theta, \mathbf{x}) + P V \right]\right)
-    \label{eq:grad_Delta_step}
-\end{align}
-Substituting this back yields the NPT expectation value:
-\begin{align}
-    \nabla_\theta G_\lambda(\theta) &= \int_0^\infty dV \int d\mathbf{x} \beta_\lambda \nabla_\theta U_\lambda(\theta, \mathbf{x}) \frac{\exp\left(-\beta_\lambda \left[ U_\lambda(\theta, \mathbf{x}) + P V \right]\right)}{\Delta_\lambda(\theta)} \nonumber \\
-    &= \langle \beta_\lambda \nabla_\theta U_\lambda \rangle_{\lambda, NPT}
-    \label{eq:grad_G_NPT}
-\end{align}
-
-Because the AWH algorithm generates a stationary extended ensemble upon convergence, we can rigorously evaluate this expectation value $\langle \dots \rangle_{\lambda}$ (in either NVT or NPT) using the Multistate Bennett Acceptance Ratio (MBAR) identity.
-For a discrete trajectory of $M$ frames generated from the converged AWH ensemble, the exact loss gradient is evaluated at the endpoints $x \in \{0, 1\}$:
-\begin{equation}
-    \nabla_{\theta}\mathcal{L} = \frac{d \mathcal{L}}{d \mathcal{E}} \left[ \sum_{k=1}^M \omega_{k \to 1}^{(n)} \beta_1 \nabla_\theta U_1(\theta, \mathbf{x}_k) - \sum_{k=1}^M \omega_{k \to 0}^{(n)} \beta_0 \nabla_\theta U_0(\theta, \mathbf{x}_k) \right]
-    \label{eq:grad_loss_final}
-\end{equation}
-where $\omega_{k \to x}^{(n)}$ is the normalized MBAR weight of frame $k$ at state $x$.
-This formulation seamlessly links the analytical definitions of free energy directly to our phase-space optimization pipeline.
-
-\section{Loss Function Geometries}
-
-The choice of loss function $\mathcal{L}(\mathcal{E})$ determines the pre-factor governing how strongly the optimizer reacts to deviations from experimental data.
-The L1 loss is robust to outliers, which is useful when initial free energy estimates are very poor.
-\begin{equation}
-    \mathcal{L}_{L1} = | \mathcal{E} |, \quad \frac{d\mathcal{L}_{L1}}{d\mathcal{E}} = \mathrm{sign}(\mathcal{E})
-    \label{eq:loss_L1}
-\end{equation}
-This provides a constant gradient magnitude regardless of how far the prediction is from the target, but is non-differentiable at $\mathcal{E}=0$.
-The L2 loss penalizes large errors more heavily and provides a smooth gradient that approaches zero as the prediction converges.
-\begin{equation}
-    \mathcal{L}_{L2} = \mathcal{E}^2, \quad \frac{d\mathcal{L}_{L2}}{d\mathcal{E}} = 2 \mathcal{E}
-    \label{eq:loss_L2}
-\end{equation}
-Note that if defined as $\frac{1}{2}\mathcal{E}^2$, the derivative simplifies to just $\mathcal{E}$.
-The L2 loss is generally preferred for fine-tuning but can be unstable if gradients are extremely large initially.
-The Huber loss combines the best properties of L1 and L2.
-It is quadratic for small errors (stable convergence) and linear for large errors (robust to outliers).
-Defined with a threshold $\delta$: 
-\begin{equation}
-    \mathcal{L}_{\delta} = \begin{cases}
-    \frac{1}{2}\mathcal{E}^2 & \text{for } |\mathcal{E}| \le \delta, \\
-    \delta (|\mathcal{E}| - \frac{1}{2}\delta), & \text{otherwise.}
-    \end{cases}
-    \label{eq:loss_huber}
-\end{equation}
-
-The derivative is:
-\begin{equation}
-    \frac{d\mathcal{L}_{\delta}}{d\mathcal{E}} = \begin{cases}
-    \mathcal{E} & \text{for } |\mathcal{E}| \le \delta, \\
-    \delta \cdot \mathrm{sign}(\mathcal{E}), & \text{otherwise.}
-    \end{cases}
-    \label{eq:deriv_huber}
-\end{equation}
-
-This ensures that the gradients used to update the force field parameters never exceed magnitude $\delta$, preventing numerical instability during the early stages of optimization.
-
-\section{Information Theory and the Fisher Information Matrix}
-
-While the Huber loss clips the magnitude of the gradient, it does not correct its direction in the underlying parameter space.
-Standard gradient descent assumes the parameter space $\theta$ is Euclidean, meaning a step of magnitude $\Delta$ in one parameter is geometrically equivalent to a step of magnitude $\Delta$ in another.
-In molecular mechanics, this assumption fails severely. A perturbation of $0.05$ units in a Lennard-Jones collision radius ($\sigma$) induces massive steric clashes and fundamentally alters the sampled ensemble.
-Conversely, the same $0.05$ perturbation in a soft dihedral force constant barely affects the total energy, leaving the sampled ensemble largely unchanged.
-Instead of an Euclidean space, the parameters $\theta$ define coordinates on a \textit{statistical manifold}.
-To guarantee valid ensemble reweighting, the optimization step must be constrained by the geometry of this manifold.
-
-In the proposed algorithmic workflow, AWH is run until the free energy estimates $F_\lambda$ converge.
-The bias is then fixed, and the system explores an extended ensemble defined jointly over the atomic coordinates $\mathbf{x}$, fluctuating volume $V$ (if NPT), and the alchemical states $\lambda$.
-Each point on our statistical manifold is therefore not a simple ensemble, but the joint probability distribution of this extended AWH ensemble.
-For a generic NPT extended ensemble, this is: 
-\begin{equation}
-    P_{\theta}(\mathbf{x}, V, \lambda) = \frac{\rho_\lambda \exp\left(G_\lambda - \beta_\lambda [U_\lambda(\theta, \mathbf{x}) + PV]\right)}{\mathcal{Z}(\theta)}
-    \label{eq:P_theta}
-\end{equation}
-
-where $\mathcal{Z}(\theta)$ is the global partition function of the extended ensemble:
-\begin{equation}
-    \mathcal{Z}(\theta) = \sum_{k \in \Lambda} \int_0^\infty dV \int d\mathbf{x} \rho_k \exp\left(G_k - \beta_k [U_k(\theta, \mathbf{x}) + PV]\right)
-    \label{eq:Z_theta_global}
-\end{equation}
-
-Note that averaging an observable over this joint distribution $P_{\theta}(\mathbf{x}, V, \lambda)$ corresponds exactly to the AWH-weighted ensemble average $\langle \dots \rangle_w$ utilized in our gradient estimators.
-To optimize safely, we must measure the statistical distance between the extended ensemble generated at the current epoch $P_{\theta}$ and the proposed distribution $P_{\theta+d\theta}$, ensuring that both have sufficient phase-space overlap.
-In information theory, this distance is quantified by the Kullback-Leibler (KL) divergence: 
-\begin{align}
-    \begin{split}
-        D_{KL}(P_{\theta} || P_{\theta+d\theta}) &= \sum_{\lambda \in \Lambda} \int_0^\infty dV \int P_{\theta}(\mathbf{x}, V, \lambda) \ln \frac{P_{\theta}(\mathbf{x}, V, \lambda)}{P_{\theta+d\theta}(\mathbf{x}, V, \lambda)} d\mathbf{x} \\
-        &= \left \langle \ln{\frac{P_{\theta}(\mathbf{x}, V, \lambda)}{P_{\theta+d\theta}(\mathbf{x}, V, \lambda)}} \right\rangle_{w}
-    \end{split}
-    \label{eq:KL_div}
-\end{align}
-
-To relate small parameter updates $d\theta$ to this statistical distance, we perform a second-order Taylor expansion of $\ln P_{\theta+d\theta}$ around $\theta$:
-\begin{equation}
-    \ln P_{\theta+d\theta} \approx \ln P_{\theta} + d\theta^T \nabla_{\theta} \ln P_{\theta} + \frac{1}{2} d\theta^T \nabla^2_{\theta} \ln P_{\theta} d\theta
-    \label{eq:taylor_expansion}
-\end{equation}
-
-Substituting this expansion back into the KL divergence (Equation \ref{eq:KL_div}) yields:
-\begin{equation}
-    D_{KL}(P_{\theta} || P_{\theta+d\theta}) \approx -\left\langle d\theta^T \nabla_{\theta} \ln P_{\theta} + \frac{1}{2} d\theta^T \nabla^2_{\theta} \ln P_{\theta} d\theta \right\rangle_w
-    \label{eq:KL_taylor}
-\end{equation}
-
-The expectation of the first-order score function $\nabla_{\theta} \ln P_{\theta}$ strictly vanishes:
-\begin{equation}
-    \left\langle \nabla_{\theta} \ln P_{\theta} \right\rangle_w = \sum_{\lambda} \int_0^\infty dV \int P_{\theta} \frac{\nabla_{\theta} P_{\theta}}{P_{\theta}} d\mathbf{x} = \nabla_{\theta} \left( \sum_{\lambda} \int_0^\infty dV \int P_{\theta} d\mathbf{x} \right) = \nabla_{\theta} (1) = 0
-    \label{eq:score_vanishes}
-\end{equation}
-
-This leaves the second-order term:
-\begin{equation}
-    D_{KL}(P_{\theta} || P_{\theta+d\theta}) \approx - \frac{1}{2} d\theta^T \left\langle \nabla^2_{\theta} \ln P_{\theta} \right\rangle_w d\theta
-    \label{eq:KL_second_order}
-\end{equation}
-
-The matrix $-\langle \nabla^2_{\theta} \ln P_{\theta} \rangle_w$ is the Fisher Information Matrix (FIM), $\mathcal{I}(\theta)$.
-Under standard regularity conditions, the negative expectation of the Hessian of the log-likelihood is mathematically equivalent to the covariance of the score functions: 
-\begin{equation}
-    \mathcal{I}_{ij}(\theta) = \left\langle \left( \nabla_{\theta_i} \ln P_{\theta} \right) \left( \nabla_{\theta_j} \ln P_{\theta} \right) \right\rangle_w
-    \label{eq:FIM_def}
-\end{equation}
-
-Thus, the FIM acts as the metric tensor for the statistical manifold, explicitly translating parameter updates into statistical distance:
-\begin{equation}
-    D_{KL}(P_{\theta} || P_{\theta+d\theta}) \approx \frac{1}{2} d\theta^T \mathcal{I}(\theta) d\theta
-    \label{eq:KL_FIM}
-\end{equation}
-
-We can now analytically derive the FIM for the AWH extended ensemble.
-First, we compute the score function $\nabla_{\theta} \ln P_{\theta}(\mathbf{x}, V, \lambda)$.
-The derivative of the $PV$ term trivially zeroes out:
-\begin{align}
-    \nabla_{\theta} \ln P_{\theta}(\mathbf{x}, V, \lambda) &= \nabla_{\theta} \left[ \ln \rho_\lambda + G_\lambda - \beta_\lambda U_\lambda(\theta, \mathbf{x}) - \beta_\lambda P V - \ln \mathcal{Z}(\theta) \right] \nonumber \\
-    &= -\beta_\lambda \nabla_{\theta} U_\lambda(\theta, \mathbf{x}) - \frac{\nabla_{\theta} \mathcal{Z}(\theta)}{\mathcal{Z}(\theta)}
-    \label{eq:score_deriv_1}
-\end{align}
-
-Evaluating the global partition function derivative similarly causes the $PV$ dependencies to vanish, leaving:
-\begin{equation}
-    \frac{\nabla_{\theta} \mathcal{Z}(\theta)}{\mathcal{Z}(\theta)} = -\langle \beta \nabla_{\theta} U \rangle_{w}
-    \label{eq:grad_Z_global}
-\end{equation}
-
-Therefore, the score function of the extended ensemble is precisely the deviation of the local energy gradient from its global AWH-weighted ensemble average: 
-\begin{equation}
-    \nabla_{\theta} \ln P_{\theta}(\mathbf{x}, V, \lambda) = -\beta_\lambda \nabla_{\theta} U_\lambda(\theta, \mathbf{x}) + \langle \beta \nabla_{\theta} U \rangle_{w}
-    \label{eq:score_final}
-\end{equation}
-
-Substituting this score function into the FIM definition (Equation \ref{eq:FIM_def}) yields exactly the covariance of the energy gradients evaluated over the extended AWH ensemble, regardless of whether NVT or NPT boundary conditions apply:
-\begin{align}
-    \begin{split}
-        \mathcal{I}_{ij}(\theta) &= \left\langle \left[ -\beta_\lambda \nabla_{\theta_i} U_\lambda + \langle \beta \nabla_{\theta_i} U \rangle_w \right] \left[ -\beta_\lambda \nabla_{\theta_j} U_\lambda + \langle \beta \nabla_{\theta_j} U \rangle_w \right] \right\rangle_w \\
-        &= \langle \beta^2 \nabla_{\theta_i} U \nabla_{\theta_j} U \rangle_w - \langle \beta \nabla_{\theta_i} U \rangle_w \langle \beta \nabla_{\theta_j} U \rangle_w \\
-        &= \text{Cov}_w(\beta \nabla_{\theta_i} U, \beta \nabla_{\theta_j} U)
-    \end{split}
-    \label{eq:FIM_cov}
-\end{align}
-
-\section{Algorithmic Failure Modes and Robustness Fixes}
-
-This derivation reveals why optimizing the loss via standard gradient descent is problematic for reweighting schemes.
-However, translating this theory to a discrete, empirical implementation introduces primary failure modes that require explicit algorithmic corrections.
-
-\subsection{FIM Ill-Conditioning and KL-Bounded Eigendecomposition}
-
-The natural gradient update direction is defined by the inverse of the Fisher Information Matrix (FIM) applied to the loss gradient: $\mathbf{d} = \mathcal{I}^{-1}(\theta_n) \mathbf{g}_n$.
-The FIM acts as a metric tensor that maps parameter changes to changes in the probability distribution of the sampled ensemble.
-By definition, an empirical FIM constructed from a finite trajectory is symmetric and positive semi-definite.
-However, empirical force field optimization frequently couples extensive (bulk solvent) and intensive (single solute) parameters, creating severe mathematical ill-conditioning via two primary mechanisms:
-
+The implemented method separates two tasks that are easy to conflate:
 \begin{enumerate}
-    \item \textbf{Structural Correlation:} In molecular mechanics, parameters are often highly correlated (e.g., modifying the partial charge on one atom mandates an equal and opposite modification to an adjacent atom to maintain net charge). This causes the empirical FIM to be nearly rank-deficient.
-    \item \textbf{Scale Disparity:} The variance of the energy gradient of an extensive property scales linearly with the number of interacting particles. Therefore, the variance for a parameter belonging to the bulk solvent scales with $O(N_{\text{wat}})$, while the variance for a single solute parameter scales with $O(1)$. This disparity routinely generates condition numbers exceeding $10^{11}$.
+    \item adaptive AWH sampling, which is used to construct a reliable reference
+    expanded ensemble,
+    \item offline thermodynamic estimation, which is performed only after that
+    reference ensemble has been frozen.
 \end{enumerate}
+This distinction is essential. The optimization gradients in the current code are
+\emph{not} obtained by differentiating the online AWH update rule. Instead, the
+adaptive AWH phase is used only to produce a stationary reference distribution
+from which replay-based estimators can be evaluated cleanly.
 
-When decomposed, the FIM's eigenvalue spectrum features massive values representing the stiff bulk solvent dimensions, and near-zero values representing the comparatively unconstrained solute dimensions. Standard matrix inversion divides by these eigenvalues. If an eigenvalue $\lambda_i \approx 0$, the inverse $1/\lambda_i$ approaches infinity. This causes the optimizer to take a massive step along a dimension where it has no statistical signal, instantly destroying phase-space overlap and causing the Effective Sample Size (ESS) to collapse.
+Throughout this section, $i \in \Lambda_\ell$ denotes a generic lambda-state
+index, $m \in \Lambda_\ell$ denotes a target lambda state to which the stored
+frames are reweighted, and $n$ indexes stored frames from the frozen reference
+trajectory.
 
-\subsubsection{The Failure of Tikhonov Regularization}
-A standard approach to ill-conditioned matrices is Tikhonov regularization (Levenberg-Marquardt damping), which adds a small scalar $\gamma$ to the diagonal elements: $\mathcal{I}_{\text{reg}} = \mathcal{I} + \gamma I$.
-The inverted eigenvalues become $1/(\lambda_i + \gamma)$. 
-
-This approach is fundamentally flawed for multiscale reweighting schemes.
-If $\gamma$ is small, the near-zero eigenvalues still explode, leaving the step unstable.
-If $\gamma$ is large enough to ensure numerical stability for the solvent dimensions, it artificially dominates the actual eigenvalues of the solute ($1/(\lambda_i + \gamma) \approx 1/\gamma$).
-As the inverse matrix approaches $\frac{1}{\gamma} I$, the natural gradient for the solute degenerates completely into standard Euclidean gradient descent, ignoring the geometry of the statistical manifold entirely.
-
-\subsubsection{Scale Disparity and Diagonal Preconditioning}
-To resolve the scale disparity without destroying the structural cross-correlations between the solute and the solvent, we apply diagonal preconditioning. This mathematically converts the FIM from a covariance matrix into a correlation matrix.
-We construct a diagonal scaling matrix $D$, where each entry is the inverse standard deviation of that parameter's gradient:
+Consider one thermodynamic leg $\ell$ with lambda states
+$i \in \Lambda_\ell$, inverse temperature $\beta_\ell$, and, for NPT legs,
+pressure $P_\ell$. The reduced potential of state $i$ at parameters $\theta$ is
 \begin{equation}
-    D_{ii} = \frac{1}{\sqrt{\mathcal{I}_{ii}}}
-    \label{eq:diagonal_scaling_matrix}
+    u_\ell(\mathbf{x}, V, i; \theta)
+    =
+    \beta_\ell U_\ell(\mathbf{x}, i; \theta)
+    +
+    \beta_\ell P_\ell V,
+    \label{eq:reducedpotential}
+\end{equation}
+with the pressure-volume term omitted for legs that do not include a $pV$
+contribution.
+
+During the frozen stage, the AWH bias and target lambda weights are fixed. The
+reference Gibbs log-weights used by the implementation are
+\begin{equation}
+    g_{\mathrm{ref},\ell}(i)
+    =
+    f_\ell(i)
+    +
+    \log \rho_\ell(i),
+    \label{eq:gref}
+\end{equation}
+where $f_\ell(i)$ is the frozen AWH free-energy estimate and $\rho_\ell(i)$ is
+the fixed target lambda distribution. The corresponding frozen extended-ensemble
+reference density is
+\begin{equation}
+    p_{\mathrm{ref},\ell}(\mathbf{x}, V, i)
+    =
+    \frac{
+        \exp \left[
+            g_{\mathrm{ref},\ell}(i)
+            -
+            u_{\mathrm{ref},\ell}(\mathbf{x}, V, i)
+        \right]
+    }{
+        \mathcal{Z}_{\mathrm{ref},\ell}
+    },
+    \label{eq:pref}
+\end{equation}
+where $u_{\mathrm{ref},\ell}$ denotes the reduced potential at the frozen
+reference parameterization and
+$\mathcal{Z}_{\mathrm{ref},\ell}$ is the corresponding normalizing constant.
+
+For a stored frame $n$ with coordinates $\mathbf{x}_n$ and volume $V_n$, the code
+evaluates the reference-mixture denominator
+\begin{equation}
+    \log Z_{\mathrm{mix},\ell}(n)
+    =
+    \log
+    \sum_{i \in \Lambda_\ell}
+    \exp \left[
+        g_{\mathrm{ref},\ell}(i)
+        -
+        u_{\mathrm{ref},\ell}(\mathbf{x}_n, V_n, i)
+    \right].
+    \label{eq:logmix}
+\end{equation}
+Equation \eqref{eq:logmix} is the key MBAR/AWH consistency relation in the
+current implementation. It is the object against which replayed frames are
+reweighted both for readiness analysis and for optimization.
+
+\section{MBAR Reweighting to an Arbitrary Lambda State}
+
+Let $m \in \Lambda_\ell$ be a target lambda state at which we want to evaluate a
+free energy or a free-energy gradient under the current parameter vector
+$\theta$. Define the target-state partition function
+\begin{equation}
+    Q_{\ell,m}(\theta)
+    =
+    \int dV \int d\mathbf{x} \,
+    \exp \left[
+        -u_\ell(\mathbf{x}, V, m; \theta)
+    \right].
+    \label{eq:qtarget}
+\end{equation}
+The corresponding reduced free energy is
+\begin{equation}
+    F_{\ell,m}(\theta)
+    =
+    -\log Q_{\ell,m}(\theta).
+    \label{eq:ftarget}
 \end{equation}
 
-By applying this transformation, we obtain the preconditioned (Correlation) FIM, $\tilde{\mathcal{I}}$, and the preconditioned gradient, $\tilde{\mathbf{g}}$:
+To connect $Q_{\ell,m}$ to the frozen reference ensemble, multiply and divide the
+integrand in Equation \eqref{eq:qtarget} by the reference-mixture density:
 \begin{align}
-    \tilde{\mathcal{I}} &= D \, \mathcal{I} \, D \label{eq:preconditioned_FIM} \\
-    \tilde{\mathbf{g}} &= D \mathbf{g}_n \label{eq:preconditioned_grad}
+    Q_{\ell,m}(\theta)
+    &=
+    \int dV \int d\mathbf{x} \,
+    \mathcal{Z}_{\mathrm{ref},\ell}
+    p_{\mathrm{ref},\ell}(\mathbf{x}, V)
+    \exp \left[
+        -u_\ell(\mathbf{x}, V, m; \theta)
+        -
+        \log Z_{\mathrm{mix},\ell}(\mathbf{x}, V)
+    \right]
+    \nonumber \\
+    &=
+    \mathcal{Z}_{\mathrm{ref},\ell}
+    \,
+    \mathbb{E}_{\mathrm{ref},\ell}
+    \left[
+        \exp \left(
+            -u_\ell(\mathbf{x}, V, m; \theta)
+            -
+            \log Z_{\mathrm{mix},\ell}(\mathbf{x}, V)
+        \right)
+    \right].
+    \label{eq:qtargetref}
 \end{align}
+Here
+$\log Z_{\mathrm{mix},\ell}(\mathbf{x}, V)$ denotes the framewise quantity in
+Equation \eqref{eq:logmix}, but written as a function of a generic configuration
+instead of an indexed stored frame.
 
-Because every element in $\tilde{\mathcal{I}}$ is now strictly bounded between $[-1.0, 1.0]$, the extreme condition number driven by the $O(N_{\text{wat}})$ scale is eliminated, placing all parameters—regardless of the number of molecules they govern—onto a scale-invariant manifold.
+Taking minus the logarithm of Equation \eqref{eq:qtargetref} gives
+\begin{equation}
+    F_{\ell,m}(\theta)
+    =
+    -\log \mathcal{Z}_{\mathrm{ref},\ell}
+    -
+    \log
+    \mathbb{E}_{\mathrm{ref},\ell}
+    \left[
+        \exp \left(
+            -u_\ell(\mathbf{x}, V, m; \theta)
+            -
+            \log Z_{\mathrm{mix},\ell}(\mathbf{x}, V)
+        \right)
+    \right].
+    \label{eq:freeref}
+\end{equation}
+The first term depends only on the frozen reference ensemble and is therefore a
+constant shared by every target state $m$ of the same leg. The implementation
+does not need that constant explicitly because only free-energy differences are
+used. It is therefore convenient to define the additive-constant-free quantity
+\begin{equation}
+    \widetilde{F}_{\ell,m}(\theta)
+    =
+    -
+    \log
+    \mathbb{E}_{\mathrm{ref},\ell}
+    \left[
+        \exp \left(
+            -u_\ell(\mathbf{x}, V, m; \theta)
+            -
+            \log Z_{\mathrm{mix},\ell}(\mathbf{x}, V)
+        \right)
+    \right],
+    \label{eq:fendpointdef}
+\end{equation}
+so that
+\begin{equation}
+    F_{\ell,m}(\theta)
+    =
+    -\log \mathcal{Z}_{\mathrm{ref},\ell}
+    +
+    \widetilde{F}_{\ell,m}(\theta).
+    \label{eq:fendpointconst}
+\end{equation}
+All endpoint differences within a leg depend only on
+$\widetilde{F}_{\ell,m}(\theta)$ because the reference constant cancels.
 
-\subsubsection{Truncated Eigendecomposition}
-With the metric tensor stabilized, we compute a truncated pseudoinverse on the correlation matrix to safely filter out true linear dependencies. We perform an eigendecomposition on the preconditioned FIM:
+\section{Discrete MBAR Weights Used by the Code}
+
+Suppose the frozen reference trajectory for leg $\ell$ contains
+$M_\ell$ stored frames. Replacing the expectation in
+Equation \eqref{eq:fendpointdef} by the empirical average over those frames gives
 \begin{equation}
-    \tilde{\mathcal{I}} = \tilde{V} \tilde{\Sigma} \tilde{V}^T
+    \widetilde{F}_{\ell,m}(\theta)
+    \approx
+    -
+    \log
+    \left[
+        \frac{1}{M_\ell}
+        \sum_{n=1}^{M_\ell}
+        a_{\ell,n}^{(m)}(\theta)
+    \right],
+    \label{eq:fendpointdisc}
 \end{equation}
-where $\tilde{\Sigma}$ is a diagonal matrix of eigenvalues $\tilde{\lambda}_i$, and $\tilde{V}$ contains the corresponding eigenvectors.
-We construct the truncated pseudoinverse $\tilde{\mathcal{I}}^+$ by defining the elements of $\tilde{\Sigma}^+$ as:
+where the unnormalized target-state weights are
 \begin{equation}
-    \tilde{\Sigma}^+_{ii} = \begin{cases}
-    \frac{1}{\tilde{\lambda}_i} & \text{if } \tilde{\lambda}_i > \tau \\
-    0 & \text{if } \tilde{\lambda}_i \le \tau
-    \end{cases}
+    a_{\ell,n}^{(m)}(\theta)
+    =
+    \exp \left[
+        -u_\ell(\mathbf{x}_n, V_n, m; \theta)
+        -
+        \log Z_{\mathrm{mix},\ell}(n)
+    \right].
+    \label{eq:am}
 \end{equation}
-where $\tau$ is a strict numerical threshold scaled to the largest correlation eigenvalue (e.g., $\tau = \tilde{\lambda}_{\max} \cdot 10^{-2}$).
-Because the truncation is applied in the normalized correlation space, the algorithm safely zeros out unconstrained numerical noise without systematically deleting the solute's eigenvectors. 
-The unscaled natural gradient step $\Delta \tilde{\theta}$ is evaluated, and then mapped back to the physical parameter space using the inverse of our scaling matrix $D$:
+Because the prefactor $1/M_\ell$ is the same for every state of the same leg,
+the implementation evaluates
+\begin{equation}
+    \widetilde{F}_{\ell,m}(\theta)
+    =
+    -
+    \log
+    \sum_{n=1}^{M_\ell}
+    a_{\ell,n}^{(m)}(\theta),
+    \label{eq:fendpointimpl}
+\end{equation}
+which differs from Equation \eqref{eq:fendpointdisc} only by the additive
+constant $\log M_\ell$ and therefore produces the same endpoint free-energy
+differences.
+
+The normalized MBAR weights used to reweight observables to the target state $m$
+are
+\begin{equation}
+    \omega_{\ell,n}^{(m)}(\theta)
+    =
+    \frac{
+        a_{\ell,n}^{(m)}(\theta)
+    }{
+        \sum_{j=1}^{M_\ell}
+        a_{\ell,j}^{(m)}(\theta)
+    }.
+    \label{eq:omegam}
+\end{equation}
+These are the weights implicitly formed by the current endpoint-gradient
+routine in the code.
+
+The same machinery can be applied to every lambda state in the schedule to
+reconstruct a full replayed free-energy profile. Stage B readiness uses this
+full-profile reconstruction to compare MBAR-replayed profiles against the frozen
+AWH profile. Optimization, however, only needs the endpoint states.
+
+\section{Endpoint Free-Energy Gradients}
+
+The endpoint gradient estimator follows directly from the MBAR expression above.
+Differentiating Equation \eqref{eq:fendpointimpl} with respect to $\theta$ gives
 \begin{align}
-    \Delta \tilde{\theta} &= \tilde{\mathcal{I}}^+ \tilde{\mathbf{g}} \\
-    \mathbf{d}_{\text{base}} &= D \Delta \tilde{\theta} \label{eq:step_mapped_back}
+    \nabla_\theta \widetilde{F}_{\ell,m}(\theta)
+    &=
+    -\frac{1}{
+        \sum_{n=1}^{M_\ell} a_{\ell,n}^{(m)}(\theta)
+    }
+    \sum_{n=1}^{M_\ell}
+    \nabla_\theta a_{\ell,n}^{(m)}(\theta)
+    \nonumber \\
+    &=
+    -\frac{1}{
+        \sum_{n=1}^{M_\ell} a_{\ell,n}^{(m)}(\theta)
+    }
+    \sum_{n=1}^{M_\ell}
+    \left[
+        -a_{\ell,n}^{(m)}(\theta)
+        \nabla_\theta
+        u_\ell(\mathbf{x}_n, V_n, m; \theta)
+    \right]
+    \nonumber \\
+    &=
+    \sum_{n=1}^{M_\ell}
+    \omega_{\ell,n}^{(m)}(\theta)
+    \nabla_\theta
+    u_\ell(\mathbf{x}_n, V_n, m; \theta).
+    \label{eq:fgradred}
 \end{align}
-
-\subsubsection{Bounding the Kullback-Leibler Divergence}
-The truncated pseudoinverse yields a geometrically sound base step: $\mathbf{d}_{\text{base}}$.
-However, even in well-conditioned dimensions, a steep loss gradient $\mathbf{g}_n$ could generate a step magnitude that pushes the parameters outside the trust region of the reference trajectory.
-The Kullback-Leibler (KL) divergence measures the statistical distance between the old ensemble $P_{\theta_n}$ and the proposed ensemble $P_{\theta_n + \mathbf{d}}$.
-Based on the second-order Taylor expansion evaluated in the original parameter space, this divergence is governed exactly by the original covariance FIM:
+Since the pressure-volume term in Equation \eqref{eq:reducedpotential} does not
+depend on the force-field parameters,
 \begin{equation}
-    D_{KL}(P_{\theta_n} || P_{\theta_n + \mathbf{d}}) \approx \frac{1}{2} \mathbf{d}^T \mathcal{I}(\theta_n) \mathbf{d}
+    \nabla_\theta
+    u_\ell(\mathbf{x}_n, V_n, m; \theta)
+    =
+    \beta_\ell
+    \nabla_\theta
+    U_\ell(\mathbf{x}_n, m; \theta),
+    \label{eq:gradreduced}
+\end{equation}
+and therefore
+\begin{equation}
+    \nabla_\theta \widetilde{F}_{\ell,m}(\theta)
+    =
+    \sum_{n=1}^{M_\ell}
+    \omega_{\ell,n}^{(m)}(\theta)
+    \,
+    \beta_\ell
+    \nabla_\theta
+    U_\ell(\mathbf{x}_n, m; \theta).
+    \label{eq:fgradtheta}
+\end{equation}
+This is the precise sense in which the MBAR weights are used to compute endpoint
+gradients in the implementation: every stored frame is replayed at the endpoint
+lambda state of interest, and the corresponding force-field gradient at that
+endpoint is averaged with the normalized target-state weights
+$\omega_{\ell,n}^{(m)}(\theta)$.
+
+The endpoint free energy of a leg is the coupled-minus-decoupled difference
+\begin{equation}
+    \Delta G_\ell(\theta)
+    =
+    \widetilde{F}_{\ell,\mathrm{coupled}}(\theta)
+    -
+    \widetilde{F}_{\ell,\mathrm{decoupled}}(\theta),
+    \label{eq:legdg}
+\end{equation}
+and its gradient is
+\begin{equation}
+    \nabla_\theta \Delta G_\ell(\theta)
+    =
+    \nabla_\theta \widetilde{F}_{\ell,\mathrm{coupled}}(\theta)
+    -
+    \nabla_\theta \widetilde{F}_{\ell,\mathrm{decoupled}}(\theta).
+    \label{eq:legdggrad}
+\end{equation}
+For a coefficient-weighted thermodynamic cycle,
+\begin{equation}
+    \Delta G_{\mathrm{cyc}}(\theta)
+    =
+    \Delta G_{\mathrm{std}}
+    +
+    \sum_\ell c_\ell \Delta G_\ell(\theta),
+    \label{eq:cycle}
+\end{equation}
+and the residual against experiment is
+\begin{equation}
+    \mathcal{E}(\theta)
+    =
+    \Delta G_{\mathrm{cyc}}(\theta)
+    -
+    \widetilde{\Delta G}_{\mathrm{exp}}.
+    \label{eq:residual}
+\end{equation}
+The code applies a Huber derivative to this residual, so the optimization
+gradient is
+\begin{equation}
+    \nabla_\theta \mathcal{L}
+    =
+    \frac{d \mathcal{L}}{d \mathcal{E}}
+    \nabla_\theta \Delta G_{\mathrm{cyc}}(\theta).
+    \label{eq:lossgradtheta}
 \end{equation}
 
-We define a hard trust-region boundary, $\epsilon$, representing the maximum allowable KL divergence.
-We then evaluate the estimated KL divergence of our proposed base step:
+\section{Bounded Coordinates}
+
+The optimizer does not update unconstrained physical parameters directly. Each
+trainable parameter is represented by a latent coordinate $\phi_i$ and mapped
+into a bounded interval
+$[\theta_{i,\min}, \theta_{i,\max}]$ through a shifted sigmoid transform,
 \begin{equation}
-    K_{\text{est}} = \frac{1}{2} \mathbf{d}_{\text{base}}^T \mathcal{I}(\theta_n) \mathbf{d}_{\text{base}}
+    \theta_i(\phi_i)
+    =
+    \theta_{i,\min}
+    +
+    \left(
+        \theta_{i,\max} - \theta_{i,\min}
+    \right)
+    \sigma(k \phi_i),
+    \label{eq:phitheta}
+\end{equation}
+where $k$ is a configurable slope and $\sigma$ is the logistic function. The
+chain rule then gives
+\begin{equation}
+    \nabla_{\phi_i} U
+    =
+    \frac{d \theta_i}{d \phi_i}
+    \nabla_{\theta_i} U,
+    \label{eq:chainphi}
+\end{equation}
+so all optimization-space gradients and Fisher matrices are assembled in latent
+coordinates.
+
+\section{From Euclidean to Natural Gradient Descent}
+
+At this point the reason for introducing a metric tensor can be stated
+explicitly. If one ignored the geometry of the probability distributions and
+performed ordinary Euclidean gradient descent in latent parameter space, the step
+would be
+\begin{equation}
+    \Delta \phi_{\mathrm{Euc}}
+    =
+    -
+    \eta
+    \nabla_\phi \mathcal{L}.
+    \label{eq:eucstep}
+\end{equation}
+This update treats all coordinate directions in $\phi$-space as geometrically
+equivalent. That assumption is poor for force-field optimization. Different
+parameters perturb the sampled distribution with very different strength: a small
+change in one parameter can produce a large statistical distortion, while a
+numerically larger change in another parameter can have only a modest effect. In
+other words, the relevant geometry is not the Euclidean geometry of the
+coordinates themselves, but the geometry of the manifold of probability
+distributions induced by those coordinates.
+
+The natural gradient is the steepest-descent direction on that statistical
+manifold. If $G(\phi)$ is the metric tensor, then the corresponding
+natural-gradient update is
+\begin{equation}
+    \Delta \phi_{\mathrm{nat}}
+    =
+    -
+    \eta
+    G(\phi)^{-1}
+    \nabla_\phi \mathcal{L}.
+    \label{eq:natstep}
+\end{equation}
+In our setting, the appropriate local metric is the Fisher information matrix.
+This does not mean that the code explicitly integrates exact geodesics of the
+manifold. Rather, it uses the Fisher matrix as a local quadratic description of
+the manifold curvature, so that the update direction is the local
+steepest-descent direction consistent with distribution space rather than raw
+coordinate space.
+
+This is exactly how the current implementation uses the Fisher matrix. The code
+first builds a latent-space loss gradient, then preconditions it by the empirical
+Fisher matrix to obtain a natural-gradient-like base step. That step is then
+stabilized by diagonal normalization, eigentruncation, KL-target scaling, and a
+line search. The KL derivation below explains why this is the correct local
+geometry to use.
+
+\section{Why Fisher is the Metric Tensor}
+
+The role of the Fisher information matrix is not merely heuristic. It appears as
+the first nonzero local approximation to the Kullback-Leibler divergence between
+nearby candidate ensembles. This is precisely why the current optimizer uses it
+as a metric tensor: it measures how large a parameter step is in the space of
+probability distributions, not in the raw coordinate system of the parameters.
+
+For a fixed frozen reference Gibbs scheme $g_{\mathrm{ref},\ell}$ and current
+latent parameter vector $\phi$, define the candidate extended-state density
+\begin{equation}
+    p_\phi(\mathbf{x}, V, i)
+    =
+    \frac{
+        \exp \left[
+            g_{\mathrm{ref},\ell}(i)
+            -
+            u_\ell(\mathbf{x}, V, i; \phi)
+        \right]
+    }{
+        \mathcal{Z}_\ell(\phi)
+    }.
+    \label{eq:pphi}
+\end{equation}
+Here the dependence on $\phi$ enters only through the reduced potential; the
+frozen AWH Gibbs log-weights are held fixed.
+
+Now compare $p_\phi$ with a nearby candidate
+$p_{\phi + \delta \phi}$. The KL divergence from the current ensemble to the
+proposed ensemble is
+\begin{equation}
+    D_{\mathrm{KL}}
+    \left(
+        p_\phi
+        \,\|\, 
+        p_{\phi + \delta \phi}
+    \right)
+    =
+    \mathbb{E}_\phi
+    \left[
+        \log p_\phi
+        -
+        \log p_{\phi + \delta \phi}
+    \right].
+    \label{eq:kl}
 \end{equation}
 
-If $K_{\text{est}} \le \epsilon$, the step is safe.
-If $K_{\text{est}} > \epsilon$, we must scale the step vector by a scalar $c$ such that the new step $c \cdot \mathbf{d}_{\text{base}}$ sits precisely on the trust-region boundary.
-Because the FIM is a quadratic form, scaling the vector by $c$ scales the KL divergence by $c^2$:
+Taylor-expand the log density of the proposed distribution around $\phi$:
 \begin{equation}
-    \frac{1}{2} (c \cdot \mathbf{d}_{\text{base}})^T \mathcal{I}(\theta_n) (c \cdot \mathbf{d}_{\text{base}}) = c^2 \left( \frac{1}{2} \mathbf{d}_{\text{base}}^T \mathcal{I}(\theta_n) \mathbf{d}_{\text{base}} \right) = c^2 K_{\text{est}}
+    \log p_{\phi + \delta \phi}
+    =
+    \log p_\phi
+    +
+    \delta \phi^\top \mathbf{s}_\phi
+    +
+    \frac{1}{2}
+    \delta \phi^\top
+    H_\phi
+    \delta \phi
+    +
+    O(\|\delta \phi\|^3),
+    \label{eq:taylorlogp}
+\end{equation}
+where
+\begin{equation}
+    \mathbf{s}_\phi
+    =
+    \nabla_\phi \log p_\phi
+    \label{eq:score}
+\end{equation}
+is the score vector and
+\begin{equation}
+    H_\phi
+    =
+    \nabla_\phi^2 \log p_\phi
+    \label{eq:hessian}
+\end{equation}
+is the Hessian of the log density.
+
+Substituting Equation \eqref{eq:taylorlogp} into
+Equation \eqref{eq:kl} yields
+\begin{equation}
+    D_{\mathrm{KL}}
+    \left(
+        p_\phi
+        \,\|\, 
+        p_{\phi + \delta \phi}
+    \right)
+    =
+    -
+    \delta \phi^\top
+    \mathbb{E}_\phi[\mathbf{s}_\phi]
+    -
+    \frac{1}{2}
+    \delta \phi^\top
+    \mathbb{E}_\phi[H_\phi]
+    \delta \phi
+    +
+    O(\|\delta \phi\|^3).
+    \label{eq:kltaylor}
 \end{equation}
 
-Setting this equal to our target $\epsilon$ yields the exact scaling factor required to bound the update:
+The score expectation vanishes:
 \begin{equation}
-    c = \sqrt{\frac{\epsilon}{K_{\text{est}}}}
+    \mathbb{E}_\phi[\mathbf{s}_\phi]
+    =
+    \int p_\phi
+    \nabla_\phi \log p_\phi
+    =
+    \int \nabla_\phi p_\phi
+    =
+    \nabla_\phi \int p_\phi
+    =
+    \nabla_\phi 1
+    =
+    0.
+    \label{eq:scorezero}
+\end{equation}
+Therefore the linear term disappears and the \emph{first nonzero} contribution to
+the local KL divergence is second order:
+\begin{equation}
+    D_{\mathrm{KL}}
+    \left(
+        p_\phi
+        \,\|\, 
+        p_{\phi + \delta \phi}
+    \right)
+    =
+    \frac{1}{2}
+    \delta \phi^\top
+    \mathcal{I}(\phi)
+    \delta \phi
+    +
+    O(\|\delta \phi\|^3),
+    \label{eq:klmetric}
+\end{equation}
+where
+\begin{equation}
+    \mathcal{I}(\phi)
+    =
+    -
+    \mathbb{E}_\phi[H_\phi]
+    \label{eq:fimhessian}
+\end{equation}
+is the Fisher information matrix. Equation \eqref{eq:klmetric} is the reason the
+Fisher matrix is the natural metric tensor: its quadratic form is the local
+statistical distance induced by KL divergence.
+
+\section{From the KL Expansion to a Covariance of Energy Gradients}
+
+Under the usual regularity assumptions,
+\begin{equation}
+    \mathcal{I}(\phi)
+    =
+    \mathbb{E}_\phi
+    \left[
+        \mathbf{s}_\phi
+        \mathbf{s}_\phi^\top
+    \right].
+    \label{eq:fimscore}
+\end{equation}
+To turn this abstract definition into the object actually used by the code, we
+derive the score explicitly for the frozen Gibbs family in
+Equation \eqref{eq:pphi}.
+
+Taking the logarithm of Equation \eqref{eq:pphi} gives
+\begin{equation}
+    \log p_\phi(\mathbf{x}, V, i)
+    =
+    g_{\mathrm{ref},\ell}(i)
+    -
+    u_\ell(\mathbf{x}, V, i; \phi)
+    -
+    \log \mathcal{Z}_\ell(\phi).
+    \label{eq:logpphi}
+\end{equation}
+Differentiating with respect to $\phi$ yields
+\begin{equation}
+    \mathbf{s}_\phi(\mathbf{x}, V, i)
+    =
+    -
+    \nabla_\phi u_\ell(\mathbf{x}, V, i; \phi)
+    -
+    \nabla_\phi \log \mathcal{Z}_\ell(\phi).
+    \label{eq:score1}
+\end{equation}
+Now
+\begin{align}
+    \nabla_\phi \log \mathcal{Z}_\ell(\phi)
+    &=
+    \frac{1}{\mathcal{Z}_\ell(\phi)}
+    \nabla_\phi \mathcal{Z}_\ell(\phi)
+    \nonumber \\
+    &=
+    \frac{1}{\mathcal{Z}_\ell(\phi)}
+    \sum_i \int dV \int d\mathbf{x}
+    \left[
+        -
+        \nabla_\phi u_\ell(\mathbf{x}, V, i; \phi)
+    \right]
+    \nonumber \\
+    &\qquad \times
+    \exp \left[
+        g_{\mathrm{ref},\ell}(i)
+        -
+        u_\ell(\mathbf{x}, V, i; \phi)
+    \right]
+    \nonumber \\
+    &=
+    -
+    \mathbb{E}_\phi
+    \left[
+        \nabla_\phi u_\ell(\mathbf{x}, V, i; \phi)
+    \right].
+    \label{eq:gradlogz}
+\end{align}
+Substituting Equation \eqref{eq:gradlogz} into Equation \eqref{eq:score1}
+gives
+\begin{equation}
+    \mathbf{s}_\phi(\mathbf{x}, V, i)
+    =
+    -
+    \nabla_\phi u_\ell(\mathbf{x}, V, i; \phi)
+    +
+    \mathbb{E}_\phi
+    \left[
+        \nabla_\phi u_\ell(\mathbf{x}, V, i; \phi)
+    \right].
+    \label{eq:score2}
+\end{equation}
+This is already a centered quantity, so the Fisher matrix is the covariance of
+reduced-potential gradients:
+\begin{equation}
+    \mathcal{I}(\phi)
+    =
+    \mathrm{Cov}_\phi
+    \left(
+        \nabla_\phi u_\ell(\mathbf{x}, V, i; \phi)
+    \right).
+    \label{eq:fimcovu}
 \end{equation}
 
-\subsubsection{The Exact Optimization Step Sequence}
-Synthesizing these mechanics, the parameter update executed inside the offline optimization loop follows this strict sequence:
+Finally, because
+$u_\ell(\mathbf{x}, V, i; \phi) = \beta_\ell U_\ell(\mathbf{x}, i; \phi) + \beta_\ell P_\ell V$
+and the $pV$ term does not depend on $\phi$,
+\begin{equation}
+    \nabla_\phi u_\ell(\mathbf{x}, V, i; \phi)
+    =
+    \beta_\ell
+    \nabla_\phi U_\ell(\mathbf{x}, i; \phi),
+    \label{eq:gradubeta}
+\end{equation}
+which leads to the form used conceptually by the implementation:
+\begin{equation}
+    \mathcal{I}(\phi)
+    =
+    \mathrm{Cov}_\phi
+    \left(
+        \beta_\ell
+        \nabla_\phi U_\ell(\mathbf{x}, i; \phi)
+    \right).
+    \label{eq:fimcovgradu}
+\end{equation}
+Thus the Fisher matrix is not an arbitrary preconditioner. It is the covariance
+of the reduced-potential score vectors and the local metric tensor induced by KL
+divergence.
+
+\section{Empirical Reweighting, ESS, and the Practical Fisher Estimate}
+
+The formulas above are expectations under the current candidate distribution
+$p_\phi$, but the stored frames come from the frozen reference distribution
+$p_{\mathrm{ref}}$. The code therefore reweights the reference frames into the
+current candidate ensemble.
+
+For the full extended state $(\mathbf{x}, V, \lambda)$,
+\begin{equation}
+    \frac{
+        p_\phi(\mathbf{x}, V, \lambda)
+    }{
+        p_{\mathrm{ref}}(\mathbf{x}, V, \lambda)
+    }
+    =
+    \frac{
+        \mathcal{Z}_{\mathrm{ref}}
+    }{
+        \mathcal{Z}_\phi
+    }
+    \exp \left[
+        -
+        u_\ell(\mathbf{x}, V, \lambda; \phi)
+        +
+        u_{\mathrm{ref},\ell}(\mathbf{x}, V, \lambda)
+    \right].
+    \label{eq:ratio}
+\end{equation}
+Because the frozen Gibbs factor
+$g_{\mathrm{ref},\ell}(i_n)$ appears in both numerator and denominator, it
+cancels exactly. For a stored frame $n$ with visited lambda state $i_n$,
+the unnormalized reweighting factor used by the optimizer is therefore
+\begin{equation}
+    W_{\ell,n}(\phi)
+    \propto
+    \exp \left[
+        -
+        u_\ell(\mathbf{x}_n, V_n, i_n; \phi)
+        +
+        u_{\mathrm{ref},\ell}(\mathbf{x}_n, V_n, i_n)
+    \right].
+    \label{eq:wactive}
+\end{equation}
+For NPT legs, the $pV$ term also cancels because the same pressure is used in the
+reference and candidate ensembles. The normalized weights are
+\begin{equation}
+    \overline{W}_{\ell,n}(\phi)
+    =
+    \frac{
+        W_{\ell,n}(\phi)
+    }{
+        \sum_{j=1}^{M_\ell} W_{\ell,j}(\phi)
+    },
+    \label{eq:wnorm}
+\end{equation}
+and the effective sample size is
+\begin{equation}
+    \mathrm{ESS}_\ell(\phi)
+    =
+    \frac{1}{
+        \sum_{n=1}^{M_\ell}
+        \overline{W}_{\ell,n}(\phi)^2
+    }.
+    \label{eq:ess}
+\end{equation}
+
+The empirical score vector for frame $n$ is taken at the physically visited
+lambda state,
+\begin{equation}
+    \mathbf{s}_{\ell,n}(\phi)
+    =
+    \beta_\ell
+    \nabla_\phi
+    U_\ell(\mathbf{x}_n, i_n; \phi),
+    \label{eq:scoreemp}
+\end{equation}
+and the weighted empirical Fisher matrix is
+\begin{equation}
+    \widehat{\mathcal{I}}_\ell(\phi)
+    =
+    \sum_{n=1}^{M_\ell}
+    \overline{W}_{\ell,n}(\phi)
+    \left(
+        \mathbf{s}_{\ell,n}(\phi)
+        -
+        \overline{\mathbf{s}}_\ell(\phi)
+    \right)
+    \left(
+        \mathbf{s}_{\ell,n}(\phi)
+        -
+        \overline{\mathbf{s}}_\ell(\phi)
+    \right)^\top,
+    \label{eq:fimemp}
+\end{equation}
+with
+\begin{equation}
+    \overline{\mathbf{s}}_\ell(\phi)
+    =
+    \sum_{n=1}^{M_\ell}
+    \overline{W}_{\ell,n}(\phi)
+    \mathbf{s}_{\ell,n}(\phi).
+    \label{eq:meanemp}
+\end{equation}
+The full cycle Fisher matrix is the sum of the leg contributions in the shared
+latent parameter space.
+
+Because the first nonzero KL term is
+$\frac{1}{2} \delta \phi^\top \mathcal{I}(\phi) \delta \phi$, the optimizer uses
+the empirical Fisher matrix to define a trust region,
+\begin{equation}
+    D_{\mathrm{KL}}
+    \approx
+    \frac{1}{2}
+    \Delta \phi^\top
+    \widehat{\mathcal{I}}(\phi)
+    \Delta \phi.
+    \label{eq:kltrust}
+\end{equation}
+In the code, the empirical Fisher matrix is therefore not a decorative
+diagnostic. It is the operator that turns the Euclidean loss gradient into a
+natural-gradient-like base step, after which the optimizer applies diagonal
+normalization, eigentruncation, and KL-target scaling before the line search.
+The full logic is:
 \begin{enumerate}
-    \item \textbf{Evaluate FIM and Gradient:} Calculate $\mathcal{I}(\theta_n)$ and $\mathbf{g}_n$.
-    \item \textbf{Diagonal Preconditioning:} Compute the scaling matrix $D$ and evaluate the correlation matrix $\tilde{\mathcal{I}} = D \mathcal{I} D$ and the scaled gradient $\tilde{\mathbf{g}} = D \mathbf{g}_n$.
-    \item \textbf{Eigendecomposition:} Compute $\tilde{V}$ and $\tilde{\Sigma}$ from $\tilde{\mathcal{I}}$.
-    \item \textbf{Truncate and Invert:} Build $\tilde{\mathcal{I}}^+$ by inverting eigenvalues $\tilde{\lambda}_i > \tau$ and zeroing the remainder.
-    \item \textbf{Base Step:} Calculate the unconstrained preconditioned gradient $\Delta \tilde{\theta} = \tilde{\mathcal{I}}^+ \tilde{\mathbf{g}}$ and map it back to physical space $\mathbf{d}_{\text{base}} = D \Delta \tilde{\theta}$.
-    \item \textbf{Evaluate KL Distance:} Calculate $K_{\text{est}} = \frac{1}{2} \mathbf{d}_{\text{base}}^T \mathcal{I}(\theta_n) \mathbf{d}_{\text{base}}$.
-    \item \textbf{Determine Scaling Factor:} Apply $c = 1.0$ if $K_{\text{est}} \le \epsilon$, or $c = \sqrt{\epsilon / K_{\text{est}}}$ if $K_{\text{est}} > \epsilon$.
-    \item \textbf{Final Update:} Apply the strictly bounded step alongside the base learning rate $\eta$:
-    \begin{equation}
-        \theta_{n+1} = \theta_n - \eta \cdot c \cdot \mathbf{d}_{\text{base}}
-    \end{equation}
+    \item replay the frozen reference frames to obtain endpoint free energies and
+    endpoint gradients,
+    \item assemble the latent-space loss gradient from those endpoint
+    contributions,
+    \item estimate the empirical Fisher matrix from reweighted score vectors at
+    the visited lambda states,
+    \item use that Fisher matrix as the local metric tensor of the statistical
+    manifold,
+    \item bound the proposed update through the quadratic KL model in
+    Equation \eqref{eq:kltrust}.
 \end{enumerate}
-
-\subsection{Hyper-Velocity ESS Collapse and Backtracking Line Search}
-During offline optimization, importance sampling weights are evaluated via exponential differences, $W_k^{(n)} = \exp(-[u_k^{(n)} - u_k^{(0)}])$.
-Because exponentials are highly sensitive to steric clashes induced by shifting sensitive parameters (like LJ $\sigma$), a tiny fraction of frames will dominate the normalized weights, causing the Effective Sample Size (ESS) to plummet instantly.
-Rather than blindly applying an update and terminating the loop when the ESS check fails on the subsequent epoch, we implement a backtracking line search.
-A step scalar $\alpha = 1.0$ is proposed. If the proposed parameter set $\theta_{\text{prop}} = \theta_n - \alpha \mathbf{d}_n$ causes the ESS to collapse below the threshold, $\alpha$ is iteratively halved until a safe overlap is verified.
-
-\subsection{Endpoint Variance and Global MBAR Reweighting}
-Evaluating the loss gradient requires the free energy gradients strictly at the endpoints, $\lambda=1$ and $\lambda=0$.
-Because AWH distributes samples across the entire reaction coordinate, the subset of frames precisely at these boundaries is statistically impoverished, which could lead to variance-dominated gradient estimators.
-
-However, our choice to define the gradients using the MBAR identity (Equation \ref{eq:grad_loss_final}) over the \textit{entire} extended ensemble directly mitigates this.
-By reweighting all $M$ frames to the endpoints, we borrow statistical strength from neighboring alchemical windows to drastically suppress gradient noise. Note that for NPT trajectories, the reduced potential evaluated by MBAR to compute the weights $\omega_{k \to x}^{(n)}$ must explicitly incorporate the $PV$ term for each frame $k$: $u_x(\mathbf{x}_k, V_k) = \beta_x U_x(\theta, \mathbf{x}_k) + \beta_x P V_k$.
+This is why a KL target, rather than a raw Euclidean step length, is the natural
+quantity to bound. A step that is small in Euclidean coordinates can still be
+large in distribution space if it distorts the ensemble strongly, while a step
+that is large in a weakly constrained coordinate may still be statistically
+safe. The Fisher metric captures that distinction directly.

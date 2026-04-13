@@ -87,7 +87,106 @@ end
     @test AWHGrads.line_search_noise_tolerance(FT(-5.0), FT(0.1)) == FT(0.5)
     @test AWHGrads.line_search_residual_acceptable(FT(10.0), FT(10.9), FT(0.1))
     @test !AWHGrads.line_search_residual_acceptable(FT(10.0), FT(11.2), FT(0.1))
+    @test !AWHGrads.line_search_residual_acceptable(FT(10.0), FT(10.9), FT(0.1), FT(0.8))
     @test AWHGrads.default_optimization_config().max_inner_epochs == 10
+end
+
+@testset "pipeline stabilization helpers" begin
+    FT = Float32
+
+    @test AWHGrads.stage_b_near_pass_scale(:keep, FT(0.5)) == FT(1.0)
+    @test AWHGrads.stage_b_near_pass_scale(:shrink, FT(0.5)) == FT(0.5)
+
+    split_only = AWHGrads.StageBStats(
+        split_ready=false,
+        parity_ready=true,
+        endpoint_parity_ready=true,
+        support_coverage_ready=true,
+    )
+    @test AWHGrads.stage_b_is_split_only_candidate(split_only)
+    @test !AWHGrads.stage_b_is_split_only_candidate(AWHGrads.StageBStats(
+        split_ready=false,
+        parity_ready=false,
+        endpoint_parity_ready=true,
+        support_coverage_ready=true,
+    ))
+
+    @test :opt_stageB_health_scaling_enabled ∉ fieldnames(AWHGrads.OptimizationConfig)
+    @test :opt_stageB_health_min_scale ∉ fieldnames(AWHGrads.OptimizationConfig)
+    @test :opt_stageB_health_comfort_fraction ∉ fieldnames(AWHGrads.OptimizationConfig)
+
+    @test isnothing(AWHGrads.split_half_frame_indices(3, 4))
+    first_half, second_half = AWHGrads.split_half_frame_indices(4, 4)
+    @test collect(first_half) == [1, 2]
+    @test collect(second_half) == [3, 4]
+end
+
+@testset "optimization split-half confidence scaling" begin
+    FT = Float32
+    trainable_param_names = ["atom_c3_σ"]
+    energies = FT[
+        0.0  2.0;
+        0.0  2.0;
+        0.0  0.2;
+        0.0  0.2;
+    ]
+    gradients = Dict(
+        "atom_c3_σ" => FT[
+            0.0  1.0;
+            0.0  1.0;
+            0.0 -1.0;
+            0.0 -1.0;
+        ],
+    )
+    leg = AWHGrads.LegArtifacts(
+        name=:solvent,
+        coefficient=FT(1.0),
+        include_pv=false,
+        n_states=2,
+        coupled_state_idx=1,
+        decoupled_state_idx=2,
+        logger_prod=(active_idx_history=[1, 1, 1, 1],),
+        u_ref=copy(energies),
+        active_bias=(f=zeros(FT, 2), log_rho=zeros(FT, 2)),
+    )
+    grad_cycle, _ = AWHGrads.compute_leg_endpoint_state(
+        leg,
+        trainable_param_names,
+        gradients,
+        energies,
+        FT(1.0),
+        FT[];
+        compute_gradients=true,
+    )
+    opt_cfg = AWHGrads.optimization_config_with(
+        AWHGrads.default_optimization_config(FT=FT);
+        optimization_confidence_min_frames=4,
+        optimization_confidence_min_scale=FT(0.25),
+        optimization_confidence_scale_strength=FT(1.0),
+        optimization_confidence_residual_requirement_strength=FT(0.5),
+    )
+    summary = AWHGrads.compute_optimization_confidence_summary(
+        [leg],
+        Dict(:solvent => energies),
+        Dict(:solvent => gradients),
+        Dict(:solvent => FT[]),
+        trainable_param_names,
+        grad_cycle,
+        FT(1.0),
+        FT(0.0),
+        opt_cfg,
+        FT,
+    )
+
+    @test summary.enabled
+    @test summary.eligible_legs == 1
+    @test isempty(summary.skipped_legs)
+    @test summary.cycle_disagreement > 0
+    @test summary.gradient_disagreement > 0
+    @test FT(0.25) <= summary.scale < FT(1.0)
+    @test summary.additional_residual_requirement > 0
+    @test opt_cfg.kl_target * summary.scale < opt_cfg.kl_target
+    @test opt_cfg.max_phi_step_solute * summary.scale < opt_cfg.max_phi_step_solute
 end
 
 @testset "Molly dispersion correction unit stripping" begin

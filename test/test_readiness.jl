@@ -666,8 +666,23 @@ end
     @test opt_cfg.awh_stageB_near_pass_cooldown_blocks == 0
     @test opt_cfg.awh_stageB_probe_growth_factor == Float32(1.5)
     @test opt_cfg.awh_stageB_probe_near_pass_scale == Float32(0.5)
+    @test opt_cfg.awh_stageB_probe_near_pass_mode_solvent == :keep
+    @test opt_cfg.awh_stageB_probe_near_pass_mode_vacuum == :shrink
     @test opt_cfg.awh_stageB_probe_growth_ns == Float32(2.0)
+    @test opt_cfg.awh_stageB_split_extension_enabled
+    @test opt_cfg.awh_stageB_split_extension_max_segments == 3
     @test opt_cfg.awh_stageB_support_allow_missing == 3
+    @test :opt_stageB_health_scaling_enabled ∉ fieldnames(typeof(opt_cfg))
+    @test :opt_stageB_health_min_scale ∉ fieldnames(typeof(opt_cfg))
+    @test :opt_stageB_health_comfort_fraction ∉ fieldnames(typeof(opt_cfg))
+    @test opt_cfg.optimization_confidence_mode == :split_half
+    @test opt_cfg.optimization_confidence_min_frames == 200
+    @test opt_cfg.optimization_confidence_min_scale == Float32(0.25)
+    @test opt_cfg.optimization_confidence_scale_strength == Float32(1.0)
+    @test opt_cfg.optimization_confidence_residual_requirement_strength == Float32(0.25)
+    @test opt_cfg.readiness_log_mode == :concise
+    @test opt_cfg.awh_stageB_repeat_suppression
+    @test opt_cfg.optimization_log_mode == :default
 end
 
 @testset "full physical coverage gates initial-stage doubling" begin
@@ -1370,6 +1385,9 @@ end
     @test near_pass_policy.next_probe_steps == 50
     @test near_pass_policy.cooldown_blocks == 0
 
+    @test AWHGrads.stage_b_near_pass_scale(:keep, FT(0.5)) == FT(1.0)
+    @test AWHGrads.stage_b_near_pass_scale(:shrink, FT(0.5)) == FT(0.5)
+
     passed_policy = AWHGrads.stage_b_next_probe_policy(
         250,
         100,
@@ -1482,6 +1500,7 @@ end
     @test stats_from_probe.accumulation_mode == :single_probe
     @test !stats_from_probe.support_switch_ready
     @test stats_from_probe.n_evicted_frames == 0
+    @test stats_from_probe.n_total_states == 0
 
     probe_stats = (
         ready=false,

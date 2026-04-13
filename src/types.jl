@@ -227,8 +227,12 @@ Base.@kwdef struct OptimizationConfig
     awh_stageB_near_pass_cooldown_blocks::Int = 0
     awh_stageB_probe_growth_factor = Float32(1.5)
     awh_stageB_probe_near_pass_scale = Float32(0.5)
+    awh_stageB_probe_near_pass_mode_solvent::Symbol = :keep
+    awh_stageB_probe_near_pass_mode_vacuum::Symbol = :shrink
     awh_stageB_probe_max_factor = Float32(4.0)
     awh_stageB_probe_growth_ns = Float32(2.0)
+    awh_stageB_split_extension_enabled::Bool = true
+    awh_stageB_split_extension_max_segments::Int = 3
 
     awh_min_initial_df_threshold = Float32(0.1)
     awh_min_initial_state_occupancy = Float32(0.01)
@@ -239,6 +243,16 @@ Base.@kwdef struct OptimizationConfig
     awh_stageB_cooldown_growth_factor = Float32(1.5)
     awh_stageA_max_streak::Int = 10
     awh_stageB_max_cooldown::Int = 10
+
+    optimization_confidence_mode::Symbol = :split_half
+    optimization_confidence_min_frames::Int = 200
+    optimization_confidence_min_scale = Float32(0.25)
+    optimization_confidence_scale_strength = Float32(1.0)
+    optimization_confidence_residual_requirement_strength = Float32(0.25)
+
+    readiness_log_mode::Symbol = :concise
+    awh_stageB_repeat_suppression::Bool = true
+    optimization_log_mode::Symbol = :default
 
     k_sigmoid = Float32(1.0)
 end
@@ -368,6 +382,7 @@ Base.@kwdef struct StageBStats
     endpoint_parity_gap::Any = Inf
     endpoint_parity_ready::Bool = false
     support_coverage_ready::Bool = false
+    n_total_states::Int = 0
     n_frames::Int = 0
     dG_half_1::Any = NaN
     dG_half_2::Any = NaN
@@ -397,6 +412,7 @@ StageBStats(nt::NamedTuple) = StageBStats(
     endpoint_parity_gap = hasproperty(nt, :endpoint_parity_gap) ? nt.endpoint_parity_gap : nt.parity_gap,
     endpoint_parity_ready = hasproperty(nt, :endpoint_parity_ready) ? nt.endpoint_parity_ready : nt.parity_ready,
     support_coverage_ready = hasproperty(nt, :support_coverage_ready) ? nt.support_coverage_ready : false,
+    n_total_states = hasproperty(nt, :n_total_states) ? nt.n_total_states : 0,
     n_frames = nt.n_frames,
     dG_half_1 = nt.dG_half_1,
     dG_half_2 = nt.dG_half_2,

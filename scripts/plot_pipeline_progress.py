@@ -328,17 +328,27 @@ class OptimizationEpoch:
     target: Optional[float] = None
     residual: Optional[float] = None
     accepted_residual: Optional[float] = None
+    extra_residual_requirement: Optional[float] = None
     huber_dlde: Optional[float] = None
     grad_norm: Optional[float] = None
     grad_max: Optional[float] = None
     fim_raw_cond: Optional[float] = None
     truncated_eigs: Optional[int] = None
     fim_rank: Optional[int] = None
+    health_score: Optional[float] = None
+    health_scale: Optional[float] = None
+    confidence_scale: Optional[float] = None
+    confidence_endpoint_disagreement: Optional[float] = None
+    confidence_cycle_disagreement: Optional[float] = None
+    confidence_gradient_disagreement: Optional[float] = None
+    confidence_eligible_legs: Optional[int] = None
+    confidence_skipped_legs: List[str] = field(default_factory=list)
     kl_est: Optional[float] = None
     kl_target: Optional[float] = None
     kl_scaling: Optional[float] = None
     line_search_alpha: Optional[float] = None
     actual_max_phi_step: Optional[float] = None
+    max_solute_phi_step: Optional[float] = None
     params_min: Optional[float] = None
     params_max: Optional[float] = None
     line_search_iters: List[Dict[str, object]] = field(default_factory=list)
@@ -366,9 +376,16 @@ class LogParser:
     block_status_re = re.compile(r"AWH Block Status:\s*(.*?)\s*\|\s*spent_ns:\s*(.*)")
     stage_a_re = re.compile(r"Stage A \(([^)]+)\): (.*)")
     stage_b_re = re.compile(r"Stage B \(([^)]+)\): (.*)")
+    stage_b_cached_re = re.compile(r"Stage B Cached \(([^)]+)\): (.*)")
     stage_b_diag_re = re.compile(r"Stage B Diagnostics \(([^)]+)\): (.*)")
     probe_enter_re = re.compile(
         r"Stage A \(([^)]+)\) reached stable streak \((\d+)/(\d+)\); entering Stage B probe \| probe_steps=(\d+) \| probe_ns=([-\deE+.]+)"
+    )
+    probe_continue_re = re.compile(
+        r"Stage B \(([^)]+)\) continuing frozen probe \| segment=(\d+)/(\d+) \| probe_steps=(\d+) \| probe_ns=([-\deE+.]+)"
+    )
+    split_continue_re = re.compile(
+        r"Stage B \(([^)]+)\) split-only failure; continuing frozen probe in place \| next_segment_steps=(\d+) \| next_segment_ns=([-\deE+.]+) \| segments=(\d+)/(\d+)\."
     )
     cooldown_re = re.compile(r"Stage B \(([^)]+)\) cooldown active: remaining_checks=(\d+);")
     failure_keep_re = re.compile(
@@ -396,8 +413,16 @@ class LogParser:
     opt_metrics_re = re.compile(r"--- Optimization Metrics \(Epoch (\d+) - Block: (.+)\) ---")
     prediction_re = re.compile(r"Prediction:\s+.*?=\s*([-\deE+.]+)\s*kT\s+\|\s+Target\s*=\s*([-\deE+.]+)\s*kT")
     error_re = re.compile(r"Error:\s+Residual\s*=\s*([-\deE+.]+)\s+\|\s+Huber dL/dE\s*=\s*([-\deE+.]+)")
+    accepted_re = re.compile(r"Accepted:\s+Residual\s*=\s*([-\deE+.]+)\s+\|\s+Extra req\s*=\s*([-\deE+.]+)")
     gradients_re = re.compile(r"Gradients:\s+Norm\s*=\s*([-\deE+.]+)\s+\|\s+Max\s*=\s*([-\deE+.]+)")
     fim_re = re.compile(r"FIM .*?Raw Cond Number\s*=\s*([-\deE+.]+)\s+\|\s+Truncated Eigs\s*=\s*(\d+)\s*/\s*(\d+)")
+    trust_region_re = re.compile(
+        r"Trust Reg\.:.*?Health\s*=\s*([-\deE+.]+) \(scale=([-\deE+.]+)\) \| Confidence\s*=\s*([-\deE+.]+) \| KL target\s*=\s*([-\deE+.]+) \| Max solute .*?=\s*([-\deE+.]+)"
+    )
+    confidence_re = re.compile(
+        r"Confidence:\s+endpoint_ΔG\s*=\s*([-\deE+.]+) \| cycle\s*=\s*([-\deE+.]+) \| gradient\s*=\s*([-\deE+.]+) \| eligible_legs\s*=\s*(\d+)"
+    )
+    confidence_skipped_re = re.compile(r"Confidence:\s+skipped_legs\s*=\s*(.*)")
     kl_re = re.compile(r"KL Bound:\s+Est\. KL\s*=\s*([-\deE+.]+)\s+\|\s+Target\s*=\s*([-\deE+.]+)\s+\|\s+Scaling\s*=\s*([-\deE+.]+)")
     alpha_re = re.compile(r"Line Search:\s+Converged .*?=\s*([-\deE+.]+)")
     step_re = re.compile(r"Actual Step:\s+Max .*?=\s*([-\deE+.]+)\s+\(.*?=([-\deE+.]+)\)")
@@ -719,6 +744,19 @@ class LogParser:
             self.run.stage_b.append(snapshot)
             return
 
+        stage_b_cached_match = self.stage_b_cached_re.match(message)
+        if stage_b_cached_match:
+            leg = stage_b_cached_match.group(1).strip().lower()
+            details: Dict[str, object] = {}
+            for chunk in stage_b_cached_match.group(2).split("|"):
+                item = chunk.strip()
+                if "=" not in item:
+                    continue
+                key, value = item.split("=", 1)
+                details[key.strip()] = value.strip()
+            self._append_control(line_no, leg, "stage_b_cached", details)
+            return
+
         diag_match = self.stage_b_diag_re.match(message)
         if diag_match:
             leg = diag_match.group(1).strip().lower()
@@ -741,6 +779,38 @@ class LogParser:
                     "target_streak": to_int(probe_enter_match.group(3)),
                     "probe_steps": to_int(probe_enter_match.group(4)),
                     "probe_ns": to_float(probe_enter_match.group(5)),
+                },
+            )
+            return
+
+        probe_continue_match = self.probe_continue_re.match(message)
+        if probe_continue_match:
+            leg = probe_continue_match.group(1).strip().lower()
+            self.pending_stage_b_snapshot_fresh[leg] = True
+            self._append_control(
+                line_no,
+                leg,
+                "probe_continue",
+                {
+                    "segment": to_int(probe_continue_match.group(2)),
+                    "max_segments": to_int(probe_continue_match.group(3)),
+                    "probe_steps": to_int(probe_continue_match.group(4)),
+                    "probe_ns": to_float(probe_continue_match.group(5)),
+                },
+            )
+            return
+
+        split_continue_match = self.split_continue_re.match(message)
+        if split_continue_match:
+            self._append_control(
+                line_no,
+                split_continue_match.group(1).strip().lower(),
+                "split_only_continue",
+                {
+                    "next_probe_steps": to_int(split_continue_match.group(2)),
+                    "next_probe_ns": to_float(split_continue_match.group(3)),
+                    "segment": to_int(split_continue_match.group(4)),
+                    "max_segments": to_int(split_continue_match.group(5)),
                 },
             )
             return
@@ -921,6 +991,12 @@ class LogParser:
                 self.current_opt_epoch.huber_dlde = to_float(error_match.group(2))
                 return
 
+            accepted_match = self.accepted_re.search(message)
+            if accepted_match:
+                self.current_opt_epoch.accepted_residual = to_float(accepted_match.group(1))
+                self.current_opt_epoch.extra_residual_requirement = to_float(accepted_match.group(2))
+                return
+
             gradients_match = self.gradients_re.search(message)
             if gradients_match:
                 self.current_opt_epoch.grad_norm = to_float(gradients_match.group(1))
@@ -932,6 +1008,29 @@ class LogParser:
                 self.current_opt_epoch.fim_raw_cond = to_float(fim_match.group(1))
                 self.current_opt_epoch.truncated_eigs = to_int(fim_match.group(2))
                 self.current_opt_epoch.fim_rank = to_int(fim_match.group(3))
+                return
+
+            trust_region_match = self.trust_region_re.search(message)
+            if trust_region_match:
+                self.current_opt_epoch.health_score = to_float(trust_region_match.group(1))
+                self.current_opt_epoch.health_scale = to_float(trust_region_match.group(2))
+                self.current_opt_epoch.confidence_scale = to_float(trust_region_match.group(3))
+                self.current_opt_epoch.kl_target = to_float(trust_region_match.group(4))
+                self.current_opt_epoch.max_solute_phi_step = to_float(trust_region_match.group(5))
+                return
+
+            confidence_match = self.confidence_re.search(message)
+            if confidence_match:
+                self.current_opt_epoch.confidence_endpoint_disagreement = to_float(confidence_match.group(1))
+                self.current_opt_epoch.confidence_cycle_disagreement = to_float(confidence_match.group(2))
+                self.current_opt_epoch.confidence_gradient_disagreement = to_float(confidence_match.group(3))
+                self.current_opt_epoch.confidence_eligible_legs = to_int(confidence_match.group(4))
+                return
+
+            confidence_skipped_match = self.confidence_skipped_re.search(message)
+            if confidence_skipped_match:
+                skipped = confidence_skipped_match.group(1).strip()
+                self.current_opt_epoch.confidence_skipped_legs = [item for item in skipped.split(",") if item]
                 return
 
             kl_match = self.kl_re.search(message)

@@ -29,6 +29,342 @@ function phase_timing_metadata(
 end
 
 
+
+function analyze_stage_b_probe(
+    probe_sim::AWHSimulation,
+    bias_data,
+    sys_base,
+    theta_params::Vector{FT},
+    param_names::Vector{String},
+    idxs,
+    coupled_state_idx::Int,
+    decoupled_state_idx::Int,
+    beta::BT,
+    awh_split_tol_kT::ST,
+    awh_parity_tol_kT::PTT;
+    leg_name::String,
+    include_pv::Bool=false,
+    P0_energy_per_vol::PV=zero(BT),
+    probe_frame_stride::Int=1,
+    probe_min_frames::Int=2,
+    probe_max_frames::Int=0,
+    awh_probe_discard_fraction::Real=0.0,
+    parity_gate_mode::Symbol=:support_aware_max,
+    parity_support_threshold::SP=zero(BT),
+    parity_near_pass_factor::NP=BT(2),
+    support_allow_missing::Int=0,
+    probe_tail_state_idxs::Vector{Int}=Int[],
+    probe_tail_min_state_occupancy_floor::FT=zero(FT),
+    probe_md_timed=nothing,
+) where {
+    FT <: AbstractFloat,
+    BT <: AbstractFloat,
+    ST <: AbstractFloat,
+    PTT <: AbstractFloat,
+    PV <: AbstractFloat,
+    SP <: AbstractFloat,
+    NP <: AbstractFloat,
+}
+    ET = promote_energy_analysis_type(
+        beta,
+        awh_split_tol_kT,
+        awh_parity_tol_kT,
+        P0_energy_per_vol,
+        parity_support_threshold,
+        parity_near_pass_factor,
+    )
+    n_total_states = length(probe_sim.state.partition.λ_atoms)
+    logger_probe_raw = get_production_logger(probe_sim, "$leg_name probe")
+    n_frames_raw = length(logger_probe_raw.active_idx_history)
+    if n_frames_raw < 2
+        @info "Stage B ($(leg_name)) early exit: insufficient probe frames (n_frames=$n_frames_raw, required=2)$(stage_b_probe_timing_suffix(probe_md_timed))"
+        return stage_b_probe_empty_result(ET, n_frames_raw, n_total_states)
+    end
+
+    probe_selection = select_probe_frame_indices(
+        n_frames_raw;
+        frame_stride=probe_frame_stride,
+        min_frames=probe_min_frames,
+        max_frames=probe_max_frames,
+        discard_fraction=awh_probe_discard_fraction,
+    )
+    n_frames_selected = length(probe_selection.selected)
+    n_frames = length(probe_selection.retained)
+    max_frames_msg = probe_max_frames > 0 ? string(probe_max_frames) : "none"
+    @info "Stage B ($(leg_name)) probe frame selection: raw_frames=$n_frames_raw | selected_frames=$n_frames_selected | retained_frames=$n_frames | discard_fraction=$(round(Float64(awh_probe_discard_fraction), digits=3)) | stride=$(max(1, probe_frame_stride)) | min_frames=$(max(2, probe_min_frames)) | max_frames=$max_frames_msg"
+
+    if n_frames < 2
+        @info "Stage B ($(leg_name)) early exit: insufficient retained probe frames after discard (n_frames=$n_frames, required=2)$(stage_b_probe_timing_suffix(probe_md_timed))"
+        return stage_b_probe_empty_result(ET, n_frames, n_total_states)
+    end
+
+    logger_probe = subset_awh_logger_frames(logger_probe_raw, probe_selection.retained)
+    n_frames = length(logger_probe.active_idx_history)
+
+    nbrs_probe_timed = timed_phase("Stage B Neighbor Precompute", leg_name) do
+        precompute_neighbors(logger_probe, probe_sim.state.active_sys)
+    end
+    nbrs_probe = nbrs_probe_timed.result
+
+    ensemble_eval_timed = timed_phase("Stage B Ensemble Eval", leg_name) do
+        evaluate_ensemble(
+            logger_probe, nbrs_probe, probe_sim, sys_base,
+            theta_params, param_names, idxs...; compute_gradients=false
+        )
+    end
+    u_probe_ref, _ = ensemble_eval_timed.result
+
+    log_gibbs_weights = awh_log_gibbs_weights(bias_data)
+    volumes_probe = include_pv ? ET.(ustrip.(logger_probe.volume_history)) : ET[]
+    log_mixture_denom = include_pv ?
+        reference_log_mixture_denominator(
+            u_probe_ref,
+            log_gibbs_weights,
+            beta;
+            volumes=volumes_probe,
+            P0_energy_per_vol=P0_energy_per_vol,
+        ) :
+        reference_log_mixture_denominator(
+            u_probe_ref,
+            log_gibbs_weights,
+            beta,
+        )
+
+    split_parity_timed = timed_phase("Stage B Split-Parity", leg_name) do
+        compute_stage_b_split_parity(
+            u_probe_ref,
+            log_mixture_denom,
+            bias_data.f,
+            coupled_state_idx,
+            decoupled_state_idx,
+            beta,
+            awh_split_tol_kT,
+            awh_parity_tol_kT,
+            volumes=volumes_probe,
+            P0_energy_per_vol=include_pv ? P0_energy_per_vol : zero(ET),
+            parity_gate_mode=parity_gate_mode,
+            parity_support_threshold=parity_support_threshold,
+            parity_near_pass_factor=parity_near_pass_factor,
+            support_allow_missing=support_allow_missing,
+        )
+    end
+
+    split_parity = split_parity_timed.result
+    dG_half_1 = split_parity.dG_half_1
+    dG_half_2 = split_parity.dG_half_2
+    split_gap = split_parity.split_gap
+    split_ready = split_parity.split_ready
+    parity_gap = split_parity.parity_gap
+    parity_ready = split_parity.parity_ready
+    probe_residence = residence_length_summary(logger_probe.active_idx_history, FT)
+    probe_occupancies = state_occupancy_fractions(logger_probe.active_idx_history, size(u_probe_ref, 2), FT)
+    probe_endpoint_low, probe_endpoint_high = endpoint_occupancy_fractions(
+        logger_probe.active_idx_history,
+        coupled_state_idx,
+        decoupled_state_idx,
+    )
+    hotspot_occ_entries = String[]
+    for idx in split_parity.parity_top_state_idxs
+        if 1 <= idx <= length(probe_occupancies)
+            push!(hotspot_occ_entries, "λ$(idx)=$(round(probe_occupancies[idx], digits=4))")
+        end
+    end
+    valid_tail_state_idxs = sort(unique(filter(idx -> 1 <= idx <= length(probe_occupancies), probe_tail_state_idxs)))
+    tail_occupancy = isempty(valid_tail_state_idxs) ? zero(FT) : sum(probe_occupancies[valid_tail_state_idxs])
+    tail_min_state_occupancy = isempty(valid_tail_state_idxs) ? zero(FT) : minimum(probe_occupancies[valid_tail_state_idxs])
+    tail_low_occupancy_states = isempty(valid_tail_state_idxs) ? Int[] : [
+        idx for idx in valid_tail_state_idxs if probe_occupancies[idx] < probe_tail_min_state_occupancy_floor
+    ]
+    parity_residual = hasproperty(split_parity, :parity_residual) ? split_parity.parity_residual : ET[]
+    tail_residual_entries = isempty(valid_tail_state_idxs) || isempty(parity_residual) ? String[] : [
+        "λ$(idx)=$(round(parity_residual[idx], digits=4))" for idx in valid_tail_state_idxs
+    ]
+    diagnostics = split_parity.diagnostics *
+        " | probe_switches=$(probe_residence.switch_count)" *
+        " | probe_dwell_samples=(mean=$(round(probe_residence.mean_residence, digits=2)), med=$(round(probe_residence.median_residence, digits=2)))"
+    if !isempty(hotspot_occ_entries)
+        diagnostics *= " | probe_occ=[" * join(hotspot_occ_entries, "; ") * "]"
+    end
+    diagnostics *= " | probe_endpt=(low=$(round(probe_endpoint_low, digits=4)), high=$(round(probe_endpoint_high, digits=4)))"
+    if !isempty(valid_tail_state_idxs)
+        tail_low_msg = isempty(tail_low_occupancy_states) ? "-" : join(["λ$(idx)" for idx in tail_low_occupancy_states], ",")
+        diagnostics *= " | probe_tail=(total=$(round(tail_occupancy, digits=4)), min=$(round(tail_min_state_occupancy, digits=4)), low=$tail_low_msg)"
+    end
+    if !isempty(tail_residual_entries)
+        diagnostics *= " | tail_resid=[" * join(tail_residual_entries, "; ") * "]"
+    end
+    parity_worst_state_idx = split_parity.parity_worst_state_idx
+    parity_worst_state_residual = split_parity.parity_worst_state_residual
+
+    return (
+        ready = split_parity.ready,
+        split_ready = split_ready,
+        split_gap = split_gap,
+        parity_ready = parity_ready,
+        parity_gap = parity_gap,
+        raw_parity_gap = split_parity.raw_parity_gap,
+        supported_parity_gap = split_parity.supported_parity_gap,
+        endpoint_parity_gap = split_parity.endpoint_parity_gap,
+        endpoint_parity_ready = split_parity.endpoint_parity_ready,
+        n_total_states = n_total_states,
+        n_frames = n_frames,
+        dG_half_1 = dG_half_1,
+        dG_half_2 = dG_half_2,
+        diagnostics = diagnostics,
+        parity_worst_state_idx = parity_worst_state_idx,
+        parity_worst_state_residual = parity_worst_state_residual,
+        n_supported_states = split_parity.n_supported_states,
+        support_threshold = split_parity.support_threshold,
+        support_coverage_ready = split_parity.support_coverage_ready,
+        required_supported_states = split_parity.required_supported_states,
+        failure_mode = split_parity.failure_mode,
+        near_pass = split_parity.near_pass,
+        probe_energies = u_probe_ref,
+        probe_log_mixture_denom = log_mixture_denom,
+        probe_volumes = volumes_probe,
+    )
+end
+
+
+function advance_stage_b_probe!(
+    probe_sim::AWHSimulation,
+    bias_data,
+    md_steps_segment::Int,
+    sys_base,
+    theta_params::Vector{FT},
+    param_names::Vector{String},
+    idxs,
+    coupled_state_idx::Int,
+    decoupled_state_idx::Int,
+    beta::BT,
+    awh_split_tol_kT::ST,
+    awh_parity_tol_kT::PTT;
+    leg_name::String,
+    include_pv::Bool=false,
+    P0_energy_per_vol::PV=zero(BT),
+    probe_frame_stride::Int=1,
+    probe_min_frames::Int=2,
+    probe_max_frames::Int=0,
+    awh_probe_discard_fraction::Real=0.0,
+    parity_gate_mode::Symbol=:support_aware_max,
+    parity_support_threshold::SP=zero(BT),
+    parity_near_pass_factor::NP=BT(2),
+    support_allow_missing::Int=0,
+    probe_tail_state_idxs::Vector{Int}=Int[],
+    probe_tail_min_state_occupancy_floor::FT=zero(FT),
+) where {
+    FT <: AbstractFloat,
+    BT <: AbstractFloat,
+    ST <: AbstractFloat,
+    PTT <: AbstractFloat,
+    PV <: AbstractFloat,
+    SP <: AbstractFloat,
+    NP <: AbstractFloat,
+}
+    probe_md_timed = timed_phase("Stage B Probe MD", leg_name; md_steps=md_steps_segment) do
+        simulate!(probe_sim, md_steps_segment)
+    end
+    return analyze_stage_b_probe(
+        probe_sim,
+        bias_data,
+        sys_base,
+        theta_params,
+        param_names,
+        idxs,
+        coupled_state_idx,
+        decoupled_state_idx,
+        beta,
+        awh_split_tol_kT,
+        awh_parity_tol_kT;
+        leg_name=leg_name,
+        include_pv=include_pv,
+        P0_energy_per_vol=P0_energy_per_vol,
+        probe_frame_stride=probe_frame_stride,
+        probe_min_frames=probe_min_frames,
+        probe_max_frames=probe_max_frames,
+        awh_probe_discard_fraction=awh_probe_discard_fraction,
+        parity_gate_mode=parity_gate_mode,
+        parity_support_threshold=parity_support_threshold,
+        parity_near_pass_factor=parity_near_pass_factor,
+        support_allow_missing=support_allow_missing,
+        probe_tail_state_idxs=probe_tail_state_idxs,
+        probe_tail_min_state_occupancy_floor=probe_tail_min_state_occupancy_floor,
+        probe_md_timed=probe_md_timed,
+    )
+end
+
+
+function start_stage_b_probe(
+    awh_sim::AWHSimulation,
+    sys_base,
+    theta_params::Vector{FT},
+    param_names::Vector{String},
+    idxs,
+    coupled_state_idx::Int,
+    decoupled_state_idx::Int,
+    beta::BT,
+    awh_split_tol_kT::ST,
+    awh_parity_tol_kT::PTT;
+    md_steps_probe::Int,
+    leg_name::String,
+    probe_num_md_steps::Union{Nothing, Int}=nothing,
+    include_pv::Bool=false,
+    P0_energy_per_vol::PV=zero(BT),
+    probe_frame_stride::Int=1,
+    probe_min_frames::Int=2,
+    probe_max_frames::Int=0,
+    awh_probe_discard_fraction::Real=0.0,
+    parity_gate_mode::Symbol=:support_aware_max,
+    parity_support_threshold::SP=zero(BT),
+    parity_near_pass_factor::NP=BT(2),
+    support_allow_missing::Int=0,
+    probe_tail_state_idxs::Vector{Int}=Int[],
+    probe_tail_min_state_occupancy_floor::FT=zero(FT),
+) where {
+    FT <: AbstractFloat,
+    BT <: AbstractFloat,
+    ST <: AbstractFloat,
+    PTT <: AbstractFloat,
+    PV <: AbstractFloat,
+    SP <: AbstractFloat,
+    NP <: AbstractFloat,
+}
+    probe_sim, bias_data = build_stage_b_probe_sim(
+        awh_sim,
+        md_steps_probe;
+        probe_num_md_steps=probe_num_md_steps,
+    )
+    probe_stats = advance_stage_b_probe!(
+        probe_sim,
+        bias_data,
+        md_steps_probe,
+        sys_base,
+        theta_params,
+        param_names,
+        idxs,
+        coupled_state_idx,
+        decoupled_state_idx,
+        beta,
+        awh_split_tol_kT,
+        awh_parity_tol_kT;
+        leg_name=leg_name,
+        include_pv=include_pv,
+        P0_energy_per_vol=P0_energy_per_vol,
+        probe_frame_stride=probe_frame_stride,
+        probe_min_frames=probe_min_frames,
+        probe_max_frames=probe_max_frames,
+        awh_probe_discard_fraction=awh_probe_discard_fraction,
+        parity_gate_mode=parity_gate_mode,
+        parity_support_threshold=parity_support_threshold,
+        parity_near_pass_factor=parity_near_pass_factor,
+        support_allow_missing=support_allow_missing,
+        probe_tail_state_idxs=probe_tail_state_idxs,
+        probe_tail_min_state_occupancy_floor=probe_tail_min_state_occupancy_floor,
+    )
+    return (probe_sim=probe_sim, bias_data=bias_data, stats=probe_stats)
+end
+
+
 """
     timed_phase(phase, leg_name, op; md_steps=nothing)
 
@@ -617,6 +953,44 @@ function build_stage_b_probe_sim(
     )
 end
 
+function stage_b_probe_timing_suffix(probe_md_timed)
+    if isnothing(probe_md_timed)
+        return ""
+    end
+    return " | probe_md_wall_s=$(round(probe_md_timed.timing.wall_s, digits=3)) | probe_md_steps_per_s=$(round(probe_md_timed.timing.steps_per_s, digits=2))"
+end
+
+
+function stage_b_probe_empty_result(::Type{ET}, n_frames::Int, n_total_states::Int) where {ET <: AbstractFloat}
+    return (
+        ready = false,
+        split_ready = false,
+        split_gap = ET(Inf),
+        parity_ready = false,
+        parity_gap = ET(Inf),
+        raw_parity_gap = ET(Inf),
+        supported_parity_gap = ET(Inf),
+        endpoint_parity_gap = ET(Inf),
+        endpoint_parity_ready = false,
+        n_total_states = n_total_states,
+        n_frames = n_frames,
+        dG_half_1 = ET(NaN),
+        dG_half_2 = ET(NaN),
+        diagnostics = "",
+        parity_worst_state_idx = 0,
+        parity_worst_state_residual = ET(NaN),
+        n_supported_states = 0,
+        support_threshold = zero(ET),
+        support_coverage_ready = false,
+        required_supported_states = 0,
+        failure_mode = :insufficient_frames,
+        near_pass = false,
+        probe_energies = zeros(ET, max(0, n_frames), max(0, n_total_states)),
+        probe_log_mixture_denom = ET[],
+        probe_volumes = ET[],
+    )
+end
+
 """
     stage_b_parity_diagnostics(parity_residual, ess_by_state; top_k=3)
 
@@ -1066,232 +1440,43 @@ function run_stage_b_probe(
     SP <: AbstractFloat,
     NP <: AbstractFloat,
 }
-    ET = promote_energy_analysis_type(
-        beta,
-        awh_split_tol_kT,
-        awh_parity_tol_kT,
-        P0_energy_per_vol,
-        parity_support_threshold,
-        parity_near_pass_factor,
-    )
     if md_steps_probe <= 0
-        @info "Stage B ($(leg_name)) skipped: md_steps_probe <= 0 (md_steps_probe=$md_steps_probe)."
-        return (
-            ready = false,
-            split_ready = false,
-            split_gap = ET(Inf),
-            parity_ready = false,
-            parity_gap = ET(Inf),
-            n_frames = 0,
-            dG_half_1 = ET(NaN),
-            dG_half_2 = ET(NaN),
-            diagnostics = "",
-            parity_worst_state_idx = 0,
-            parity_worst_state_residual = ET(NaN),
-            support_coverage_ready = false,
-            required_supported_states = 0,
-            probe_energies = zeros(ET, 0, 0),
-            probe_log_mixture_denom = ET[],
-            probe_volumes = ET[],
-        )
-    end
-
-    # Probe on a cloned state so a failed Stage B check does not disturb the
-    # main leg that continues accumulating readiness statistics. The cloned
-    # probe keeps the sampling bias fixed so MBAR and AWH are compared against
-    # the same bias profile.
-    probe_sim, bias_data = build_stage_b_probe_sim(
-        awh_sim,
-        md_steps_probe;
-        probe_num_md_steps=probe_num_md_steps,
-    )
-    probe_md_timed = timed_phase("Stage B Probe MD", leg_name; md_steps=md_steps_probe) do
-        simulate!(probe_sim, md_steps_probe)
-    end
-
-    logger_probe_raw = get_production_logger(probe_sim, "$leg_name probe")
-    n_frames_raw = length(logger_probe_raw.active_idx_history)
-    if n_frames_raw < 2
-        @info "Stage B ($(leg_name)) early exit: insufficient probe frames (n_frames=$n_frames_raw, required=2) | probe_md_wall_s=$(round(probe_md_timed.timing.wall_s, digits=3)) | probe_md_steps_per_s=$(round(probe_md_timed.timing.steps_per_s, digits=2))"
-        return (
-            ready = false,
-            split_ready = false,
-            split_gap = ET(Inf),
-            parity_ready = false,
-            parity_gap = ET(Inf),
-            n_frames = n_frames_raw,
-            dG_half_1 = ET(NaN),
-            dG_half_2 = ET(NaN),
-            diagnostics = "",
-            parity_worst_state_idx = 0,
-            parity_worst_state_residual = ET(NaN),
-            support_coverage_ready = false,
-            required_supported_states = 0,
-            probe_energies = zeros(ET, 0, 0),
-            probe_log_mixture_denom = ET[],
-            probe_volumes = ET[],
-        )
-    end
-
-    probe_selection = select_probe_frame_indices(
-        n_frames_raw;
-        frame_stride=probe_frame_stride,
-        min_frames=probe_min_frames,
-        max_frames=probe_max_frames,
-        discard_fraction=awh_probe_discard_fraction,
-    )
-    n_frames_selected = length(probe_selection.selected)
-    n_frames = length(probe_selection.retained)
-    max_frames_msg = probe_max_frames > 0 ? string(probe_max_frames) : "none"
-    @info "Stage B ($(leg_name)) probe frame selection: raw_frames=$n_frames_raw | selected_frames=$n_frames_selected | retained_frames=$n_frames | discard_fraction=$(round(Float64(awh_probe_discard_fraction), digits=3)) | stride=$(max(1, probe_frame_stride)) | min_frames=$(max(2, probe_min_frames)) | max_frames=$max_frames_msg"
-
-    if n_frames < 2
-        @info "Stage B ($(leg_name)) early exit: insufficient retained probe frames after discard (n_frames=$n_frames, required=2) | probe_md_wall_s=$(round(probe_md_timed.timing.wall_s, digits=3)) | probe_md_steps_per_s=$(round(probe_md_timed.timing.steps_per_s, digits=2))"
-        return (
-            ready = false,
-            split_ready = false,
-            split_gap = ET(Inf),
-            parity_ready = false,
-            parity_gap = ET(Inf),
-            n_frames = n_frames,
-            dG_half_1 = ET(NaN),
-            dG_half_2 = ET(NaN),
-            diagnostics = "",
-            parity_worst_state_idx = 0,
-            parity_worst_state_residual = ET(NaN),
-            support_coverage_ready = false,
-            required_supported_states = 0,
-            probe_energies = zeros(ET, 0, 0),
-            probe_log_mixture_denom = ET[],
-            probe_volumes = ET[],
-        )
-    end
-
-    logger_probe = subset_awh_logger_frames(logger_probe_raw, probe_selection.retained)
-    n_frames = length(logger_probe.active_idx_history)
-
-    nbrs_probe_timed = timed_phase("Stage B Neighbor Precompute", leg_name) do
-        precompute_neighbors(logger_probe, probe_sim.state.active_sys)
-    end
-    nbrs_probe = nbrs_probe_timed.result
-
-    ensemble_eval_timed = timed_phase("Stage B Ensemble Eval", leg_name) do
-        evaluate_ensemble(
-            logger_probe, nbrs_probe, probe_sim, sys_base,
-            theta_params, param_names, idxs...; compute_gradients=false
-        )
-    end
-    u_probe_ref, _ = ensemble_eval_timed.result
-
-    # Molly's AWH "bias" is a λ-state Gibbs log-weight, not a force bias. MBAR
-    # must use the fixed log-weights g_ref = f_ref + logρ_ref in the mixture
-    # denominator, matching `process_sample` in Molly's AWH implementation.
-    log_gibbs_weights = awh_log_gibbs_weights(bias_data)
-    volumes_probe = include_pv ? ET.(ustrip.(logger_probe.volume_history)) : ET[]
-    log_mixture_denom = include_pv ?
-        reference_log_mixture_denominator(
-            u_probe_ref,
-            log_gibbs_weights,
-            beta;
-            volumes=volumes_probe,
-            P0_energy_per_vol=P0_energy_per_vol,
-        ) :
-        reference_log_mixture_denominator(
-            u_probe_ref,
-            log_gibbs_weights,
-            beta,
-        )
-
-    split_parity_timed = timed_phase("Stage B Split-Parity", leg_name) do
-        compute_stage_b_split_parity(
-            u_probe_ref,
-            log_mixture_denom,
-            bias_data.f,
-            coupled_state_idx,
-            decoupled_state_idx,
+        ET = promote_energy_analysis_type(
             beta,
             awh_split_tol_kT,
             awh_parity_tol_kT,
-            volumes=volumes_probe,
-            P0_energy_per_vol=include_pv ? P0_energy_per_vol : zero(ET),
-            parity_gate_mode=parity_gate_mode,
-            parity_support_threshold=parity_support_threshold,
-            parity_near_pass_factor=parity_near_pass_factor,
-            support_allow_missing=support_allow_missing,
+            P0_energy_per_vol,
+            parity_support_threshold,
+            parity_near_pass_factor,
         )
+        @info "Stage B ($(leg_name)) skipped: md_steps_probe <= 0 (md_steps_probe=$md_steps_probe)."
+        return stage_b_probe_empty_result(ET, 0, 0)
     end
-
-    split_parity = split_parity_timed.result
-    dG_half_1 = split_parity.dG_half_1
-    dG_half_2 = split_parity.dG_half_2
-    split_gap = split_parity.split_gap
-    split_ready = split_parity.split_ready
-    parity_gap = split_parity.parity_gap
-    parity_ready = split_parity.parity_ready
-    probe_residence = residence_length_summary(logger_probe.active_idx_history, FT)
-    probe_occupancies = state_occupancy_fractions(logger_probe.active_idx_history, size(u_probe_ref, 2), FT)
-    probe_endpoint_low, probe_endpoint_high = endpoint_occupancy_fractions(
-        logger_probe.active_idx_history,
+    return start_stage_b_probe(
+        awh_sim,
+        sys_base,
+        theta_params,
+        param_names,
+        idxs,
         coupled_state_idx,
         decoupled_state_idx,
-    )
-    hotspot_occ_entries = String[]
-    for idx in split_parity.parity_top_state_idxs
-        if 1 <= idx <= length(probe_occupancies)
-            push!(hotspot_occ_entries, "λ$(idx)=$(round(probe_occupancies[idx], digits=4))")
-        end
-    end
-    valid_tail_state_idxs = sort(unique(filter(idx -> 1 <= idx <= length(probe_occupancies), probe_tail_state_idxs)))
-    tail_occupancy = isempty(valid_tail_state_idxs) ? zero(FT) : sum(probe_occupancies[valid_tail_state_idxs])
-    tail_min_state_occupancy = isempty(valid_tail_state_idxs) ? zero(FT) : minimum(probe_occupancies[valid_tail_state_idxs])
-    tail_low_occupancy_states = isempty(valid_tail_state_idxs) ? Int[] : [
-        idx for idx in valid_tail_state_idxs if probe_occupancies[idx] < probe_tail_min_state_occupancy_floor
-    ]
-    parity_residual = hasproperty(split_parity, :parity_residual) ? split_parity.parity_residual : ET[]
-    tail_residual_entries = isempty(valid_tail_state_idxs) || isempty(parity_residual) ? String[] : [
-        "λ$(idx)=$(round(parity_residual[idx], digits=4))" for idx in valid_tail_state_idxs
-    ]
-    diagnostics = split_parity.diagnostics *
-        " | probe_switches=$(probe_residence.switch_count)" *
-        " | probe_dwell_samples=(mean=$(round(probe_residence.mean_residence, digits=2)), med=$(round(probe_residence.median_residence, digits=2)))"
-    if !isempty(hotspot_occ_entries)
-        diagnostics *= " | probe_occ=[" * join(hotspot_occ_entries, "; ") * "]"
-    end
-    diagnostics *= " | probe_endpt=(low=$(round(probe_endpoint_low, digits=4)), high=$(round(probe_endpoint_high, digits=4)))"
-    if !isempty(valid_tail_state_idxs)
-        tail_low_msg = isempty(tail_low_occupancy_states) ? "-" : join(["λ$(idx)" for idx in tail_low_occupancy_states], ",")
-        diagnostics *= " | probe_tail=(total=$(round(tail_occupancy, digits=4)), min=$(round(tail_min_state_occupancy, digits=4)), low=$tail_low_msg)"
-    end
-    if !isempty(tail_residual_entries)
-        diagnostics *= " | tail_resid=[" * join(tail_residual_entries, "; ") * "]"
-    end
-    parity_worst_state_idx = split_parity.parity_worst_state_idx
-    parity_worst_state_residual = split_parity.parity_worst_state_residual
-
-    return (
-        ready = split_parity.ready,
-        split_ready = split_ready,
-        split_gap = split_gap,
-        parity_ready = parity_ready,
-        parity_gap = parity_gap,
-        raw_parity_gap = split_parity.raw_parity_gap,
-        supported_parity_gap = split_parity.supported_parity_gap,
-        endpoint_parity_gap = split_parity.endpoint_parity_gap,
-        endpoint_parity_ready = split_parity.endpoint_parity_ready,
-        n_frames = n_frames,
-        dG_half_1 = dG_half_1,
-        dG_half_2 = dG_half_2,
-        diagnostics = diagnostics,
-        parity_worst_state_idx = parity_worst_state_idx,
-        parity_worst_state_residual = parity_worst_state_residual,
-        n_supported_states = split_parity.n_supported_states,
-        support_threshold = split_parity.support_threshold,
-        support_coverage_ready = split_parity.support_coverage_ready,
-        required_supported_states = split_parity.required_supported_states,
-        failure_mode = split_parity.failure_mode,
-        near_pass = split_parity.near_pass,
-        probe_energies = u_probe_ref,
-        probe_log_mixture_denom = log_mixture_denom,
-        probe_volumes = volumes_probe,
-    )
+        beta,
+        awh_split_tol_kT,
+        awh_parity_tol_kT;
+        md_steps_probe=md_steps_probe,
+        leg_name=leg_name,
+        probe_num_md_steps=probe_num_md_steps,
+        include_pv=include_pv,
+        P0_energy_per_vol=P0_energy_per_vol,
+        probe_frame_stride=probe_frame_stride,
+        probe_min_frames=probe_min_frames,
+        probe_max_frames=probe_max_frames,
+        awh_probe_discard_fraction=awh_probe_discard_fraction,
+        parity_gate_mode=parity_gate_mode,
+        parity_support_threshold=parity_support_threshold,
+        parity_near_pass_factor=parity_near_pass_factor,
+        support_allow_missing=support_allow_missing,
+        probe_tail_state_idxs=probe_tail_state_idxs,
+        probe_tail_min_state_occupancy_floor=probe_tail_min_state_occupancy_floor,
+    ).stats
 end

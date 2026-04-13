@@ -68,6 +68,71 @@ function scaled_probe_frame_cap(base_max_frames::Int, base_probe_steps::Int, cur
     return max(base_max_frames, Int(ceil(base_max_frames * scale)))
 end
 
+Base.@kwdef mutable struct ActiveStageBProbeState
+    probe_sim::Any = nothing
+    bias_data::Any = nothing
+    segment_steps::Int = 0
+    n_segments::Int = 0
+    max_segments::Int = 0
+    probe_num_md_steps::Union{Nothing, Int} = nothing
+end
+
+function stage_b_near_pass_scale(mode::Symbol, default_scale::FT) where {FT <: AbstractFloat}
+    if mode == :keep
+        return one(FT)
+    elseif mode == :shrink
+        return clamp(default_scale, eps(FT), one(FT))
+    end
+    throw(ArgumentError("Unsupported Stage B near-pass mode: $(mode). Expected :keep or :shrink."))
+end
+
+function stage_b_is_split_only_candidate(stats::StageBStats)
+    return !stats.split_ready && stats.parity_ready && stats.endpoint_parity_ready && stats.support_coverage_ready
+end
+
+function finalize_stage_b_stats(
+    probe_stats;
+    accumulation_mode::Symbol,
+    n_probe_segments::Int,
+)
+    return StageBStats(merge(
+        probe_stats,
+        (
+            n_accumulated_frames=probe_stats.n_frames,
+            n_probe_segments=n_probe_segments,
+            accumulation_mode=accumulation_mode,
+            support_switch_ready=false,
+            n_evicted_frames=0,
+        ),
+    ))
+end
+
+function stage_b_summary_fingerprint(stats::StageBStats)
+    return join(
+        [
+            string(stats.ready),
+            string(stats.split_ready),
+            string(round(stats.split_gap, digits=6)),
+            string(stats.parity_ready),
+            string(round(stats.parity_gap, digits=6)),
+            string(round(stats.raw_parity_gap, digits=6)),
+            string(round(stats.supported_parity_gap, digits=6)),
+            string(round(stats.endpoint_parity_gap, digits=6)),
+            string(stats.endpoint_parity_ready),
+            string(stats.support_coverage_ready),
+            string(stats.n_supported_states),
+            string(stats.required_supported_states),
+            string(stats.failure_mode),
+            string(stats.near_pass),
+            string(stats.accumulation_mode),
+            string(stats.n_frames),
+            string(stats.n_accumulated_frames),
+            string(stats.n_probe_segments),
+        ],
+        "|",
+    )
+end
+
 function solvent_stage_a_tail_state_indices(
     leg::ThermodynamicLegConfig,
     state_schedule::ResolvedLegStateSchedule{FT};
@@ -449,7 +514,11 @@ function run_readiness_loop!(
     awh_stageB_near_pass_cooldown_blocks::Int,
     awh_stageB_probe_growth_ns::FT,
     awh_stageB_probe_near_pass_scale::FT,
+    awh_stageB_probe_near_pass_mode_solvent::Symbol,
+    awh_stageB_probe_near_pass_mode_vacuum::Symbol,
     awh_stageB_probe_max_factor::FT,
+    awh_stageB_split_extension_enabled::Bool,
+    awh_stageB_split_extension_max_segments::Int,
     awh_min_initial_df_threshold::FT,
     awh_min_initial_state_occupancy::FT,
     awh_stageB_soften_failures_threshold::Int,
@@ -460,6 +529,8 @@ function run_readiness_loop!(
     awh_stageB_max_cooldown::Int,
     awh_control::AWHControlConfig,
     awh_probe_discard_fraction::Float64,
+    readiness_log_mode::Symbol,
+    awh_stageB_repeat_suppression::Bool,
     beta_val::BT,
     p0_energy_per_vol::PT,
 ) where {FT <: AbstractFloat, BT <: AbstractFloat, PT <: AbstractFloat}
@@ -490,6 +561,10 @@ function run_readiness_loop!(
     stageA_tail_min_occ_floor_by_leg = Dict{Symbol, FT}()
     stageA_endpoint_high_min_fraction_by_leg = Dict{Symbol, FT}()
     stageA_history_window_samples_by_leg = Dict{Symbol, Int}()
+    active_stageB_probe_by_leg = Dict{Symbol, Union{Nothing, ActiveStageBProbeState}}(leg.name => nothing for leg in cycle_cfg.legs)
+    stageB_last_logged_fingerprint_by_leg = Dict{Symbol, String}(leg.name => "" for leg in cycle_cfg.legs)
+    stageB_blocks_since_fresh_by_leg = Dict{Symbol, Int}(leg.name => 0 for leg in cycle_cfg.legs)
+    stageB_compact_logging = readiness_log_mode == :concise && awh_stageB_repeat_suppression
     for leg in cycle_cfg.legs
         leg_awh_control = resolve_leg_awh_control(awh_control, leg)
         stageA_history_window_samples_by_leg[leg.name] = stage_a_history_window_sample_count(
@@ -546,6 +621,7 @@ function run_readiness_loop!(
     awh_readiness_reason = :not_checked
 
     while true
+        stageB_fresh_result_by_leg = Dict{Symbol, Bool}(leg.name => false for leg in cycle_cfg.legs)
         for leg in cycle_cfg.legs
             name = leg.name
             leg_awh_control = resolve_leg_awh_control(awh_control, leg)
@@ -558,6 +634,138 @@ function run_readiness_loop!(
             remaining_steps = md_steps_budget - spent_steps[name]
             if remaining_steps <= 0
                 leg_status[name] = :budget_exhausted
+                continue
+            end
+
+            active_probe = active_stageB_probe_by_leg[name]
+            if !isnothing(active_probe)
+                segment_steps = min(active_probe.segment_steps, remaining_steps)
+                if segment_steps <= 0
+                    leg_status[name] = :budget_exhausted
+                    continue
+                end
+
+                next_segment = active_probe.n_segments + 1
+                @info "Stage B ($(name)) continuing frozen probe | segment=$next_segment/$(active_probe.max_segments) | probe_steps=$segment_steps | probe_ns=$(round(steps_to_ns(segment_steps), digits=4))"
+                effective_probe_max_frames = scaled_probe_frame_cap(
+                    probe_max_frames_by_leg[name],
+                    base_probe_steps_by_leg[name],
+                    active_probe.segment_steps * next_segment,
+                )
+                probe_stats = advance_stage_b_probe!(
+                    active_probe.probe_sim,
+                    active_probe.bias_data,
+                    segment_steps,
+                    sys_by_leg[name],
+                    theta_active,
+                    param_names,
+                    idxs_by_leg[name],
+                    state_schedule.coupled_state_idx,
+                    state_schedule.decoupled_state_idx,
+                    beta_val,
+                    awh_split_tol_kT,
+                    awh_parity_tol_kT;
+                    leg_name=String(name),
+                    include_pv=leg.include_pv,
+                    P0_energy_per_vol=leg.include_pv ? p0_energy_per_vol : zero(p0_energy_per_vol),
+                    probe_frame_stride=probe_stride_by_leg[name],
+                    probe_min_frames=probe_min_frames_by_leg[name],
+                    probe_max_frames=effective_probe_max_frames,
+                    awh_probe_discard_fraction=awh_probe_discard_fraction,
+                    parity_gate_mode=awh_parity_gate_mode,
+                    parity_support_threshold=awh_parity_support_threshold,
+                    support_allow_missing=awh_stageB_support_allow_missing,
+                    parity_near_pass_factor=awh_parity_near_pass_factor,
+                    probe_tail_state_idxs=stageA_tail_state_idxs_by_leg[name],
+                    probe_tail_min_state_occupancy_floor=stageA_tail_min_occ_floor_by_leg[name],
+                )
+                spent_steps[name] += segment_steps
+                stageB_fresh_result_by_leg[name] = true
+                stageB_stats_by_leg[name] = finalize_stage_b_stats(
+                    probe_stats;
+                    accumulation_mode=:continued_frozen_probe,
+                    n_probe_segments=next_segment,
+                )
+                split_gap_by_leg[name] = stageB_stats_by_leg[name].split_gap
+                parity_gap_by_leg[name] = stageB_stats_by_leg[name].parity_gap
+
+                if stageB_stats_by_leg[name].ready
+                    active_stageB_probe_by_leg[name] = nothing
+                    stageB_consecutive_failures[name] = 0
+                    current_probe_steps_by_leg[name] = base_probe_steps_by_leg[name]
+                    stageB_cooldown[name] = 0
+                    leg_status[name] = :ready_frozen
+                    @info "$(uppercasefirst(String(name))) leg frozen after passing Stage B (split_gap=$(round(split_gap_by_leg[name], digits=4)) kT, parity_gap=$(round(parity_gap_by_leg[name], digits=4)) kT)."
+                else
+                    active_probe.n_segments = next_segment
+                    stageA_streak[name] = 0
+
+                    if (
+                        awh_stageB_split_extension_enabled &&
+                        stage_b_is_split_only_candidate(stageB_stats_by_leg[name]) &&
+                        next_segment < active_probe.max_segments
+                    )
+                        stageB_cooldown[name] = 0
+                        @info "Stage B ($(name)) split-only failure persists; continuing frozen probe after segment=$next_segment."
+                    else
+                        if awh_stageB_split_extension_enabled
+                            if stage_b_is_split_only_candidate(stageB_stats_by_leg[name]) && next_segment >= active_probe.max_segments
+                                @info "Stage B ($(name)) split-only continuation exhausted max_segments=$(active_probe.max_segments); returning to normal retry logic."
+                            elseif !stage_b_is_split_only_candidate(stageB_stats_by_leg[name])
+                                @info "Stage B ($(name)) frozen-probe continuation ended because failure mode changed to $(stageB_stats_by_leg[name].failure_mode); returning to normal retry logic."
+                            end
+                        end
+
+                        active_stageB_probe_by_leg[name] = nothing
+                        stageB_consecutive_failures[name] += 1
+
+                        if stageB_consecutive_failures[name] >= awh_stageB_soften_failures_threshold
+                            new_neff = awh_leg.state.N_eff * awh_stageB_soften_factor
+                            @info "[!] Stage B ($(name)) softening AWH bias: N_eff reduced from $(round(awh_leg.state.N_eff, digits=1)) to $(round(new_neff, digits=1))."
+                            awh_leg.state.N_eff = new_neff
+                            stageB_consecutive_failures[name] = 0
+                        end
+
+                        retry_controls = stage_b_retry_controls(
+                            awh_stageA_stable_blocks,
+                            awh_stageB_cooldown_blocks,
+                            stageB_consecutive_failures[name],
+                            awh_stageA_streak_growth_factor,
+                            awh_stageB_cooldown_growth_factor,
+                            awh_stageA_max_streak,
+                            awh_stageB_max_cooldown,
+                        )
+                        near_pass_scale = stage_b_near_pass_scale(
+                            leg.is_vacuum ? awh_stageB_probe_near_pass_mode_vacuum : awh_stageB_probe_near_pass_mode_solvent,
+                            awh_stageB_probe_near_pass_scale,
+                        )
+                        probe_policy = stage_b_next_probe_policy(
+                            current_probe_steps_by_leg[name],
+                            base_probe_steps_by_leg[name],
+                            stageB_stats_by_leg[name],
+                            retry_controls.cooldown_blocks,
+                            near_pass_cooldown_blocks,
+                            time_to_steps_floor(awh_stageB_probe_growth_ns * 1.0u"ns"),
+                            near_pass_scale,
+                            awh_stageB_probe_max_factor,
+                        )
+                        current_probe_steps_by_leg[name] = probe_policy.next_probe_steps
+                        stageB_cooldown[name] = probe_policy.cooldown_blocks
+                        if probe_policy.policy == :grow_sampling
+                            @info "Stage B ($(name)) failed ($(stageB_stats_by_leg[name].failure_mode)); increasing next probe to $(probe_policy.next_probe_steps) steps ($(round(steps_to_ns(probe_policy.next_probe_steps), digits=4)) ns) and scheduling cooldown=$(probe_policy.cooldown_blocks)."
+                        elseif probe_policy.policy == :stay_bias_error
+                            @info "Stage B ($(name)) failed ($(stageB_stats_by_leg[name].failure_mode)); keeping probe at $(probe_policy.next_probe_steps) steps and scheduling cooldown=$(probe_policy.cooldown_blocks) for Stage A learning."
+                        elseif probe_policy.policy == :near_pass
+                            @info "Stage B ($(name)) near pass; retrying with probe=$(probe_policy.next_probe_steps) steps ($(round(steps_to_ns(probe_policy.next_probe_steps), digits=4)) ns) after cooldown=$(probe_policy.cooldown_blocks)."
+                        elseif stageB_cooldown[name] > 0
+                            @info "Stage B ($(name)) failed; scheduling cooldown for $(stageB_cooldown[name]) stable-check opportunities."
+                        end
+                    end
+                end
+
+                if leg_status[name] == :active && spent_steps[name] >= md_steps_budget
+                    leg_status[name] = :budget_exhausted
+                end
                 continue
             end
 
@@ -633,7 +841,7 @@ function run_readiness_loop!(
                         probe_steps,
                     )
                     @info "Stage A ($(name)) reached stable streak ($(stageA_streak[name])/$(current_target_streak)); entering Stage B probe | probe_steps=$probe_steps | probe_ns=$(round(steps_to_ns(probe_steps), digits=4))"
-                    probe_stats = run_stage_b_probe(
+                    probe_run = start_stage_b_probe(
                         awh_leg,
                         sys_by_leg[name],
                         theta_active,
@@ -660,16 +868,12 @@ function run_readiness_loop!(
                         probe_tail_state_idxs=stageA_tail_state_idxs_by_leg[name],
                         probe_tail_min_state_occupancy_floor=stageA_tail_min_occ_floor_by_leg[name],
                     )
-                    stageB_stats_by_leg[name] = StageBStats(merge(
-                        probe_stats,
-                        (
-                            n_accumulated_frames=probe_stats.n_frames,
-                            n_probe_segments=probe_stats.n_frames > 0 ? 1 : 0,
-                            accumulation_mode=:single_probe,
-                            support_switch_ready=false,
-                            n_evicted_frames=0,
-                        ),
-                    ))
+                    stageB_fresh_result_by_leg[name] = true
+                    stageB_stats_by_leg[name] = finalize_stage_b_stats(
+                        probe_run.stats;
+                        accumulation_mode=:single_probe,
+                        n_probe_segments=probe_run.stats.n_frames > 0 ? 1 : 0,
+                    )
 
                     split_gap_by_leg[name] = stageB_stats_by_leg[name].split_gap
                     parity_gap_by_leg[name] = stageB_stats_by_leg[name].parity_gap
@@ -682,6 +886,22 @@ function run_readiness_loop!(
                         # for later production/resimulation.
                         leg_status[name] = :ready_frozen
                         @info "$(uppercasefirst(String(name))) leg frozen after passing Stage B (split_gap=$(round(split_gap_by_leg[name], digits=4)) kT, parity_gap=$(round(parity_gap_by_leg[name], digits=4)) kT)."
+                    elseif (
+                        awh_stageB_split_extension_enabled &&
+                        awh_stageB_split_extension_max_segments > 1 &&
+                        stage_b_is_split_only_candidate(stageB_stats_by_leg[name])
+                    )
+                        stageA_streak[name] = 0
+                        stageB_cooldown[name] = 0
+                        active_stageB_probe_by_leg[name] = ActiveStageBProbeState(
+                            probe_sim=probe_run.probe_sim,
+                            bias_data=probe_run.bias_data,
+                            segment_steps=probe_steps,
+                            n_segments=1,
+                            max_segments=max(2, awh_stageB_split_extension_max_segments),
+                            probe_num_md_steps=leg.probe_awh_seed_num_md_steps,
+                        )
+                        @info "Stage B ($(name)) split-only failure; continuing frozen probe in place | next_segment_steps=$probe_steps | next_segment_ns=$(round(steps_to_ns(probe_steps), digits=4)) | segments=1/$(max(2, awh_stageB_split_extension_max_segments))."
                     else
                         stageA_streak[name] = 0
                         stageB_consecutive_failures[name] += 1
@@ -702,6 +922,10 @@ function run_readiness_loop!(
                             awh_stageA_max_streak,
                             awh_stageB_max_cooldown,
                         )
+                        near_pass_scale = stage_b_near_pass_scale(
+                            leg.is_vacuum ? awh_stageB_probe_near_pass_mode_vacuum : awh_stageB_probe_near_pass_mode_solvent,
+                            awh_stageB_probe_near_pass_scale,
+                        )
                         probe_policy = stage_b_next_probe_policy(
                             current_probe_steps_by_leg[name],
                             base_probe_steps_by_leg[name],
@@ -709,7 +933,7 @@ function run_readiness_loop!(
                             retry_controls.cooldown_blocks,
                             near_pass_cooldown_blocks,
                             time_to_steps_floor(awh_stageB_probe_growth_ns * 1.0u"ns"),
-                            awh_stageB_probe_near_pass_scale,
+                            near_pass_scale,
                             awh_stageB_probe_max_factor,
                         )
                         current_probe_steps_by_leg[name] = probe_policy.next_probe_steps
@@ -759,10 +983,23 @@ function run_readiness_loop!(
 
             statsB = stageB_stats_by_leg[name]
             if statsB.n_frames > 0
-                n_states = length(state_schedules_by_leg[name].lambda)
-                @info "  Stage B ($(name)): split_gap=$(round(statsB.split_gap, digits=4)) kT (ok=$(statsB.split_ready)) | parity_gap=$(round(statsB.parity_gap, digits=4)) kT (ok=$(statsB.parity_ready)) | raw_parity=$(round(statsB.raw_parity_gap, digits=4)) | supported_parity=$(round(statsB.supported_parity_gap, digits=4)) | endpoint_parity=$(round(statsB.endpoint_parity_gap, digits=4)) (ok=$(statsB.endpoint_parity_ready)) | support_coverage=$(statsB.n_supported_states)/$(n_states) (required>=$(statsB.required_supported_states), ok=$(statsB.support_coverage_ready)) @ ess>=$(round(statsB.support_threshold, digits=1)) | failure=$(statsB.failure_mode) | near_pass=$(statsB.near_pass) | mode=$(statsB.accumulation_mode) | frames=$(statsB.n_frames) | accumulated_frames=$(statsB.n_accumulated_frames) | probe_segments=$(statsB.n_probe_segments)"
-                if !isempty(statsB.diagnostics)
-                    @info "    Stage B Diagnostics ($(name)): $(statsB.diagnostics)"
+                n_states = statsB.n_total_states > 0 ? statsB.n_total_states : length(state_schedules_by_leg[name].lambda)
+                if stageB_fresh_result_by_leg[name]
+                    stageB_blocks_since_fresh_by_leg[name] = 0
+                else
+                    stageB_blocks_since_fresh_by_leg[name] += 1
+                end
+                fingerprint = stage_b_summary_fingerprint(statsB)
+                active_probe = active_stageB_probe_by_leg[name]
+                extension_state = isnothing(active_probe) ? "-" : "active $(active_probe.n_segments)/$(active_probe.max_segments)"
+                if !stageB_compact_logging || stageB_fresh_result_by_leg[name] || fingerprint != stageB_last_logged_fingerprint_by_leg[name]
+                    @info "  Stage B ($(name)): split_gap=$(round(statsB.split_gap, digits=4)) kT (ok=$(statsB.split_ready)) | parity_gap=$(round(statsB.parity_gap, digits=4)) kT (ok=$(statsB.parity_ready)) | raw_parity=$(round(statsB.raw_parity_gap, digits=4)) | supported_parity=$(round(statsB.supported_parity_gap, digits=4)) | endpoint_parity=$(round(statsB.endpoint_parity_gap, digits=4)) (ok=$(statsB.endpoint_parity_ready)) | support_coverage=$(statsB.n_supported_states)/$(n_states) (required>=$(statsB.required_supported_states), ok=$(statsB.support_coverage_ready)) @ ess>=$(round(statsB.support_threshold, digits=1)) | failure=$(statsB.failure_mode) | near_pass=$(statsB.near_pass) | mode=$(statsB.accumulation_mode) | frames=$(statsB.n_frames) | accumulated_frames=$(statsB.n_accumulated_frames) | probe_segments=$(statsB.n_probe_segments)"
+                    if !isempty(statsB.diagnostics)
+                        @info "    Stage B Diagnostics ($(name)): $(statsB.diagnostics)"
+                    end
+                    stageB_last_logged_fingerprint_by_leg[name] = fingerprint
+                else
+                    @info "  Stage B Cached ($(name)): failure=$(statsB.failure_mode) | age_blocks=$(stageB_blocks_since_fresh_by_leg[name]) | cooldown=$(stageB_cooldown[name]) | streak=$(stageA_streak[name]) | extension=$extension_state"
                 end
             end
         end
@@ -1014,7 +1251,11 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             opt_cfg.awh_stageB_near_pass_cooldown_blocks,
             FT(opt_cfg.awh_stageB_probe_growth_ns),
             FT(opt_cfg.awh_stageB_probe_near_pass_scale),
+            opt_cfg.awh_stageB_probe_near_pass_mode_solvent,
+            opt_cfg.awh_stageB_probe_near_pass_mode_vacuum,
             FT(opt_cfg.awh_stageB_probe_max_factor),
+            opt_cfg.awh_stageB_split_extension_enabled,
+            opt_cfg.awh_stageB_split_extension_max_segments,
             FT(opt_cfg.awh_min_initial_df_threshold),
             FT(opt_cfg.awh_min_initial_state_occupancy),
             opt_cfg.awh_stageB_soften_failures_threshold,
@@ -1025,6 +1266,8 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             opt_cfg.awh_stageB_max_cooldown,
             sim_cfg.awh_control,
             Float64(sim_cfg.awh_probe_discard_fraction),
+            opt_cfg.readiness_log_mode,
+            opt_cfg.awh_stageB_repeat_suppression,
             beta_val,
             p0_energy_per_vol,
         )

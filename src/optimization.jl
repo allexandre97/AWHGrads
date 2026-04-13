@@ -53,22 +53,26 @@ function compute_leg_weights_and_ess(
     leg::LegArtifacts,
     energies_current::AbstractMatrix{ET},
     beta_val::BT,
-    volumes::AbstractVector{VT},
+    volumes::AbstractVector{VT};
+    frame_indices::Union{Nothing, AbstractVector{Int}}=nothing,
 ) where {ET <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat}
-    idx_history = leg.logger_prod.active_idx_history
+    idx_history = isnothing(frame_indices) ? leg.logger_prod.active_idx_history : leg.logger_prod.active_idx_history[frame_indices]
+    energies_local = isnothing(frame_indices) ? energies_current : @view energies_current[frame_indices, :]
+    u_ref_local = isnothing(frame_indices) ? leg.u_ref : @view leg.u_ref[frame_indices, :]
+    volumes_local = leg.include_pv && !isnothing(frame_indices) ? volumes[frame_indices] : volumes
     if leg.include_pv
         return compute_weights_and_ess(
-            energies_current,
-            leg.u_ref,
+            energies_local,
+            u_ref_local,
             idx_history,
             beta_val,
-            volumes,
+            volumes_local,
             leg.p0_energy_per_vol,
         )
     end
     return compute_weights_and_ess(
-        energies_current,
-        leg.u_ref,
+        energies_local,
+        u_ref_local,
         idx_history,
         beta_val,
     )
@@ -91,8 +95,15 @@ function compute_leg_endpoint_state(
     beta_val::BT,
     volumes::AbstractVector{VT};
     compute_gradients::Bool=true,
+    frame_indices::Union{Nothing, AbstractVector{Int}}=nothing,
 ) where {ET <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat}
-    idx_history = leg.logger_prod.active_idx_history
+    idx_history = isnothing(frame_indices) ? leg.logger_prod.active_idx_history : leg.logger_prod.active_idx_history[frame_indices]
+    energies_local = isnothing(frame_indices) ? energies_current : @view energies_current[frame_indices, :]
+    u_ref_local = isnothing(frame_indices) ? leg.u_ref : @view leg.u_ref[frame_indices, :]
+    gradients_phi_local = isnothing(frame_indices) ? gradients_phi : Dict(
+        p_key => @view(gradients_phi[p_key][frame_indices, :]) for p_key in trainable_param_names
+    )
+    volumes_local = leg.include_pv && !isnothing(frame_indices) ? volumes[frame_indices] : volumes
     # Endpoint MBAR conditions on arbitrary λ targets, so the denominator must
     # use Molly's fixed AWH Gibbs log-weights g_ref = f_ref + logρ_ref.
     log_gibbs_weights = awh_log_gibbs_weights(leg.active_bias)
@@ -100,36 +111,36 @@ function compute_leg_endpoint_state(
     if leg.include_pv
         grad_F_1, F_1 = compute_global_endpoint_gradients(
             trainable_param_names,
-            gradients_phi,
-            energies_current,
-            leg.u_ref,
+            gradients_phi_local,
+            energies_local,
+            u_ref_local,
             idx_history,
             leg.coupled_state_idx,
             beta_val,
             log_gibbs_weights,
-            volumes,
+            volumes_local,
             leg.p0_energy_per_vol;
             compute_gradients=compute_gradients,
         )
         grad_F_0, F_0 = compute_global_endpoint_gradients(
             trainable_param_names,
-            gradients_phi,
-            energies_current,
-            leg.u_ref,
+            gradients_phi_local,
+            energies_local,
+            u_ref_local,
             idx_history,
             leg.decoupled_state_idx,
             beta_val,
             log_gibbs_weights,
-            volumes,
+            volumes_local,
             leg.p0_energy_per_vol;
             compute_gradients=compute_gradients,
         )
     else
         grad_F_1, F_1 = compute_global_endpoint_gradients(
             trainable_param_names,
-            gradients_phi,
-            energies_current,
-            leg.u_ref,
+            gradients_phi_local,
+            energies_local,
+            u_ref_local,
             idx_history,
             leg.coupled_state_idx,
             beta_val,
@@ -138,9 +149,9 @@ function compute_leg_endpoint_state(
         )
         grad_F_0, F_0 = compute_global_endpoint_gradients(
             trainable_param_names,
-            gradients_phi,
-            energies_current,
-            leg.u_ref,
+            gradients_phi_local,
+            energies_local,
+            u_ref_local,
             idx_history,
             leg.decoupled_state_idx,
             beta_val,
@@ -231,9 +242,28 @@ function line_search_residual_acceptable(
     error_residual_prop::PT,
     tolerance_fraction::TT,
 ) where {RT <: AbstractFloat, PT <: AbstractFloat, TT <: AbstractFloat}
+    return line_search_residual_acceptable(
+        error_residual,
+        error_residual_prop,
+        tolerance_fraction,
+        zero(promote_energy_analysis_type(error_residual, error_residual_prop, tolerance_fraction)),
+    )
+end
+
+
+function line_search_residual_acceptable(
+    error_residual::RT,
+    error_residual_prop::PT,
+    tolerance_fraction::TT,
+    additional_improvement_requirement::ATX,
+) where {RT <: AbstractFloat, PT <: AbstractFloat, TT <: AbstractFloat, ATX <: AbstractFloat}
     noise_tolerance = line_search_noise_tolerance(error_residual, tolerance_fraction)
-    AT = promote_energy_analysis_type(error_residual, error_residual_prop, tolerance_fraction)
-    return abs(AT(error_residual_prop)) <= abs(AT(error_residual)) + noise_tolerance
+    AT = promote_energy_analysis_type(error_residual, error_residual_prop, tolerance_fraction, additional_improvement_requirement)
+    acceptance_threshold = max(
+        zero(AT),
+        abs(AT(error_residual)) + noise_tolerance - AT(additional_improvement_requirement),
+    )
+    return abs(AT(error_residual_prop)) <= acceptance_threshold
 end
 
 function optimization_analysis_type(
@@ -256,6 +286,155 @@ function optimization_analysis_type(
         end
     end
     return AT
+end
+
+Base.@kwdef struct OptimizationConfidenceSummary
+    enabled::Bool = false
+    scale::Any = 1.0
+    endpoint_disagreement::Any = 0.0
+    cycle_disagreement::Any = 0.0
+    gradient_disagreement::Any = 0.0
+    additional_residual_requirement::Any = 0.0
+    eligible_legs::Int = 0
+    skipped_legs::Vector{Symbol} = Symbol[]
+end
+
+function split_half_frame_indices(n_frames::Int, min_frames::Int)
+    min_required = max(2, min_frames)
+    if n_frames < min_required
+        return nothing
+    end
+    n_first = fld(n_frames, 2)
+    n_second = n_frames - n_first
+    if n_first < 1 || n_second < 1
+        return nothing
+    end
+    return (1:n_first, (n_first + 1):n_frames)
+end
+
+function compute_optimization_confidence_summary(
+    leg_artifacts::Vector{LegArtifacts},
+    leg_energies_cache,
+    leg_grads_phi,
+    leg_volumes_cache,
+    trainable_param_names::Vector{String},
+    grad_cycle::AbstractVector{AT},
+    beta_val::BT,
+    dG_std_corr::DT,
+    opt_cfg::OptimizationConfig,
+    ::Type{AT},
+) where {AT <: AbstractFloat, BT <: AbstractFloat, DT <: AbstractFloat}
+    if opt_cfg.optimization_confidence_mode != :split_half
+        return OptimizationConfidenceSummary(
+            enabled=false,
+            scale=one(AT),
+            endpoint_disagreement=zero(AT),
+            cycle_disagreement=zero(AT),
+            gradient_disagreement=zero(AT),
+            additional_residual_requirement=zero(AT),
+            eligible_legs=0,
+            skipped_legs=Symbol[],
+        )
+    end
+
+    endpoint_disagreements = AT[]
+    cycle_half_1 = AT(dG_std_corr)
+    cycle_half_2 = AT(dG_std_corr)
+    grad_cycle_half_1 = zeros(AT, length(grad_cycle))
+    grad_cycle_half_2 = zeros(AT, length(grad_cycle))
+    eligible_legs = 0
+    skipped_legs = Symbol[]
+
+    for leg in leg_artifacts
+        energies = leg_energies_cache[leg.name]
+        frame_split = split_half_frame_indices(size(energies, 1), opt_cfg.optimization_confidence_min_frames)
+        if isnothing(frame_split)
+            push!(skipped_legs, leg.name)
+            continue
+        end
+
+        eligible_legs += 1
+        first_half, second_half = frame_split
+        _, dG_half_1 = compute_leg_endpoint_state(
+            leg,
+            trainable_param_names,
+            leg_grads_phi[leg.name],
+            energies,
+            beta_val,
+            leg_volumes_cache[leg.name];
+            compute_gradients=false,
+            frame_indices=first_half,
+        )
+        _, dG_half_2 = compute_leg_endpoint_state(
+            leg,
+            trainable_param_names,
+            leg_grads_phi[leg.name],
+            energies,
+            beta_val,
+            leg_volumes_cache[leg.name];
+            compute_gradients=false,
+            frame_indices=second_half,
+        )
+        grad_half_1, _ = compute_leg_endpoint_state(
+            leg,
+            trainable_param_names,
+            leg_grads_phi[leg.name],
+            energies,
+            beta_val,
+            leg_volumes_cache[leg.name];
+            compute_gradients=true,
+            frame_indices=first_half,
+        )
+        grad_half_2, _ = compute_leg_endpoint_state(
+            leg,
+            trainable_param_names,
+            leg_grads_phi[leg.name],
+            energies,
+            beta_val,
+            leg_volumes_cache[leg.name];
+            compute_gradients=true,
+            frame_indices=second_half,
+        )
+
+        coeff = AT(leg.coefficient)
+        cycle_half_1 += coeff * AT(dG_half_1)
+        cycle_half_2 += coeff * AT(dG_half_2)
+        grad_cycle_half_1 .+= coeff .* AT.(grad_half_1)
+        grad_cycle_half_2 .+= coeff .* AT.(grad_half_2)
+        push!(endpoint_disagreements, abs(AT(dG_half_1) - AT(dG_half_2)))
+    end
+
+    if eligible_legs == 0
+        return OptimizationConfidenceSummary(
+            enabled=false,
+            scale=one(AT),
+            endpoint_disagreement=zero(AT),
+            cycle_disagreement=zero(AT),
+            gradient_disagreement=zero(AT),
+            additional_residual_requirement=zero(AT),
+            eligible_legs=0,
+            skipped_legs=skipped_legs,
+        )
+    end
+
+    endpoint_disagreement = isempty(endpoint_disagreements) ? zero(AT) : maximum(endpoint_disagreements)
+    cycle_disagreement = abs(cycle_half_1 - cycle_half_2)
+    gradient_disagreement = norm(grad_cycle_half_1 - grad_cycle_half_2) / max(norm(grad_cycle), sqrt(eps(AT)))
+    raw_penalty = max(endpoint_disagreement, cycle_disagreement, gradient_disagreement)
+    min_scale = clamp(AT(opt_cfg.optimization_confidence_min_scale), zero(AT), one(AT))
+    strength = max(zero(AT), AT(opt_cfg.optimization_confidence_scale_strength))
+    scale = max(min_scale, one(AT) / (one(AT) + strength * raw_penalty))
+    additional_requirement = max(zero(AT), AT(opt_cfg.optimization_confidence_residual_requirement_strength)) * cycle_disagreement
+    return OptimizationConfidenceSummary(
+        enabled=true,
+        scale=scale,
+        endpoint_disagreement=endpoint_disagreement,
+        cycle_disagreement=cycle_disagreement,
+        gradient_disagreement=gradient_disagreement,
+        additional_residual_requirement=additional_requirement,
+        eligible_legs=eligible_legs,
+        skipped_legs=skipped_legs,
+    )
 end
 
 
@@ -357,6 +536,7 @@ function run_optimization_phase!(
         ess_current = Dict{Symbol, AT}()
         N_active = Dict{Symbol, AT}()
         leg_dG_current = Dict{Symbol, AT}()
+        leg_energies_cache = Dict{Symbol, Any}()
         leg_grads_phi = Dict{Symbol, Dict{String, Matrix{FT}}}()
         leg_volumes_cache = Dict{Symbol, Vector{AT}}()
 
@@ -414,6 +594,7 @@ function run_optimization_phase!(
             dG_pred += coeff * dG_leg
 
             leg_dG_current[leg.name] = dG_leg
+            leg_energies_cache[leg.name] = u_eval
             leg_grads_phi[leg.name] = grads_eval_phi
             leg_volumes_cache[leg.name] = volumes
         end
@@ -428,6 +609,21 @@ function run_optimization_phase!(
         if isnan(macro_start_residual)
             macro_start_residual = error_residual
         end
+
+        confidence_summary = compute_optimization_confidence_summary(
+            leg_artifacts,
+            leg_energies_cache,
+            leg_grads_phi,
+            leg_volumes_cache,
+            trainable_param_names,
+            grad_cycle,
+            beta_val,
+            dG_std_corr,
+            opt_cfg,
+            AT,
+        )
+        effective_kl_target = AT(opt_cfg.kl_target) * confidence_summary.scale
+        effective_max_phi_step_solute = AT(opt_cfg.max_phi_step_solute) * confidence_summary.scale
 
         dL_dE = abs(error_residual) <= AT(opt_cfg.huber_delta) ? error_residual : AT(opt_cfg.huber_delta) * sign(error_residual)
         grad_loss = dL_dE .* grad_cycle
@@ -456,8 +652,8 @@ function run_optimization_phase!(
         base_step_active = D_vec .* base_step_scaled
 
         estimated_KL = AT(0.5) * dot(base_step_active, fim_active * base_step_active)
-        if estimated_KL > AT(opt_cfg.kl_target)
-            kl_scaling = sqrt(AT(opt_cfg.kl_target) / estimated_KL)
+        if estimated_KL > effective_kl_target
+            kl_scaling = sqrt(effective_kl_target / estimated_KL)
             update_direction_active = base_step_active * kl_scaling
         else
             kl_scaling = one(AT)
@@ -468,7 +664,7 @@ function run_optimization_phase!(
         fim_cond_raw = cond(fim_corr)
 
         max_phi_update = maximum(abs.(update_direction_active))
-        max_allowed_phi_step = block.kind == :solute ? AT(opt_cfg.max_phi_step_solute) : AT(opt_cfg.max_phi_step_solvent)
+        max_allowed_phi_step = block.kind == :solute ? effective_max_phi_step_solute : AT(opt_cfg.max_phi_step_solvent)
 
         if max_phi_update > max_allowed_phi_step
             clip_scaling = max_allowed_phi_step / max_phi_update
@@ -540,6 +736,7 @@ function run_optimization_phase!(
                 error_residual,
                 error_residual_prop,
                 AT(opt_cfg.line_search_noise_tolerance_fraction),
+                confidence_summary.additional_residual_requirement,
             )
                 line_search_success = true
                 phi_active .= phi_prop
@@ -579,9 +776,15 @@ function run_optimization_phase!(
         @info "--- Optimization Metrics (Epoch $inner_epoch - Block: $block_name) ---"
         @info "  Prediction:  ∆G_pred = $(round(dG_pred, digits=3)) kT | Target = $(round(dG_exp, digits=3)) kT"
         @info "  Error:       Residual = $(round(error_residual, digits=3)) | Huber dL/dE = $(round(dL_dE, digits=3))"
+        @info "  Accepted:    Residual = $(round(accepted_residual, digits=3)) | Extra req = $(round(confidence_summary.additional_residual_requirement, digits=4))"
         @info "  Gradients:   Norm = $(round(norm_grad_loss, digits=5)) | Max = $(round(max_grad_loss, digits=5))"
         @info "  FIM (Corr):  Raw Cond Number = $(round(fim_cond_raw, digits=2)) | Truncated Eigs = $n_truncated / $(length(vals))"
-        @info "  KL Bound:    Est. KL = $(round(estimated_KL, digits=4)) | Target = $(opt_cfg.kl_target) | Scaling = $(round(kl_scaling, digits=4))"
+        @info "  Trust Reg.:  Confidence = $(round(confidence_summary.scale, digits=4)) | KL target = $(round(effective_kl_target, digits=4)) | Max solute ϕ step = $(round(effective_max_phi_step_solute, digits=4))"
+        @info "  Confidence:  endpoint_ΔG = $(round(confidence_summary.endpoint_disagreement, digits=4)) | cycle = $(round(confidence_summary.cycle_disagreement, digits=4)) | gradient = $(round(confidence_summary.gradient_disagreement, digits=4)) | eligible_legs = $(confidence_summary.eligible_legs)"
+        if !isempty(confidence_summary.skipped_legs)
+            @info "  Confidence:  skipped_legs = $(join(String.(confidence_summary.skipped_legs), ","))"
+        end
+        @info "  KL Bound:    Est. KL = $(round(estimated_KL, digits=4)) | Target = $(round(effective_kl_target, digits=4)) | Scaling = $(round(kl_scaling, digits=4))"
         @info "  Line Search: Converged α = $alpha"
         @info "  Actual Step: Max ϕ ∆ = $(round(actual_max_phi_step, digits=6)) (α=$alpha)"
         @info "  Params (σ,ϵ): Min = $(round(minimum(theta_active[active_global_indices]), digits=5)) | Max = $(round(maximum(theta_active[active_global_indices]), digits=5))"
