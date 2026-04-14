@@ -37,6 +37,30 @@ Base.@kwdef struct AWHControlConfig
 end
 
 """
+    StageAReadinessPolicyConfig
+
+Configuration for the cheap Stage A readiness checks attached to a single
+thermodynamic leg. Policies stay leg-local, but the criteria are now selected
+explicitly rather than inferred from hard-coded solvent/vacuum branches.
+"""
+Base.@kwdef struct StageAReadinessPolicyConfig
+    preset::Symbol = :generic_alchemical
+    endpoint_state_idxs::Union{Nothing, Vector{Int}} = nothing
+    hotspot_state_idxs::Union{Nothing, Vector{Int}} = nothing
+    hotspot_lj_lambda_max::Union{Nothing, Float64} = nothing
+    hotspot_min_state_occupancy_floor::Union{Nothing, Float64} = nothing
+    endpoint_high_min_fraction_abs::Union{Nothing, Float64} = nothing
+end
+
+struct ResolvedStageAReadinessPolicy{FT <: AbstractFloat}
+    preset::Symbol
+    endpoint_state_idxs::Vector{Int}
+    hotspot_state_idxs::Vector{Int}
+    hotspot_min_state_occupancy_floor::FT
+    endpoint_high_min_fraction_abs::FT
+end
+
+"""
     ThermodynamicLegConfig
 
 Configuration for one leg of the thermodynamic cycle. Each leg contributes
@@ -60,6 +84,7 @@ Base.@kwdef struct ThermodynamicLegConfig
     lambda_scheduler::Union{Nothing, Symbol} = nothing
     coulomb_softcore_model::Union{Nothing, Symbol} = nothing
     lj_softcore_model::Union{Nothing, Symbol} = nothing
+    readiness_policy::StageAReadinessPolicyConfig = StageAReadinessPolicyConfig()
 end
 
 """
@@ -84,6 +109,31 @@ Base.@kwdef struct ThermodynamicCycleConfig
     legs::Vector{ThermodynamicLegConfig} = ThermodynamicLegConfig[]
     include_standard_state_correction::Bool = true
     target_dG_kcal_mol::Float64 = -5.01
+end
+
+"""
+    ParameterPoolConfig
+
+Define one trainable nonbonded-parameter pool. Pools are selected by explicit
+atom metadata rules rather than by hard-coded molecular identities, allowing
+the same optimization machinery to cover hydration, binding, and other
+alchemical free-energy workflows.
+"""
+Base.@kwdef struct ParameterPoolConfig
+    name::Symbol
+    atom_indices::Union{Nothing, AbstractVector{Int}} = nothing
+    atom_types::Vector{String} = String[]
+    atom_type_patterns::Vector{String} = String[]
+    atom_names::Vector{String} = String[]
+    residue_names::Vector{String} = String[]
+    residue_numbers::Vector{Int} = Int[]
+    molecule_ids::Vector{Int} = Int[]
+    trainable_families::Vector{Symbol} = Symbol[:sigma, :epsilon]
+    exclude_atom_types::Vector{String} = String[]
+    max_phi_step::Union{Nothing, Float64} = nothing
+    max_sigma_drift::Union{Nothing, Float64} = nothing
+    max_epsilon_drift::Union{Nothing, Float64} = nothing
+    reference_penalty_strength::Float64 = 0.0
 end
 
 """
@@ -172,6 +222,7 @@ Base.@kwdef struct SimulationConfig
     force_field::ForceFieldConfig = ForceFieldConfig()
     cycle::Union{Nothing, ThermodynamicCycleConfig} = nothing
     parameter_reference_leg::Union{Nothing, Symbol} = nothing
+    parameter_pools::Vector{ParameterPoolConfig} = ParameterPoolConfig[]
     parameter_bounds::ParameterBoundsConfig = ParameterBoundsConfig()
     awh_control::AWHControlConfig = AWHControlConfig()
     ensemble_eval::EnsembleEvalConfig = EnsembleEvalConfig()
@@ -278,6 +329,23 @@ Base.@kwdef mutable struct RuntimeState
 end
 
 """
+    ResolvedParameterPool
+
+Internal runtime metadata for one trainable parameter pool after resolving the
+selector rules on the parameter reference leg.
+"""
+Base.@kwdef struct ResolvedParameterPool
+    name::Symbol
+    global_indices::Vector{Int} = Int[]
+    sigma_global_indices::Vector{Int} = Int[]
+    epsilon_global_indices::Vector{Int} = Int[]
+    max_phi_step::Float64 = Inf
+    max_sigma_drift::Union{Nothing, Float64} = nothing
+    max_epsilon_drift::Union{Nothing, Float64} = nothing
+    reference_penalty_strength::Float64 = 0.0
+end
+
+"""
     LegArtifacts
 
 Production data cached for one thermodynamic leg and reused during the
@@ -327,6 +395,10 @@ Base.@kwdef struct StageAStats
     endpoint_high::Any = 0.0
     endpoint_high_required::Any = 0.0
     endpoint_ready::Bool = false
+    hotspot_occupancy::Any = 0.0
+    hotspot_min_state_occupancy::Any = 0.0
+    hotspot_ready::Bool = true
+    hotspot_low_occupancy_states::Vector{Int} = Int[]
     tail_occupancy::Any = 0.0
     tail_min_state_occupancy::Any = 0.0
     tail_ready::Bool = true
@@ -355,10 +427,14 @@ StageAStats(nt::NamedTuple) = StageAStats(
     endpoint_high = nt.endpoint_high,
     endpoint_high_required = hasproperty(nt, :endpoint_high_required) ? nt.endpoint_high_required : nt.endpoint_high,
     endpoint_ready = nt.endpoint_ready,
-    tail_occupancy = hasproperty(nt, :tail_occupancy) ? nt.tail_occupancy : 0.0,
-    tail_min_state_occupancy = hasproperty(nt, :tail_min_state_occupancy) ? nt.tail_min_state_occupancy : 0.0,
-    tail_ready = hasproperty(nt, :tail_ready) ? nt.tail_ready : true,
-    tail_low_occupancy_states = hasproperty(nt, :tail_low_occupancy_states) ? nt.tail_low_occupancy_states : Int[],
+    hotspot_occupancy = hasproperty(nt, :hotspot_occupancy) ? nt.hotspot_occupancy : (hasproperty(nt, :tail_occupancy) ? nt.tail_occupancy : 0.0),
+    hotspot_min_state_occupancy = hasproperty(nt, :hotspot_min_state_occupancy) ? nt.hotspot_min_state_occupancy : (hasproperty(nt, :tail_min_state_occupancy) ? nt.tail_min_state_occupancy : 0.0),
+    hotspot_ready = hasproperty(nt, :hotspot_ready) ? nt.hotspot_ready : (hasproperty(nt, :tail_ready) ? nt.tail_ready : true),
+    hotspot_low_occupancy_states = hasproperty(nt, :hotspot_low_occupancy_states) ? nt.hotspot_low_occupancy_states : (hasproperty(nt, :tail_low_occupancy_states) ? nt.tail_low_occupancy_states : Int[]),
+    tail_occupancy = hasproperty(nt, :tail_occupancy) ? nt.tail_occupancy : (hasproperty(nt, :hotspot_occupancy) ? nt.hotspot_occupancy : 0.0),
+    tail_min_state_occupancy = hasproperty(nt, :tail_min_state_occupancy) ? nt.tail_min_state_occupancy : (hasproperty(nt, :hotspot_min_state_occupancy) ? nt.hotspot_min_state_occupancy : 0.0),
+    tail_ready = hasproperty(nt, :tail_ready) ? nt.tail_ready : (hasproperty(nt, :hotspot_ready) ? nt.hotspot_ready : true),
+    tail_low_occupancy_states = hasproperty(nt, :tail_low_occupancy_states) ? nt.tail_low_occupancy_states : (hasproperty(nt, :hotspot_low_occupancy_states) ? nt.hotspot_low_occupancy_states : Int[]),
     min_state_occupancy = hasproperty(nt, :min_state_occupancy) ? nt.min_state_occupancy : 0.0,
     low_occupancy_states = hasproperty(nt, :low_occupancy_states) ? nt.low_occupancy_states : Int[],
     n_hist = nt.n_hist,

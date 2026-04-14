@@ -267,6 +267,9 @@ end
     @test !tail_limited.tail_ready
     @test tail_limited.tail_min_state_occupancy == 0.0f0
     @test tail_limited.tail_low_occupancy_states == [5]
+    @test !tail_limited.hotspot_ready
+    @test tail_limited.hotspot_min_state_occupancy == tail_limited.tail_min_state_occupancy
+    @test tail_limited.hotspot_low_occupancy_states == tail_limited.tail_low_occupancy_states
     @test !tail_limited.ready
 
     endpoint_limited_history = vcat(repeat([1, 2, 3, 4, 5], 60), [6, 1, 6, 1, 6, 1])
@@ -468,9 +471,11 @@ end
     @test solvent_leg.lambda_scheduler == :ele_scaled
     @test solvent_leg.coulomb_softcore_model == :gapsys
     @test solvent_leg.lj_softcore_model == :gapsys
+    @test solvent_leg.readiness_policy.preset == :staged_decoupling
     @test vacuum_leg.electrostatics_method == :none
     @test vacuum_leg.coulomb_softcore_model == :gapsys
     @test vacuum_leg.lj_softcore_model == :gapsys
+    @test vacuum_leg.readiness_policy.preset == :generic_alchemical
 
     invalid_short_leg = AWHGrads.ThermodynamicLegConfig(
         name=:solvent,
@@ -508,6 +513,29 @@ end
     @test staged_resolved.lambda == dense_solvent_schedule_ele_scaled
     @test staged_resolved.coupled_state_idx == 1
     @test staged_resolved.decoupled_state_idx == 21
+    staged_policy = AWHGrads.resolve_leg_stage_a_readiness_policy(
+        solvent_leg,
+        staged_resolved;
+        awh_solvent_tail_lj_max=0.3025f0,
+        awh_solvent_tail_min_state_occupancy=0.0125f0,
+        awh_solvent_endpoint_min_fraction=0.0f0,
+    )
+    @test staged_policy.preset == :staged_decoupling
+    @test !isempty(staged_policy.hotspot_state_idxs)
+    @test staged_policy.endpoint_state_idxs[end] == staged_resolved.decoupled_state_idx
+    @test staged_policy.hotspot_min_state_occupancy_floor == 0.0125f0
+
+    vacuum_resolved = AWHGrads.resolve_leg_state_schedule(vacuum_leg, fallback_schedule, Float32)
+    generic_policy = AWHGrads.resolve_leg_stage_a_readiness_policy(
+        vacuum_leg,
+        vacuum_resolved;
+        awh_solvent_tail_lj_max=0.3025f0,
+        awh_solvent_tail_min_state_occupancy=0.0125f0,
+        awh_solvent_endpoint_min_fraction=0.0f0,
+    )
+    @test generic_policy.preset == :generic_alchemical
+    @test isempty(generic_policy.hotspot_state_idxs)
+    @test generic_policy.endpoint_state_idxs == [vacuum_resolved.decoupled_state_idx]
 
     sim_cfg = AWHGrads.default_simulation_config(FT=Float32, AT=Array)
     resolved_cycle = AWHGrads.resolved_cycle_config(sim_cfg)
@@ -519,9 +547,11 @@ end
     @test resolved_solvent_leg.lambda_scheduler == :ele_scaled
     @test resolved_solvent_leg.coulomb_softcore_model == :gapsys
     @test resolved_solvent_leg.lj_softcore_model == :gapsys
+    @test resolved_solvent_leg.readiness_policy.preset == :staged_decoupling
     @test resolved_vacuum_leg.electrostatics_method == :none
     @test resolved_vacuum_leg.coulomb_softcore_model == :gapsys
     @test resolved_vacuum_leg.lj_softcore_model == :gapsys
+    @test resolved_vacuum_leg.readiness_policy.preset == :generic_alchemical
 
     invalid_electrostatics_leg = AWHGrads.ThermodynamicLegConfig(
         name=:solvent,
@@ -592,12 +622,16 @@ end
     @test isnothing(baseline_vacuum_leg.lambda_schedule)
     @test length(baseline_cfg.sim_cfg.lambda_schedule) == 21
     @test baseline_solvent_leg.include_pv
+    @test baseline_solvent_leg.readiness_policy.preset == :generic_alchemical
+    @test baseline_vacuum_leg.readiness_policy.preset == :generic_alchemical
 
     staged_npt_cfg = include(joinpath(@__DIR__, "..", "scripts", "benchmark_config_staged_npt.jl"))
     staged_npt_solvent_leg = only(filter(leg -> leg.name == :solvent, staged_npt_cfg.sim_cfg.cycle.legs))
     staged_npt_vacuum_leg = only(filter(leg -> leg.name == :vacuum, staged_npt_cfg.sim_cfg.cycle.legs))
     @test length(staged_npt_solvent_leg.lambda_schedule) == 31
     @test isnothing(staged_npt_vacuum_leg.lambda_schedule)
+    @test staged_npt_solvent_leg.readiness_policy.preset == :staged_decoupling
+    @test staged_npt_vacuum_leg.readiness_policy.preset == :generic_alchemical
 
     nvt_cfg = include(joinpath(@__DIR__, "..", "scripts", "benchmark_config_staged_nvt.jl"))
     nvt_solvent_leg = only(filter(leg -> leg.name == :solvent, nvt_cfg.sim_cfg.cycle.legs))
@@ -606,6 +640,8 @@ end
     @test isnothing(nvt_vacuum_leg.lambda_schedule)
     @test nvt_solvent_leg.ensemble == :nvt
     @test !nvt_solvent_leg.include_pv
+    @test nvt_solvent_leg.readiness_policy.preset == :staged_decoupling
+    @test nvt_vacuum_leg.readiness_policy.preset == :generic_alchemical
 end
 
 @testset "phase timing helpers" begin
@@ -639,6 +675,7 @@ end
 @testset "updated optimization defaults" begin
     sim_cfg = AWHGrads.default_simulation_config()
     @test sim_cfg.awh_probe_discard_fraction == 0.2
+    @test isempty(sim_cfg.parameter_pools)
     @test sim_cfg.awh_control.bias_update_interval_md_steps == 1000
     @test sim_cfg.awh_control.stats_log_every_updates == 1
     @test isnothing(sim_cfg.awh_control.update_freq)

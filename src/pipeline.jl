@@ -68,6 +68,45 @@ function scaled_probe_frame_cap(base_max_frames::Int, base_probe_steps::Int, cur
     return max(base_max_frames, Int(ceil(base_max_frames * scale)))
 end
 
+function atom_metadata_field_string(atom_data, field::Symbol)
+    hasproperty(atom_data, field) || return nothing
+    value = getproperty(atom_data, field)
+    isnothing(value) && return nothing
+    label = strip(String(value))
+    return isempty(label) ? nothing : label
+end
+
+function label_looks_hydrogen(label::AbstractString)
+    lowered = lowercase(strip(label))
+    isempty(lowered) && return false
+
+    for token in split(lowered, r"[^a-z0-9]+")
+        isempty(token) && continue
+        if token == "h" || startswith(token, "h")
+            return true
+        end
+    end
+
+    for char in lowered
+        isletter(char) || continue
+        return char == 'h'
+    end
+    return false
+end
+
+function atom_data_is_hydrogen(atom_data)
+    element = atom_metadata_field_string(atom_data, :element)
+    !isnothing(element) && return uppercase(element) == "H"
+
+    atom_name = atom_metadata_field_string(atom_data, :atom_name)
+    !isnothing(atom_name) && return label_looks_hydrogen(atom_name)
+
+    atom_type = atom_metadata_field_string(atom_data, :atom_type)
+    !isnothing(atom_type) && return label_looks_hydrogen(atom_type)
+
+    return false
+end
+
 Base.@kwdef mutable struct ActiveStageBProbeState
     probe_sim::Any = nothing
     bias_data::Any = nothing
@@ -133,49 +172,6 @@ function stage_b_summary_fingerprint(stats::StageBStats)
     )
 end
 
-function solvent_stage_a_tail_state_indices(
-    leg::ThermodynamicLegConfig,
-    state_schedule::ResolvedLegStateSchedule{FT};
-    lj_lambda_max::FT,
-) where {FT <: AbstractFloat}
-    if leg.is_vacuum
-        return Int[]
-    end
-
-    scheduler_name = isnothing(leg.lambda_scheduler) ? :default : leg.lambda_scheduler
-    if scheduler_name ∉ (:default, :namd, :ele_scaled)
-        return Int[]
-    end
-
-    diagnostics = solvent_lambda_schedule_diagnostics(state_schedule.lambda, scheduler_name, FT)
-    lj_tol = sqrt(eps(FT))
-    tail_idxs = Int[
-        entry.idx for entry in diagnostics
-        if entry.stage == :lj && entry.lj_lambda <= lj_lambda_max + lj_tol
-    ]
-    return isempty(tail_idxs) ? Int[state_schedule.decoupled_state_idx] : tail_idxs
-end
-
-function solvent_stage_a_endpoint_state_indices(
-    leg::ThermodynamicLegConfig,
-    state_schedule::ResolvedLegStateSchedule{FT};
-    lj_lambda_max::FT,
-) where {FT <: AbstractFloat}
-    if leg.is_vacuum
-        return Int[state_schedule.coupled_state_idx, state_schedule.decoupled_state_idx]
-    end
-    endpoint_idxs = solvent_stage_a_tail_state_indices(
-        leg,
-        state_schedule;
-        lj_lambda_max=lj_lambda_max,
-    )
-    if state_schedule.decoupled_state_idx ∉ endpoint_idxs
-        push!(endpoint_idxs, state_schedule.decoupled_state_idx)
-        sort!(endpoint_idxs)
-    end
-    return endpoint_idxs
-end
-
 function stage_a_history_window_sample_count(
     md_steps_block::Int,
     awh_control::AWHControlConfig,
@@ -232,7 +228,6 @@ function initialize_parameter_state(
 )
     FT = sim_cfg.FT
     bounds_cfg = sim_cfg.parameter_bounds
-    solute_idx = sim_cfg.solute_idx
 
     ref_leg = resolve_parameter_reference_leg(sim_cfg, cycle_cfg)
     ref_nonbonded_method = resolve_base_nonbonded_method(
@@ -242,59 +237,98 @@ function initialize_parameter_state(
     )
     sys_ref = System(ref_leg.pdb, ff; array_type=(ref_leg.is_vacuum ? Array : AT), nonbonded_method=ref_nonbonded_method, nonbonded_energy_type=sim_cfg.nonbonded_energy_type)
     atoms_cpu = Molly.from_device(sys_ref.atoms)
+    pool_cfgs = resolved_parameter_pool_configs(sim_cfg, opt_cfg, sys_ref)
+    pool_cfgs_by_name = Dict(pool.name => pool for pool in pool_cfgs)
+    atom_pool_names = resolve_system_parameter_pool_names(sys_ref, pool_cfgs)
 
     theta_ref = Vector{FT}()
     param_names = String[]
     param_kind = Symbol[]
     param_is_hydrogen = Bool[]
-    processed_atom_types = Dict{String, Int}()
-    solute_param_indices = Int[]
-    solvent_param_indices = Int[]
+    param_indices_by_key = Dict{Tuple{Symbol, String}, Tuple{Int, Int}}()
+    pool_param_indices = Dict(pool.name => Int[] for pool in pool_cfgs)
+    pool_sigma_indices = Dict(pool.name => Int[] for pool in pool_cfgs)
+    pool_epsilon_indices = Dict(pool.name => Int[] for pool in pool_cfgs)
 
     sigma_floor = FT(bounds_cfg.sigma_floor)
     epsilon_floor = FT(bounds_cfg.epsilon_floor)
     clamp_eps = FT(bounds_cfg.reference_clamp_eps)
 
-    # Each unique atom type contributes one σ and one ϵ parameter. The ordering
-    # established here becomes the canonical parameter ordering everywhere else.
+    # Each pool/atom-type pair contributes one σ and one ϵ parameter (subject to
+    # the pool's selected trainable families). This allows multiple pools to
+    # carry distinct copies of the same force-field atom type.
     for idx in eachindex(atoms_cpu)
+        pool_name = atom_pool_names[idx]
+        isnothing(pool_name) && continue
+
         atom = atoms_cpu[idx]
-        atype = String(sys_ref.atoms_data[idx].atom_type)
-        if haskey(processed_atom_types, atype)
+        atom_data = sys_ref.atoms_data[idx]
+        atype = String(atom_data.atom_type)
+        key = (pool_name, atype)
+        if haskey(param_indices_by_key, key)
             continue
         end
+        pool_cfg = pool_cfgs_by_name[pool_name]
 
-        is_hydrogen = startswith(lowercase(atype), "h")
+        is_hydrogen = atom_data_is_hydrogen(atom_data)
+        sigma_idx = 0
+        epsilon_idx = 0
 
-        sigma_raw = FT(ustrip(atom.σ))
-        if sigma_raw <= FT(1e-6) || sigma_raw == one(FT)
-            sigma_raw = sigma_floor
+        if :sigma in pool_cfg.trainable_families
+            sigma_raw = FT(ustrip(atom.σ))
+            if sigma_raw <= FT(1e-6) || sigma_raw == one(FT)
+                sigma_raw = sigma_floor
+            end
+            push!(theta_ref, sigma_raw)
+            push!(param_names, "pool_$(String(pool_name))_atom_$(atype)_σ")
+            push!(param_kind, :sigma)
+            push!(param_is_hydrogen, is_hydrogen)
+            sigma_idx = length(theta_ref)
+            push!(pool_param_indices[pool_name], sigma_idx)
+            push!(pool_sigma_indices[pool_name], sigma_idx)
         end
-        push!(theta_ref, sigma_raw)
-        push!(param_names, "atom_$(atype)_σ")
-        push!(param_kind, :sigma)
-        push!(param_is_hydrogen, is_hydrogen)
-        sigma_idx = length(theta_ref)
 
-        epsilon_raw = FT(ustrip(atom.ϵ))
-        if epsilon_raw <= FT(1e-6)
-            epsilon_raw = epsilon_floor
+        if :epsilon in pool_cfg.trainable_families
+            epsilon_raw = FT(ustrip(atom.ϵ))
+            if epsilon_raw <= FT(1e-6)
+                epsilon_raw = epsilon_floor
+            end
+            push!(theta_ref, epsilon_raw)
+            push!(param_names, "pool_$(String(pool_name))_atom_$(atype)_ϵ")
+            push!(param_kind, :epsilon)
+            push!(param_is_hydrogen, is_hydrogen)
+            epsilon_idx = length(theta_ref)
+            push!(pool_param_indices[pool_name], epsilon_idx)
+            push!(pool_epsilon_indices[pool_name], epsilon_idx)
         end
-        push!(theta_ref, epsilon_raw)
-        push!(param_names, "atom_$(atype)_ϵ")
-        push!(param_kind, :epsilon)
-        push!(param_is_hydrogen, is_hydrogen)
-        epsilon_idx = length(theta_ref)
 
-        processed_atom_types[atype] = sigma_idx
-        if idx ∈ solute_idx
-            push!(solute_param_indices, sigma_idx, epsilon_idx)
-        else
-            push!(solvent_param_indices, sigma_idx, epsilon_idx)
-        end
+        param_indices_by_key[key] = (sigma_idx, epsilon_idx)
     end
 
-    trainable_param_indices = opt_cfg.optimize_solvent ? collect(eachindex(theta_ref)) : copy(solute_param_indices)
+    isempty(theta_ref) && throw(ArgumentError("No trainable LJ parameters were constructed. Check `parameter_pools` or the legacy `solute_idx`/`optimize_solvent` settings."))
+
+    parameter_pools = ResolvedParameterPool[]
+    default_pool_step = default_parameter_pool_max_phi_step(opt_cfg, length(pool_cfgs))
+    for pool_cfg in pool_cfgs
+        global_indices = sort(copy(pool_param_indices[pool_cfg.name]))
+        isempty(global_indices) && continue
+        push!(
+            parameter_pools,
+            ResolvedParameterPool(
+                name=pool_cfg.name,
+                global_indices=global_indices,
+                sigma_global_indices=sort(copy(pool_sigma_indices[pool_cfg.name])),
+                epsilon_global_indices=sort(copy(pool_epsilon_indices[pool_cfg.name])),
+                max_phi_step=isnothing(pool_cfg.max_phi_step) ? default_pool_step : Float64(pool_cfg.max_phi_step),
+                max_sigma_drift=isnothing(pool_cfg.max_sigma_drift) ? nothing : Float64(pool_cfg.max_sigma_drift),
+                max_epsilon_drift=isnothing(pool_cfg.max_epsilon_drift) ? nothing : Float64(pool_cfg.max_epsilon_drift),
+                reference_penalty_strength=Float64(pool_cfg.reference_penalty_strength),
+            ),
+        )
+    end
+    isempty(parameter_pools) && throw(ArgumentError("No resolved parameter pools contained trainable parameters."))
+
+    trainable_param_indices = collect(eachindex(theta_ref))
     trainable_param_names = [param_names[idx] for idx in trainable_param_indices]
     trainable_position_map = Dict{Int, Int}()
     for (i_local, i_global) in enumerate(trainable_param_indices)
@@ -342,18 +376,18 @@ function initialize_parameter_state(
             leg.coulomb_softcore_model,
         )
         sys_leg = leg.name == ref_leg.name ? sys_ref : System(leg.pdb, ff; array_type=(leg.is_vacuum ? Array : AT), nonbonded_method=leg_nonbonded_method, nonbonded_energy_type=sim_cfg.nonbonded_energy_type)
-        idxs_by_leg[leg.name] = build_index_maps(sys_leg, processed_atom_types)
+        idxs_by_leg[leg.name] = build_index_maps(sys_leg, param_indices_by_key, pool_cfgs)
     end
 
     return (
         phi_active=phi_active,
         theta_active=theta_active,
+        theta_ref=copy(theta_ref),
         param_names=param_names,
         trainable_param_names=trainable_param_names,
         trainable_param_indices=trainable_param_indices,
         trainable_position_map=trainable_position_map,
-        solute_param_indices=solute_param_indices,
-        solvent_param_indices=solvent_param_indices,
+        parameter_pools=parameter_pools,
         theta_min=theta_min,
         theta_max=theta_max,
         phi_0=phi_0,
@@ -556,10 +590,7 @@ function run_readiness_loop!(
     near_pass_cooldown_blocks = max(0, awh_stageB_near_pass_cooldown_blocks)
     base_probe_steps_by_leg = copy(probe_steps_by_leg)
     current_probe_steps_by_leg = copy(probe_steps_by_leg)
-    stageA_tail_state_idxs_by_leg = Dict{Symbol, Vector{Int}}()
-    stageA_endpoint_state_idxs_by_leg = Dict{Symbol, Vector{Int}}()
-    stageA_tail_min_occ_floor_by_leg = Dict{Symbol, FT}()
-    stageA_endpoint_high_min_fraction_by_leg = Dict{Symbol, FT}()
+    stageA_policy_by_leg = Dict{Symbol, ResolvedStageAReadinessPolicy{FT}}()
     stageA_history_window_samples_by_leg = Dict{Symbol, Int}()
     active_stageB_probe_by_leg = Dict{Symbol, Union{Nothing, ActiveStageBProbeState}}(leg.name => nothing for leg in cycle_cfg.legs)
     stageB_last_logged_fingerprint_by_leg = Dict{Symbol, String}(leg.name => "" for leg in cycle_cfg.legs)
@@ -572,29 +603,13 @@ function run_readiness_loop!(
             leg_awh_control,
             awh_stageA_history_blocks,
         )
-        if leg.is_vacuum
-            stageA_tail_state_idxs_by_leg[leg.name] = Int[]
-            stageA_endpoint_state_idxs_by_leg[leg.name] = solvent_stage_a_endpoint_state_indices(
-                leg,
-                state_schedules_by_leg[leg.name];
-                lj_lambda_max=zero(FT),
-            )
-            stageA_tail_min_occ_floor_by_leg[leg.name] = zero(FT)
-            stageA_endpoint_high_min_fraction_by_leg[leg.name] = zero(FT)
-            continue
-        end
-        stageA_tail_state_idxs_by_leg[leg.name] = solvent_stage_a_tail_state_indices(
+        stageA_policy_by_leg[leg.name] = resolve_leg_stage_a_readiness_policy(
             leg,
             state_schedules_by_leg[leg.name];
-            lj_lambda_max=awh_solvent_tail_lj_max,
+            awh_solvent_tail_lj_max=awh_solvent_tail_lj_max,
+            awh_solvent_tail_min_state_occupancy=awh_solvent_tail_min_state_occupancy,
+            awh_solvent_endpoint_min_fraction=awh_solvent_endpoint_min_fraction,
         )
-        stageA_endpoint_state_idxs_by_leg[leg.name] = solvent_stage_a_endpoint_state_indices(
-            leg,
-            state_schedules_by_leg[leg.name];
-            lj_lambda_max=awh_solvent_tail_lj_max,
-        )
-        stageA_tail_min_occ_floor_by_leg[leg.name] = max(zero(FT), awh_solvent_tail_min_state_occupancy)
-        stageA_endpoint_high_min_fraction_by_leg[leg.name] = max(zero(FT), awh_solvent_endpoint_min_fraction)
     end
 
     for leg in cycle_cfg.legs
@@ -631,6 +646,7 @@ function run_readiness_loop!(
 
             awh_leg = awh_by_leg[name]::AWHSimulation
             state_schedule = state_schedules_by_leg[name]
+            stageA_policy = stageA_policy_by_leg[name]
             remaining_steps = md_steps_budget - spent_steps[name]
             if remaining_steps <= 0
                 leg_status[name] = :budget_exhausted
@@ -676,8 +692,8 @@ function run_readiness_loop!(
                     parity_support_threshold=awh_parity_support_threshold,
                     support_allow_missing=awh_stageB_support_allow_missing,
                     parity_near_pass_factor=awh_parity_near_pass_factor,
-                    probe_tail_state_idxs=stageA_tail_state_idxs_by_leg[name],
-                    probe_tail_min_state_occupancy_floor=stageA_tail_min_occ_floor_by_leg[name],
+                    probe_hotspot_state_idxs=stageA_policy.hotspot_state_idxs,
+                    probe_hotspot_min_state_occupancy_floor=stageA_policy.hotspot_min_state_occupancy_floor,
                 )
                 spent_steps[name] += segment_steps
                 stageB_fresh_result_by_leg[name] = true
@@ -780,22 +796,22 @@ function run_readiness_loop!(
             n_states = length(state_schedule.lambda)
             dynamic_endpoint_fraction = FT(awh_endpoint_target_ratio / n_states)
 
-            stageA_stats_by_leg[name] = StageAStats(evaluate_stage_a_readiness(
-                awh_leg,
-                awh_convergence_tol;
-                tail_lag=awh_tail_lag,
-                min_lambda_ess=awh_min_lambda_ess,
-                min_linear_neff=awh_min_linear_neff,
-                min_round_trips=awh_min_round_trips,
-                endpoint_min_fraction=dynamic_endpoint_fraction,
-                history_window_length=stageA_history_window_samples_by_leg[name],
-                tail_state_idxs=stageA_tail_state_idxs_by_leg[name],
-                endpoint_state_idxs=stageA_endpoint_state_idxs_by_leg[name],
-                tail_min_state_occupancy_floor=stageA_tail_min_occ_floor_by_leg[name],
-                endpoint_high_min_fraction_abs=stageA_endpoint_high_min_fraction_by_leg[name],
-                low_idx=state_schedule.coupled_state_idx,
-                high_idx=state_schedule.decoupled_state_idx,
-            ))
+                stageA_stats_by_leg[name] = StageAStats(evaluate_stage_a_readiness(
+                    awh_leg,
+                    awh_convergence_tol;
+                    tail_lag=awh_tail_lag,
+                    min_lambda_ess=awh_min_lambda_ess,
+                    min_linear_neff=awh_min_linear_neff,
+                    min_round_trips=awh_min_round_trips,
+                    endpoint_min_fraction=dynamic_endpoint_fraction,
+                    history_window_length=stageA_history_window_samples_by_leg[name],
+                    hotspot_state_idxs=stageA_policy.hotspot_state_idxs,
+                    endpoint_state_idxs=stageA_policy.endpoint_state_idxs,
+                    hotspot_min_state_occupancy_floor=stageA_policy.hotspot_min_state_occupancy_floor,
+                    endpoint_high_min_fraction_abs=stageA_policy.endpoint_high_min_fraction_abs,
+                    low_idx=state_schedule.coupled_state_idx,
+                    high_idx=state_schedule.decoupled_state_idx,
+                ))
 
             if !awh_leg.state.in_initial_stage
                 df_ok = stageA_stats_by_leg[name].df_mean <= awh_min_initial_df_threshold
@@ -865,8 +881,8 @@ function run_readiness_loop!(
                         parity_support_threshold=awh_parity_support_threshold,
                         support_allow_missing=awh_stageB_support_allow_missing,
                         parity_near_pass_factor=awh_parity_near_pass_factor,
-                        probe_tail_state_idxs=stageA_tail_state_idxs_by_leg[name],
-                        probe_tail_min_state_occupancy_floor=stageA_tail_min_occ_floor_by_leg[name],
+                        probe_hotspot_state_idxs=stageA_policy.hotspot_state_idxs,
+                        probe_hotspot_min_state_occupancy_floor=stageA_policy.hotspot_min_state_occupancy_floor,
                     )
                     stageB_fresh_result_by_leg[name] = true
                     stageB_stats_by_leg[name] = finalize_stage_b_stats(
@@ -972,12 +988,12 @@ function run_readiness_loop!(
             name = leg.name
             statsA = stageA_stats_by_leg[name]
             low_occ_msg = isempty(statsA.low_occupancy_states) ? "-" : join(statsA.low_occupancy_states, ",")
-            endpoint_state_idxs = stageA_endpoint_state_idxs_by_leg[name]
-            endpoint_band_msg = format_state_idx_span(endpoint_state_idxs)
+            stageA_policy = stageA_policy_by_leg[name]
+            endpoint_band_msg = format_state_idx_span(stageA_policy.endpoint_state_idxs)
             tail_msg = ""
-            if !isempty(stageA_tail_state_idxs_by_leg[name])
-                tail_low_msg = isempty(statsA.tail_low_occupancy_states) ? "-" : join(statsA.tail_low_occupancy_states, ",")
-                tail_msg = " | tail=(Σ=$(round(statsA.tail_occupancy, digits=3)), min=$(round(statsA.tail_min_state_occupancy, digits=4)), ok=$(statsA.tail_ready)) | tail_low=$tail_low_msg"
+            if !isempty(stageA_policy.hotspot_state_idxs)
+                tail_low_msg = isempty(statsA.hotspot_low_occupancy_states) ? "-" : join(statsA.hotspot_low_occupancy_states, ",")
+                tail_msg = " | tail=(Σ=$(round(statsA.hotspot_occupancy, digits=3)), min=$(round(statsA.hotspot_min_state_occupancy, digits=4)), ok=$(statsA.hotspot_ready)) | tail_low=$tail_low_msg"
             end
             @info "  Stage A ($(name)): df=$(round(statsA.df_mean, digits=6)) (ok=$(statsA.df_ready)) | ess=$(round(statsA.lambda_ess, digits=1)) (ok=$(statsA.lambda_ess_ready)) | lin_neff=$(round(statsA.linear_neff, digits=1)) (ok=$(statsA.neff_ready)) | tau_int_est=$(round(statsA.tau_int_est, digits=2)) | switches=$(statsA.switch_count) | dwell_samples=(mean=$(round(statsA.mean_residence, digits=2)), med=$(round(statsA.median_residence, digits=2))) | rt=$(statsA.round_trips) (ok=$(statsA.round_trip_ready)) | endpt_recent=(low=$(round(statsA.endpoint_low, digits=3)), band=$(round(statsA.endpoint_high, digits=3)); band=$(endpoint_band_msg), req>=$(round(statsA.endpoint_high_required, digits=3))) (ok=$(statsA.endpoint_ready))$tail_msg | occ_min=$(round(statsA.min_state_occupancy, digits=4)) | low_occ=$low_occ_msg | n_hist_recent=$(statsA.n_hist_recent) | n_hist_total=$(statsA.n_hist) | streak=$(stageA_streak[name]) | cooldown=$(stageB_cooldown[name]) | failures=$(stageB_consecutive_failures[name])"
 
@@ -1177,12 +1193,12 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
     pstate = initialize_parameter_state(sim_cfg, opt_cfg, cycle_cfg)
     phi_active = pstate.phi_active
     theta_active = pstate.theta_active
+    theta_ref = pstate.theta_ref
     param_names = pstate.param_names
     trainable_param_names = pstate.trainable_param_names
     trainable_param_indices = pstate.trainable_param_indices
     trainable_position_map = pstate.trainable_position_map
-    solute_param_indices = pstate.solute_param_indices
-    solvent_param_indices = pstate.solvent_param_indices
+    parameter_pools = pstate.parameter_pools
     theta_min = pstate.theta_min
     theta_max = pstate.theta_max
     phi_0 = pstate.phi_0
@@ -1319,8 +1335,8 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             trainable_param_names,
             trainable_param_indices,
             trainable_position_map,
-            solute_param_indices,
-            solvent_param_indices,
+            parameter_pools,
+            theta_ref,
             theta_min,
             theta_max,
             phi_0,

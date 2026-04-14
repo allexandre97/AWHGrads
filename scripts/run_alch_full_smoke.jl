@@ -34,6 +34,7 @@ function smoke_cycle_from_example(cycle_cfg, solvent_probe_time, vacuum_probe_ti
             lambda_scheduler=leg.lambda_scheduler,
             coulomb_softcore_model=leg.coulomb_softcore_model,
             lj_softcore_model=leg.lj_softcore_model,
+            readiness_policy=leg.readiness_policy,
         )
     end
     return AWHGrads.ThermodynamicCycleConfig(

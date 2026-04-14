@@ -4,6 +4,23 @@
 #
 base_sim = AWHGrads.default_simulation_config()
 base_opt = AWHGrads.default_optimization_config()
+parameter_pools = [
+    AWHGrads.ParameterPoolConfig(
+        name=:inserted_region,
+        atom_indices=collect(1:9),
+        max_phi_step=0.25,
+        max_sigma_drift=0.08,
+        max_epsilon_drift=0.25,
+    ),
+    AWHGrads.ParameterPoolConfig(
+        name=:background_oxygen,
+        residue_names=["HOH"],
+        atom_types=["tip3p-O", "tip3p-H"],
+        max_phi_step=Float64(base_opt.max_phi_step_solvent),
+        max_sigma_drift=0.03,
+        max_epsilon_drift=0.08,
+    ),
+]
 
 # Vacuum keeps the legacy global λ schedule. The solvent leg uses the staged
 # default path defined on the cycle itself.
@@ -17,6 +34,7 @@ sim_cfg = AWHGrads.simulation_config_with(
     nonbonded_energy_type=AWHGrads.default_nonbonded_energy_type(base_sim.FT),
     cycle=custom_cycle,
     solute_idx=1:9,
+    parameter_pools=parameter_pools,
     force_field=AWHGrads.ForceFieldConfig(
         xml_files=["tip3p_standard.xml", "gaff.xml", "ethanol.xml"],
     ),
@@ -34,7 +52,6 @@ sim_cfg = AWHGrads.simulation_config_with(
 opt_cfg = AWHGrads.optimization_config_with(
     base_opt;
     max_macro_epochs=30,
-    optimize_solvent=false,
 )
 
 (sim_cfg=sim_cfg, opt_cfg=opt_cfg)

@@ -53,6 +53,8 @@ function analyze_stage_b_probe(
     parity_support_threshold::SP=zero(BT),
     parity_near_pass_factor::NP=BT(2),
     support_allow_missing::Int=0,
+    probe_hotspot_state_idxs::Vector{Int}=Int[],
+    probe_hotspot_min_state_occupancy_floor::FT=zero(FT),
     probe_tail_state_idxs::Vector{Int}=Int[],
     probe_tail_min_state_occupancy_floor::FT=zero(FT),
     probe_md_timed=nothing,
@@ -169,15 +171,19 @@ function analyze_stage_b_probe(
             push!(hotspot_occ_entries, "λ$(idx)=$(round(probe_occupancies[idx], digits=4))")
         end
     end
-    valid_tail_state_idxs = sort(unique(filter(idx -> 1 <= idx <= length(probe_occupancies), probe_tail_state_idxs)))
-    tail_occupancy = isempty(valid_tail_state_idxs) ? zero(FT) : sum(probe_occupancies[valid_tail_state_idxs])
-    tail_min_state_occupancy = isempty(valid_tail_state_idxs) ? zero(FT) : minimum(probe_occupancies[valid_tail_state_idxs])
-    tail_low_occupancy_states = isempty(valid_tail_state_idxs) ? Int[] : [
-        idx for idx in valid_tail_state_idxs if probe_occupancies[idx] < probe_tail_min_state_occupancy_floor
+    effective_hotspot_state_idxs = isempty(probe_hotspot_state_idxs) ? probe_tail_state_idxs : probe_hotspot_state_idxs
+    effective_hotspot_floor = probe_hotspot_min_state_occupancy_floor == zero(FT) ?
+        probe_tail_min_state_occupancy_floor :
+        probe_hotspot_min_state_occupancy_floor
+    valid_hotspot_state_idxs = sort(unique(filter(idx -> 1 <= idx <= length(probe_occupancies), effective_hotspot_state_idxs)))
+    hotspot_occupancy = isempty(valid_hotspot_state_idxs) ? zero(FT) : sum(probe_occupancies[valid_hotspot_state_idxs])
+    hotspot_min_state_occupancy = isempty(valid_hotspot_state_idxs) ? zero(FT) : minimum(probe_occupancies[valid_hotspot_state_idxs])
+    hotspot_low_occupancy_states = isempty(valid_hotspot_state_idxs) ? Int[] : [
+        idx for idx in valid_hotspot_state_idxs if probe_occupancies[idx] < effective_hotspot_floor
     ]
     parity_residual = hasproperty(split_parity, :parity_residual) ? split_parity.parity_residual : ET[]
-    tail_residual_entries = isempty(valid_tail_state_idxs) || isempty(parity_residual) ? String[] : [
-        "λ$(idx)=$(round(parity_residual[idx], digits=4))" for idx in valid_tail_state_idxs
+    tail_residual_entries = isempty(valid_hotspot_state_idxs) || isempty(parity_residual) ? String[] : [
+        "λ$(idx)=$(round(parity_residual[idx], digits=4))" for idx in valid_hotspot_state_idxs
     ]
     diagnostics = split_parity.diagnostics *
         " | probe_switches=$(probe_residence.switch_count)" *
@@ -186,9 +192,9 @@ function analyze_stage_b_probe(
         diagnostics *= " | probe_occ=[" * join(hotspot_occ_entries, "; ") * "]"
     end
     diagnostics *= " | probe_endpt=(low=$(round(probe_endpoint_low, digits=4)), high=$(round(probe_endpoint_high, digits=4)))"
-    if !isempty(valid_tail_state_idxs)
-        tail_low_msg = isempty(tail_low_occupancy_states) ? "-" : join(["λ$(idx)" for idx in tail_low_occupancy_states], ",")
-        diagnostics *= " | probe_tail=(total=$(round(tail_occupancy, digits=4)), min=$(round(tail_min_state_occupancy, digits=4)), low=$tail_low_msg)"
+    if !isempty(valid_hotspot_state_idxs)
+        tail_low_msg = isempty(hotspot_low_occupancy_states) ? "-" : join(["λ$(idx)" for idx in hotspot_low_occupancy_states], ",")
+        diagnostics *= " | probe_tail=(total=$(round(hotspot_occupancy, digits=4)), min=$(round(hotspot_min_state_occupancy, digits=4)), low=$tail_low_msg)"
     end
     if !isempty(tail_residual_entries)
         diagnostics *= " | tail_resid=[" * join(tail_residual_entries, "; ") * "]"
@@ -250,6 +256,8 @@ function advance_stage_b_probe!(
     parity_support_threshold::SP=zero(BT),
     parity_near_pass_factor::NP=BT(2),
     support_allow_missing::Int=0,
+    probe_hotspot_state_idxs::Vector{Int}=Int[],
+    probe_hotspot_min_state_occupancy_floor::FT=zero(FT),
     probe_tail_state_idxs::Vector{Int}=Int[],
     probe_tail_min_state_occupancy_floor::FT=zero(FT),
 ) where {
@@ -287,6 +295,8 @@ function advance_stage_b_probe!(
         parity_support_threshold=parity_support_threshold,
         parity_near_pass_factor=parity_near_pass_factor,
         support_allow_missing=support_allow_missing,
+        probe_hotspot_state_idxs=probe_hotspot_state_idxs,
+        probe_hotspot_min_state_occupancy_floor=probe_hotspot_min_state_occupancy_floor,
         probe_tail_state_idxs=probe_tail_state_idxs,
         probe_tail_min_state_occupancy_floor=probe_tail_min_state_occupancy_floor,
         probe_md_timed=probe_md_timed,
@@ -318,6 +328,8 @@ function start_stage_b_probe(
     parity_support_threshold::SP=zero(BT),
     parity_near_pass_factor::NP=BT(2),
     support_allow_missing::Int=0,
+    probe_hotspot_state_idxs::Vector{Int}=Int[],
+    probe_hotspot_min_state_occupancy_floor::FT=zero(FT),
     probe_tail_state_idxs::Vector{Int}=Int[],
     probe_tail_min_state_occupancy_floor::FT=zero(FT),
 ) where {
@@ -358,6 +370,8 @@ function start_stage_b_probe(
         parity_support_threshold=parity_support_threshold,
         parity_near_pass_factor=parity_near_pass_factor,
         support_allow_missing=support_allow_missing,
+        probe_hotspot_state_idxs=probe_hotspot_state_idxs,
+        probe_hotspot_min_state_occupancy_floor=probe_hotspot_min_state_occupancy_floor,
         probe_tail_state_idxs=probe_tail_state_idxs,
         probe_tail_min_state_occupancy_floor=probe_tail_min_state_occupancy_floor,
     )
@@ -790,8 +804,10 @@ function evaluate_stage_a_readiness(
     min_round_trips::Int,
     endpoint_min_fraction::FT,
     history_window_length::Int=0,
+    hotspot_state_idxs::Vector{Int}=Int[],
     tail_state_idxs::Vector{Int}=Int[],
     endpoint_state_idxs::Vector{Int}=Int[],
+    hotspot_min_state_occupancy_floor::FT=zero(FT),
     tail_min_state_occupancy_floor::FT=zero(FT),
     endpoint_high_min_fraction_abs::FT=zero(FT),
     low_idx::Int=1,
@@ -829,16 +845,20 @@ function evaluate_stage_a_readiness(
     low_occupancy_threshold = FT(0.01)
     min_state_occupancy = isempty(occupancies) ? zero(FT) : minimum(occupancies)
     low_occupancy_states = findall(x -> x < low_occupancy_threshold, occupancies)
-    valid_tail_state_idxs = sort(unique(filter(idx -> 1 <= idx <= length(occupancies), tail_state_idxs)))
-    tail_occupancy = isempty(valid_tail_state_idxs) ? zero(FT) : sum(occupancies[valid_tail_state_idxs])
-    tail_min_state_occupancy = isempty(valid_tail_state_idxs) ? one(FT) : minimum(occupancies[valid_tail_state_idxs])
-    tail_low_occupancy_states = isempty(valid_tail_state_idxs) ? Int[] : [
-        idx for idx in valid_tail_state_idxs if occupancies[idx] < tail_min_state_occupancy_floor
+    effective_hotspot_state_idxs = isempty(hotspot_state_idxs) ? tail_state_idxs : hotspot_state_idxs
+    effective_hotspot_floor = hotspot_min_state_occupancy_floor == zero(FT) ?
+        tail_min_state_occupancy_floor :
+        hotspot_min_state_occupancy_floor
+    valid_hotspot_state_idxs = sort(unique(filter(idx -> 1 <= idx <= length(occupancies), effective_hotspot_state_idxs)))
+    hotspot_occupancy = isempty(valid_hotspot_state_idxs) ? zero(FT) : sum(occupancies[valid_hotspot_state_idxs])
+    hotspot_min_state_occupancy = isempty(valid_hotspot_state_idxs) ? one(FT) : minimum(occupancies[valid_hotspot_state_idxs])
+    hotspot_low_occupancy_states = isempty(valid_hotspot_state_idxs) ? Int[] : [
+        idx for idx in valid_hotspot_state_idxs if occupancies[idx] < effective_hotspot_floor
     ]
-    tail_ready = isempty(valid_tail_state_idxs) || tail_min_state_occupancy >= tail_min_state_occupancy_floor
+    hotspot_ready = isempty(valid_hotspot_state_idxs) || hotspot_min_state_occupancy >= effective_hotspot_floor
     residence_summary = residence_length_summary(idx_history_recent, FT)
 
-    ready = df_ready && lambda_ess_ready && round_trip_ready && endpoint_ready && tail_ready
+    ready = df_ready && lambda_ess_ready && round_trip_ready && endpoint_ready && hotspot_ready
     return (
         ready = ready,
         df_ready = df_ready,
@@ -857,10 +877,14 @@ function evaluate_stage_a_readiness(
         endpoint_high = endpoint_high,
         endpoint_high_required = endpoint_high_required,
         endpoint_ready = endpoint_ready,
-        tail_occupancy = tail_occupancy,
-        tail_min_state_occupancy = tail_min_state_occupancy,
-        tail_ready = tail_ready,
-        tail_low_occupancy_states = tail_low_occupancy_states,
+        hotspot_occupancy = hotspot_occupancy,
+        hotspot_min_state_occupancy = hotspot_min_state_occupancy,
+        hotspot_ready = hotspot_ready,
+        hotspot_low_occupancy_states = hotspot_low_occupancy_states,
+        tail_occupancy = hotspot_occupancy,
+        tail_min_state_occupancy = hotspot_min_state_occupancy,
+        tail_ready = hotspot_ready,
+        tail_low_occupancy_states = hotspot_low_occupancy_states,
         min_state_occupancy = min_state_occupancy,
         low_occupancy_states = low_occupancy_states,
         n_hist = length(idx_history_full),
@@ -1429,6 +1453,8 @@ function run_stage_b_probe(
     parity_support_threshold::SP=zero(BT),
     parity_near_pass_factor::NP=BT(2),
     support_allow_missing::Int=0,
+    probe_hotspot_state_idxs::Vector{Int}=Int[],
+    probe_hotspot_min_state_occupancy_floor::FT=zero(FT),
     probe_tail_state_idxs::Vector{Int}=Int[],
     probe_tail_min_state_occupancy_floor::FT=zero(FT),
 ) where {
@@ -1476,6 +1502,8 @@ function run_stage_b_probe(
         parity_support_threshold=parity_support_threshold,
         parity_near_pass_factor=parity_near_pass_factor,
         support_allow_missing=support_allow_missing,
+        probe_hotspot_state_idxs=probe_hotspot_state_idxs,
+        probe_hotspot_min_state_occupancy_floor=probe_hotspot_min_state_occupancy_floor,
         probe_tail_state_idxs=probe_tail_state_idxs,
         probe_tail_min_state_occupancy_floor=probe_tail_min_state_occupancy_floor,
     ).stats

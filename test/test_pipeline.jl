@@ -38,48 +38,135 @@ end
     @test AWHGrads.scaled_probe_frame_cap(6_000, 5_000_000, 11_250_000) == 13_500
 end
 
-@testset "optimization helper scheduling" begin
-    param_names = [
-        "atom_c3_σ",
-        "atom_c3_ϵ",
-        "atom_oh_σ",
-        "atom_oh_ϵ",
-        "atom_ow_σ",
-        "atom_ow_ϵ",
+@testset "parameter pool selectors and optimizer metadata" begin
+    sim_cfg = AWHGrads.default_simulation_config(AT=Array)
+    cycle_cfg = AWHGrads.validate_cycle_config(
+        AWHGrads.resolved_cycle_config(sim_cfg);
+        default_lambda_schedule=sim_cfg.lambda_schedule,
+        FT=sim_cfg.FT,
+    )
+    ref_leg = AWHGrads.resolve_parameter_reference_leg(sim_cfg, cycle_cfg)
+    ref_method = AWHGrads.resolve_base_nonbonded_method(
+        ref_leg.electrostatics_method,
+        ref_leg.is_vacuum,
+        ref_leg.coulomb_softcore_model,
+    )
+    sys_ref = Molly.System(
+        ref_leg.pdb,
+        AWHGrads.ff;
+        array_type=Array,
+        nonbonded_method=ref_method,
+        nonbonded_energy_type=sim_cfg.nonbonded_energy_type,
+    )
+
+    pool_cfgs = [
+        AWHGrads.ParameterPoolConfig(
+            name=:inserted_region,
+            atom_indices=collect(1:9),
+            max_phi_step=0.25,
+        ),
+        AWHGrads.ParameterPoolConfig(
+            name=:background_oxygen,
+            residue_names=["HOH"],
+            atom_types=["tip3p-O"],
+            max_phi_step=0.035,
+            max_sigma_drift=0.03,
+            max_epsilon_drift=0.08,
+        ),
     ]
+    memberships = AWHGrads.resolve_system_parameter_pool_names(sys_ref, pool_cfgs)
+    oxygen_indices = findall(ad -> ad.res_name == "HOH" && ad.atom_type == "tip3p-O", sys_ref.atoms_data)
+    hydrogen_indices = findall(ad -> ad.res_name == "HOH" && ad.atom_type == "tip3p-H", sys_ref.atoms_data)
 
-    solute_indices = [1, 2, 3, 4]
-    solvent_indices = [5, 6]
+    @test all(memberships[1:9] .== Ref(:inserted_region))
+    @test !isempty(oxygen_indices)
+    @test all(memberships[oxygen_indices] .== Ref(:background_oxygen))
+    @test all(isnothing, memberships[hydrogen_indices])
 
-    solute_trainable_map = Dict(idx => pos for (pos, idx) in enumerate(solute_indices))
-    solute_blocks = AWHGrads.optimization_active_blocks(
-        param_names,
-        solute_indices,
-        solute_trainable_map,
-        solute_indices,
-        solvent_indices,
-        false,
+    sim_cfg_joint = AWHGrads.simulation_config_with(
+        sim_cfg;
+        parameter_pools=pool_cfgs,
+        parameter_reference_leg=:solvent,
+    )
+    pstate = AWHGrads.initialize_parameter_state(
+        sim_cfg_joint,
+        AWHGrads.default_optimization_config(FT=sim_cfg.FT),
+        cycle_cfg,
     )
 
-    @test [block.name for block in solute_blocks] == ["Solute"]
-    @test [block.kind for block in solute_blocks] == [:solute]
-    @test [block.global_indices for block in solute_blocks] == [[1, 2, 3, 4]]
-    @test [block.trainable_indices for block in solute_blocks] == [[1, 2, 3, 4]]
+    @test any(contains("pool_inserted_region"), pstate.param_names)
+    @test any(contains("pool_background_oxygen"), pstate.param_names)
+    @test !any(contains("tip3p-H"), pstate.param_names)
 
-    all_indices = collect(1:length(param_names))
-    all_trainable_map = Dict(idx => idx for idx in all_indices)
-    alternating_blocks = AWHGrads.optimization_active_blocks(
-        param_names,
-        all_indices,
-        all_trainable_map,
-        solute_indices,
-        solvent_indices,
-        true,
+    active_pools = AWHGrads.optimization_active_pools(
+        pstate.trainable_position_map,
+        pstate.parameter_pools,
+    )
+    @test [pool.name for pool in active_pools] == [:inserted_region, :background_oxygen]
+    @test all(!isempty(pool.global_indices) for pool in active_pools)
+end
+
+@testset "parameter initialization classifies hydrogen atom types from metadata" begin
+    sim_cfg = AWHGrads.default_simulation_config(AT=Array)
+    cycle_cfg = AWHGrads.validate_cycle_config(
+        AWHGrads.resolved_cycle_config(sim_cfg);
+        default_lambda_schedule=sim_cfg.lambda_schedule,
+        FT=sim_cfg.FT,
+    )
+    ref_leg = AWHGrads.resolve_parameter_reference_leg(sim_cfg, cycle_cfg)
+    ref_method = AWHGrads.resolve_base_nonbonded_method(
+        ref_leg.electrostatics_method,
+        ref_leg.is_vacuum,
+        ref_leg.coulomb_softcore_model,
+    )
+    sys_ref = Molly.System(
+        ref_leg.pdb,
+        AWHGrads.ff;
+        array_type=Array,
+        nonbonded_method=ref_method,
+        nonbonded_energy_type=sim_cfg.nonbonded_energy_type,
     )
 
-    @test [block.name for block in alternating_blocks] == ["Solute", "Solvent"]
-    @test [block.kind for block in alternating_blocks] == [:solute, :solvent]
-    @test [block.global_indices for block in alternating_blocks] == [[1, 2, 3, 4], [5, 6]]
+    water_h = first(ad for ad in sys_ref.atoms_data if ad.atom_type == "tip3p-H")
+    water_o = first(ad for ad in sys_ref.atoms_data if ad.atom_type == "tip3p-O")
+    @test AWHGrads.atom_data_is_hydrogen(water_h)
+    @test !AWHGrads.atom_data_is_hydrogen(water_o)
+    @test AWHGrads.atom_data_is_hydrogen((; atom_type="tip3p-H", atom_name="", element=""))
+
+    pool_cfgs = [
+        AWHGrads.ParameterPoolConfig(
+            name=:inserted_region,
+            atom_indices=collect(1:9),
+            max_phi_step=0.25,
+        ),
+        AWHGrads.ParameterPoolConfig(
+            name=:background_water,
+            residue_names=["HOH"],
+            atom_types=["tip3p-O", "tip3p-H"],
+            max_phi_step=0.035,
+            max_sigma_drift=0.03,
+            max_epsilon_drift=0.08,
+        ),
+    ]
+    sim_cfg_joint = AWHGrads.simulation_config_with(
+        sim_cfg;
+        parameter_pools=pool_cfgs,
+        parameter_reference_leg=:solvent,
+    )
+    opt_cfg = AWHGrads.default_optimization_config(FT=sim_cfg.FT)
+    pstate = AWHGrads.initialize_parameter_state(sim_cfg_joint, opt_cfg, cycle_cfg)
+    bounds_cfg = sim_cfg_joint.parameter_bounds
+
+    h_sigma_idx = findfirst(==("pool_background_water_atom_tip3p-H_σ"), pstate.param_names)
+    h_epsilon_idx = findfirst(==("pool_background_water_atom_tip3p-H_ϵ"), pstate.param_names)
+    @test !isnothing(h_sigma_idx)
+    @test !isnothing(h_epsilon_idx)
+    @test pstate.theta_min[h_sigma_idx] == sim_cfg.FT(bounds_cfg.sigma_hydrogen_min)
+    @test pstate.theta_max[h_sigma_idx] == sim_cfg.FT(bounds_cfg.sigma_hydrogen_max)
+    @test pstate.theta_min[h_epsilon_idx] == sim_cfg.FT(bounds_cfg.epsilon_hydrogen_min)
+    @test pstate.theta_max[h_epsilon_idx] == sim_cfg.FT(bounds_cfg.epsilon_hydrogen_max)
+    @test isapprox(pstate.theta_active[h_sigma_idx], pstate.theta_ref[h_sigma_idx]; atol=sim_cfg.FT(1e-4))
+    @test isapprox(pstate.theta_active[h_epsilon_idx], pstate.theta_ref[h_epsilon_idx]; atol=sim_cfg.FT(1e-4))
 end
 
 @testset "line search residual tolerance" begin

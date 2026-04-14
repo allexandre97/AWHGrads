@@ -20,6 +20,7 @@ cycle_cfg = AWHGrads.ThermodynamicCycleConfig(
             electrostatics_method=:pme,
             coulomb_softcore_model=:gapsys,
             lj_softcore_model=:gapsys,
+            readiness_policy=AWHGrads.StageAReadinessPolicyConfig(preset=:generic_alchemical),
         ),
         AWHGrads.ThermodynamicLegConfig(
             name=:vacuum,
@@ -31,6 +32,7 @@ cycle_cfg = AWHGrads.ThermodynamicCycleConfig(
             electrostatics_method=:none,
             coulomb_softcore_model=:gapsys,
             lj_softcore_model=:gapsys,
+            readiness_policy=AWHGrads.StageAReadinessPolicyConfig(preset=:generic_alchemical),
         ),
     ],
     include_standard_state_correction=true,

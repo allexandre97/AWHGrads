@@ -93,6 +93,7 @@ function build_full_example_configs()
                 lambda_scheduler=:ele_scaled,
                 coulomb_softcore_model=:gapsys,
                 lj_softcore_model=:gapsys,
+                readiness_policy=leg.readiness_policy,
             )
             idx = findfirst(l -> l.name == :solvent, cycle_cfg.legs)
             cycle_cfg.legs[idx] = new_leg

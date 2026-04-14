@@ -164,67 +164,124 @@ function compute_leg_endpoint_state(
 end
 
 
-Base.@kwdef struct OptimizationBlock
-    name::String
-    kind::Symbol
+Base.@kwdef struct OptimizationPool
+    name::Symbol
     global_indices::Vector{Int}
     trainable_indices::Vector{Int}
+    sigma_global_indices::Vector{Int}
+    sigma_trainable_indices::Vector{Int}
+    epsilon_global_indices::Vector{Int}
+    epsilon_trainable_indices::Vector{Int}
+    max_phi_step::Float64
+    max_sigma_drift::Union{Nothing, Float64}
+    max_epsilon_drift::Union{Nothing, Float64}
+    reference_penalty_strength::Float64
 end
 
 
 """
-    optimization_active_blocks(param_names, trainable_param_indices,
-                               trainable_position_map, solute_param_indices,
-                               solvent_param_indices, optimize_solvent)
+    optimization_active_pools(trainable_position_map, parameter_pools)
 
-Build the ordered list of parameter blocks visited by the inner optimization
-loop. When `optimize_solvent=false`, the full trainable solute vector is
-updated together.
+Build the runtime pool metadata used by the joint optimizer. Pool-specific step
+caps and drift limits are applied after solving one joint Fisher-preconditioned
+update over the full trainable parameter vector.
 """
-function optimization_active_blocks(
-    param_names::Vector{String},
-    trainable_param_indices::Vector{Int},
+function optimization_active_pools(
     trainable_position_map::Dict{Int, Int},
-    solute_param_indices::Vector{Int},
-    solvent_param_indices::Vector{Int},
-    optimize_solvent::Bool,
+    parameter_pools::Vector{ResolvedParameterPool},
 )
-    blocks = OptimizationBlock[]
+    pools = OptimizationPool[]
 
-    if optimize_solvent
-        for (name, kind, global_indices_raw) in (
-            ("Solute", :solute, solute_param_indices),
-            ("Solvent", :solvent, solvent_param_indices),
-        )
-            global_indices = [idx for idx in global_indices_raw if haskey(trainable_position_map, idx)]
-            isempty(global_indices) && continue
-            trainable_indices = [trainable_position_map[idx] for idx in global_indices]
-            push!(
-                blocks,
-                OptimizationBlock(
-                    name=name,
-                    kind=kind,
-                    global_indices=global_indices,
-                    trainable_indices=trainable_indices,
-                ),
-            )
-        end
-    else
-        global_indices = [idx for idx in trainable_param_indices if haskey(trainable_position_map, idx)]
-        trainable_indices = [trainable_position_map[idx] for idx in global_indices]
-        isempty(global_indices) || push!(
-            blocks,
-            OptimizationBlock(
-                name="Solute",
-                kind=:solute,
+    for pool in parameter_pools
+        global_indices = [idx for idx in pool.global_indices if haskey(trainable_position_map, idx)]
+        isempty(global_indices) && continue
+        push!(
+            pools,
+            OptimizationPool(
+                name=pool.name,
                 global_indices=global_indices,
-                trainable_indices=trainable_indices,
+                trainable_indices=[trainable_position_map[idx] for idx in global_indices],
+                sigma_global_indices=[idx for idx in pool.sigma_global_indices if haskey(trainable_position_map, idx)],
+                sigma_trainable_indices=[trainable_position_map[idx] for idx in pool.sigma_global_indices if haskey(trainable_position_map, idx)],
+                epsilon_global_indices=[idx for idx in pool.epsilon_global_indices if haskey(trainable_position_map, idx)],
+                epsilon_trainable_indices=[trainable_position_map[idx] for idx in pool.epsilon_global_indices if haskey(trainable_position_map, idx)],
+                max_phi_step=pool.max_phi_step,
+                max_sigma_drift=pool.max_sigma_drift,
+                max_epsilon_drift=pool.max_epsilon_drift,
+                reference_penalty_strength=pool.reference_penalty_strength,
             ),
         )
     end
 
-    isempty(blocks) && throw(ArgumentError("No optimization blocks were constructed."))
-    return blocks
+    isempty(pools) && throw(ArgumentError("No optimization pools were constructed."))
+    return pools
+end
+
+function apply_pool_reference_penalty!(
+    grad_loss::AbstractVector{AT},
+    fim_joint::AbstractMatrix{AT},
+    theta_active::AbstractVector{FT},
+    theta_ref::AbstractVector{FT},
+    chain_rule_multiplier::AbstractVector{FT},
+    optimization_pools::Vector{OptimizationPool},
+) where {AT <: AbstractFloat, FT <: AbstractFloat}
+    for pool in optimization_pools
+        strength = AT(pool.reference_penalty_strength)
+        strength <= zero(AT) && continue
+        for (idx_global, idx_local) in zip(pool.global_indices, pool.trainable_indices)
+            delta_theta = AT(theta_active[idx_global] - theta_ref[idx_global])
+            chain = AT(chain_rule_multiplier[idx_global])
+            grad_loss[idx_local] += strength * delta_theta * chain
+            fim_joint[idx_local, idx_local] += strength * chain * chain
+        end
+    end
+    return nothing
+end
+
+function clip_update_by_pool!(
+    update_direction_train::AbstractVector{AT},
+    optimization_pools::Vector{OptimizationPool},
+) where {AT <: AbstractFloat}
+    clip_stats = Dict{Symbol, NamedTuple}()
+    for pool in optimization_pools
+        if isempty(pool.trainable_indices)
+            clip_stats[pool.name] = (max_phi_update=zero(AT), clip_scaling=one(AT))
+            continue
+        end
+        max_phi_update = maximum(abs.(update_direction_train[pool.trainable_indices]))
+        clip_scaling = one(AT)
+        pool_cap = AT(pool.max_phi_step)
+        if max_phi_update > pool_cap
+            clip_scaling = pool_cap / max_phi_update
+            update_direction_train[pool.trainable_indices] .*= clip_scaling
+            max_phi_update = pool_cap
+        end
+        clip_stats[pool.name] = (max_phi_update=max_phi_update, clip_scaling=clip_scaling)
+    end
+    return clip_stats
+end
+
+function pool_drift_metrics(
+    theta_values::AbstractVector{FT},
+    theta_ref::AbstractVector{FT},
+    optimization_pools::Vector{OptimizationPool},
+) where {FT <: AbstractFloat}
+    drift_metrics = Dict{Symbol, NamedTuple}()
+    drift_ok = true
+    for pool in optimization_pools
+        sigma_drift = isempty(pool.sigma_global_indices) ? zero(FT) : maximum(abs.(theta_values[pool.sigma_global_indices] .- theta_ref[pool.sigma_global_indices]))
+        epsilon_drift = isempty(pool.epsilon_global_indices) ? zero(FT) : maximum(abs.(theta_values[pool.epsilon_global_indices] .- theta_ref[pool.epsilon_global_indices]))
+        sigma_ready = isnothing(pool.max_sigma_drift) || sigma_drift <= FT(pool.max_sigma_drift)
+        epsilon_ready = isnothing(pool.max_epsilon_drift) || epsilon_drift <= FT(pool.max_epsilon_drift)
+        drift_ok &= sigma_ready && epsilon_ready
+        drift_metrics[pool.name] = (
+            sigma_drift=sigma_drift,
+            epsilon_drift=epsilon_drift,
+            sigma_ready=sigma_ready,
+            epsilon_ready=epsilon_ready,
+        )
+    end
+    return drift_ok, drift_metrics
 end
 
 
@@ -441,14 +498,13 @@ end
 """
     run_optimization_phase!(phi_active, theta_active, leg_artifacts, param_names,
                             trainable_param_names, trainable_param_indices,
-                            trainable_position_map, solute_param_indices,
-                            solvent_param_indices, theta_min, theta_max, phi_0,
-                            beta_val, dG_std_corr, dG_exp, opt_cfg)
+                            trainable_position_map, parameter_pools, theta_ref,
+                            theta_min, theta_max, phi_0, beta_val, dG_std_corr,
+                            dG_exp, opt_cfg)
 
-Perform the inner optimization loop for one macro epoch. The loop alternates
-between evaluating the current parameterization, building a Fisher-preconditioned
-update direction, and line-searching until either progress stalls or the ESS
-constraint is violated.
+Perform the inner optimization loop for one macro epoch. Each inner epoch
+builds one joint Fisher-preconditioned update over the full trainable vector,
+then applies pool-specific step caps and drift checks during line search.
 """
 function run_optimization_phase!(
     phi_active::Vector{FT},
@@ -458,8 +514,8 @@ function run_optimization_phase!(
     trainable_param_names::Vector{String},
     trainable_param_indices::Vector{Int},
     trainable_position_map::Dict{Int, Int},
-    solute_param_indices::Vector{Int},
-    solvent_param_indices::Vector{Int},
+    parameter_pools::Vector{ResolvedParameterPool},
+    theta_ref::Vector{FT},
     theta_min::Vector{FT},
     theta_max::Vector{FT},
     phi_0::Vector{FT},
@@ -482,13 +538,9 @@ function run_optimization_phase!(
 
     theoretical_ess_ratio = exp(AT(-2.0) * AT(opt_cfg.kl_target))
     ess_threshold_ratio = AT(opt_cfg.ess_threshold_scale) * theoretical_ess_ratio
-    active_blocks = optimization_active_blocks(
-        param_names,
-        trainable_param_indices,
+    active_pools = optimization_active_pools(
         trainable_position_map,
-        solute_param_indices,
-        solvent_param_indices,
-        opt_cfg.optimize_solvent,
+        parameter_pools,
     )
 
     ess_thresholds = Dict{Symbol, AT}()
@@ -511,21 +563,12 @@ function run_optimization_phase!(
     best_macro_epoch = 0
     phi_best_macro = copy(phi_active)
     theta_best_macro = copy(theta_active)
-    solvent_theta_start = isempty(solvent_param_indices) ? FT[] : copy(theta_active[solvent_param_indices])
+    best_pool_drifts = Dict{Symbol, NamedTuple}()
 
     inner_epoch = 1
     while inner_epoch <= opt_cfg.max_inner_epochs
-        block = active_blocks[((inner_epoch - 1) % length(active_blocks)) + 1]
-        active_global_indices = block.global_indices
-        active_trainable_indices = block.trainable_indices
-        block_name = block.name
-        @info "  >> Optimization Epoch: Active Block = $block_name"
-
-        if isempty(active_trainable_indices)
-            @info "  [!] No parameters active for this block. Skipping."
-            inner_epoch += 1
-            continue
-        end
+        pool_label = join(string.(getfield.(active_pools, :name)), ",")
+        @info "  >> Optimization Epoch: Active Pools = $pool_label"
 
         chain_rule_multiplier = get_chain_rule_multiplier(theta_active, theta_min, theta_max, opt_cfg.k_sigmoid)
 
@@ -623,13 +666,20 @@ function run_optimization_phase!(
             AT,
         )
         effective_kl_target = AT(opt_cfg.kl_target) * confidence_summary.scale
-        effective_max_phi_step_solute = AT(opt_cfg.max_phi_step_solute) * confidence_summary.scale
 
         dL_dE = abs(error_residual) <= AT(opt_cfg.huber_delta) ? error_residual : AT(opt_cfg.huber_delta) * sign(error_residual)
         grad_loss = dL_dE .* grad_cycle
+        apply_pool_reference_penalty!(
+            grad_loss,
+            fim_joint,
+            theta_active,
+            theta_ref,
+            chain_rule_multiplier,
+            active_pools,
+        )
 
-        grad_loss_active = grad_loss[active_trainable_indices]
-        fim_active = fim_joint[active_trainable_indices, active_trainable_indices]
+        grad_loss_active = grad_loss
+        fim_active = fim_joint
 
         fim_diag = diag(fim_active)
         variance_threshold = maximum(fim_diag) * AT(1e-5)
@@ -663,17 +713,8 @@ function run_optimization_phase!(
         n_truncated = count(v -> v <= eigenvalue_tol, vals)
         fim_cond_raw = cond(fim_corr)
 
-        max_phi_update = maximum(abs.(update_direction_active))
-        max_allowed_phi_step = block.kind == :solute ? effective_max_phi_step_solute : AT(opt_cfg.max_phi_step_solvent)
-
-        if max_phi_update > max_allowed_phi_step
-            clip_scaling = max_allowed_phi_step / max_phi_update
-            update_direction_active .*= clip_scaling
-            @info "  [!] Step clipped by infinity-norm (Scaling: $(round(clip_scaling, digits=4)))"
-        end
-
-        update_direction_train = zeros(AT, length(trainable_param_indices))
-        update_direction_train[active_trainable_indices] = update_direction_active
+        update_direction_train = copy(update_direction_active)
+        pool_clip_stats = clip_update_by_pool!(update_direction_train, active_pools)
         update_direction = zeros(AT, length(param_names))
         for (i_local, i_global) in enumerate(trainable_param_indices)
             update_direction[i_global] = update_direction_train[i_local]
@@ -685,12 +726,15 @@ function run_optimization_phase!(
         line_search_success = false
         accepted_residual = error_residual
         ess_prop = Dict{Symbol, AT}()
+        accepted_pool_drifts = Dict{Symbol, NamedTuple}()
 
         # Backtracking line search enforces both residual improvement and a
-        # minimum effective sample size under the proposed reweighting.
+        # minimum effective sample size under the proposed reweighting, together
+        # with optional per-pool drift caps relative to the reference model.
         for ls_iter in 1:7
             phi_prop .= phi_active .- alpha .* update_direction
             theta_prop .= map_phi_to_theta(phi_prop, theta_min, theta_max, phi_0, opt_cfg.k_sigmoid)
+            drift_ok, pool_drifts_prop = pool_drift_metrics(theta_prop, theta_ref, active_pools)
 
             dG_pred_prop = AT(dG_std_corr)
             ess_ok = true
@@ -723,6 +767,13 @@ function run_optimization_phase!(
             end
 
             error_residual_prop = dG_pred_prop - dG_exp
+            drift_msg = join(
+                [
+                    "$(pool.name)=σ$(round(pool_drifts_prop[pool.name].sigma_drift, digits=5))/ϵ$(round(pool_drifts_prop[pool.name].epsilon_drift, digits=5))"
+                    for pool in active_pools
+                ],
+                " | ",
+            )
             ess_msg = join(
                 [
                     "$(leg.name)=$(round(get(ess_prop, leg.name, zero(AT)), digits=1))"
@@ -730,9 +781,9 @@ function run_optimization_phase!(
                 ],
                 " | ",
             )
-            @info "    LS Iter $ls_iter (α=$(alpha)): ESS[$ess_msg] | Res = $(round(error_residual_prop, digits=3))"
+            @info "    LS Iter $ls_iter (α=$(alpha)): ESS[$ess_msg] | Drift[$drift_msg] | Res = $(round(error_residual_prop, digits=3))"
 
-            if ess_ok && line_search_residual_acceptable(
+            if ess_ok && drift_ok && line_search_residual_acceptable(
                 error_residual,
                 error_residual_prop,
                 AT(opt_cfg.line_search_noise_tolerance_fraction),
@@ -742,6 +793,7 @@ function run_optimization_phase!(
                 phi_active .= phi_prop
                 theta_active .= theta_prop
                 accepted_residual = error_residual_prop
+                accepted_pool_drifts = pool_drifts_prop
                 @info "    -> Line search converged."
                 break
             else
@@ -762,24 +814,25 @@ function run_optimization_phase!(
             best_macro_epoch = inner_epoch
             phi_best_macro .= phi_active
             theta_best_macro .= theta_active
+            best_pool_drifts = accepted_pool_drifts
         end
 
         norm_grad_loss = norm(grad_loss_active)
         max_grad_loss = maximum(abs.(grad_loss_active))
-        actual_max_phi_step = maximum(abs.(update_direction_active)) * alpha
+        actual_max_phi_step = maximum(abs.(update_direction_train)) * alpha
 
         @info "--- Current Parameter State ---"
         for i in eachindex(param_names)
             @info "  $(param_names[i]): $(round(theta_active[i], digits=6))"
         end
 
-        @info "--- Optimization Metrics (Epoch $inner_epoch - Block: $block_name) ---"
+        @info "--- Optimization Metrics (Epoch $inner_epoch - Joint Pools) ---"
         @info "  Prediction:  ∆G_pred = $(round(dG_pred, digits=3)) kT | Target = $(round(dG_exp, digits=3)) kT"
         @info "  Error:       Residual = $(round(error_residual, digits=3)) | Huber dL/dE = $(round(dL_dE, digits=3))"
         @info "  Accepted:    Residual = $(round(accepted_residual, digits=3)) | Extra req = $(round(confidence_summary.additional_residual_requirement, digits=4))"
         @info "  Gradients:   Norm = $(round(norm_grad_loss, digits=5)) | Max = $(round(max_grad_loss, digits=5))"
         @info "  FIM (Corr):  Raw Cond Number = $(round(fim_cond_raw, digits=2)) | Truncated Eigs = $n_truncated / $(length(vals))"
-        @info "  Trust Reg.:  Confidence = $(round(confidence_summary.scale, digits=4)) | KL target = $(round(effective_kl_target, digits=4)) | Max solute ϕ step = $(round(effective_max_phi_step_solute, digits=4))"
+        @info "  Trust Reg.:  Confidence = $(round(confidence_summary.scale, digits=4)) | KL target = $(round(effective_kl_target, digits=4))"
         @info "  Confidence:  endpoint_ΔG = $(round(confidence_summary.endpoint_disagreement, digits=4)) | cycle = $(round(confidence_summary.cycle_disagreement, digits=4)) | gradient = $(round(confidence_summary.gradient_disagreement, digits=4)) | eligible_legs = $(confidence_summary.eligible_legs)"
         if !isempty(confidence_summary.skipped_legs)
             @info "  Confidence:  skipped_legs = $(join(String.(confidence_summary.skipped_legs), ","))"
@@ -787,7 +840,12 @@ function run_optimization_phase!(
         @info "  KL Bound:    Est. KL = $(round(estimated_KL, digits=4)) | Target = $(round(effective_kl_target, digits=4)) | Scaling = $(round(kl_scaling, digits=4))"
         @info "  Line Search: Converged α = $alpha"
         @info "  Actual Step: Max ϕ ∆ = $(round(actual_max_phi_step, digits=6)) (α=$alpha)"
-        @info "  Params (σ,ϵ): Min = $(round(minimum(theta_active[active_global_indices]), digits=5)) | Max = $(round(maximum(theta_active[active_global_indices]), digits=5))"
+        @info "  Params (σ,ϵ): Min = $(round(minimum(theta_active[trainable_param_indices]), digits=5)) | Max = $(round(maximum(theta_active[trainable_param_indices]), digits=5))"
+        for pool in active_pools
+            clip_stat = pool_clip_stats[pool.name]
+            drift_stat = get(accepted_pool_drifts, pool.name, (sigma_drift=zero(AT), epsilon_drift=zero(AT), sigma_ready=true, epsilon_ready=true))
+            @info "  Pool $(pool.name): max_ϕ=$(round(clip_stat.max_phi_update, digits=6)) | clip=$(round(clip_stat.clip_scaling, digits=4)) | σ_drift=$(round(drift_stat.sigma_drift, digits=6)) | ϵ_drift=$(round(drift_stat.epsilon_drift, digits=6))"
+        end
         for leg in leg_artifacts
             @info "  Leg $(leg.name): coeff=$(round(leg.coefficient, digits=3)) | ΔG=$(round(leg_dG_current[leg.name], digits=3)) kT | ESS=$(round(ess_current[leg.name], digits=1)) / $(round(ess_thresholds[leg.name], digits=1)) | N_active=$(round(N_active[leg.name], digits=1))"
         end
@@ -824,10 +882,12 @@ function run_optimization_phase!(
         @info "  [!] Restored best inner-loop state from Epoch $best_macro_epoch (Residual = $(round(best_macro_residual, digits=3)))."
     end
 
-    solvent_drift = zero(FT)
-    if !opt_cfg.optimize_solvent && !isempty(solvent_param_indices)
-        solvent_drift = maximum(abs.(theta_active[solvent_param_indices] .- solvent_theta_start))
-        @info "Solvent Invariant: max |Δθ_solvent| = $(round(solvent_drift, digits=8))"
+    if !isempty(best_pool_drifts)
+        for pool in active_pools
+            if haskey(best_pool_drifts, pool.name)
+                @info "Pool Drift ($(pool.name)): σ=$(round(best_pool_drifts[pool.name].sigma_drift, digits=8)) | ϵ=$(round(best_pool_drifts[pool.name].epsilon_drift, digits=8))"
+            end
+        end
     end
 
     return (
@@ -836,6 +896,6 @@ function run_optimization_phase!(
         macro_end_residual = macro_end_residual,
         best_macro_residual = best_macro_residual,
         best_macro_epoch = best_macro_epoch,
-        solvent_drift = solvent_drift,
+        best_pool_drifts = best_pool_drifts,
     )
 end

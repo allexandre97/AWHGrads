@@ -64,6 +64,154 @@ function dense_solvent_leg_lambda_schedule(::Type{FT}=Float32; lambda_scheduler:
     return vcat(_charge_stage_global_lambda(elec_stage, lambda_scheduler), lj_stage ./ FT(2))
 end
 
+function _validate_stage_a_readiness_policy(leg::ThermodynamicLegConfig)
+    policy = leg.readiness_policy
+    if policy.preset ∉ (:generic_alchemical, :staged_decoupling)
+        throw(ArgumentError("Leg $(leg.name) has unsupported readiness_policy.preset=$(policy.preset). Supported values are :generic_alchemical and :staged_decoupling."))
+    end
+
+    for (label, idxs) in (
+        (:endpoint_state_idxs, policy.endpoint_state_idxs),
+        (:hotspot_state_idxs, policy.hotspot_state_idxs),
+    )
+        if isnothing(idxs)
+            continue
+        end
+        if any(idx -> idx < 1, idxs)
+            throw(ArgumentError("Leg $(leg.name) readiness_policy.$label must contain only positive state indices."))
+        end
+    end
+
+    if !isnothing(policy.hotspot_lj_lambda_max) &&
+       !(0.0 <= policy.hotspot_lj_lambda_max <= 1.0)
+        throw(ArgumentError("Leg $(leg.name) readiness_policy.hotspot_lj_lambda_max must lie in [0, 1]."))
+    end
+
+    for (label, value) in (
+        (:hotspot_min_state_occupancy_floor, policy.hotspot_min_state_occupancy_floor),
+        (:endpoint_high_min_fraction_abs, policy.endpoint_high_min_fraction_abs),
+    )
+        if !isnothing(value) && value < 0.0
+            throw(ArgumentError("Leg $(leg.name) readiness_policy.$label must be non-negative."))
+        end
+    end
+
+    return nothing
+end
+
+function staged_decoupling_hotspot_state_indices(
+    leg::ThermodynamicLegConfig,
+    state_schedule::ResolvedLegStateSchedule{FT};
+    lj_lambda_max::FT,
+) where {FT <: AbstractFloat}
+    if leg.is_vacuum
+        return Int[]
+    end
+
+    scheduler_name = isnothing(leg.lambda_scheduler) ? :default : leg.lambda_scheduler
+    if scheduler_name ∉ (:default, :namd, :ele_scaled)
+        return Int[]
+    end
+
+    diagnostics = solvent_lambda_schedule_diagnostics(state_schedule.lambda, scheduler_name, FT)
+    lj_tol = sqrt(eps(FT))
+    hotspot_idxs = Int[
+        entry.idx for entry in diagnostics
+        if entry.stage == :lj && entry.lj_lambda <= lj_lambda_max + lj_tol
+    ]
+    return isempty(hotspot_idxs) ? Int[state_schedule.decoupled_state_idx] : hotspot_idxs
+end
+
+function staged_decoupling_endpoint_state_indices(
+    leg::ThermodynamicLegConfig,
+    state_schedule::ResolvedLegStateSchedule{FT};
+    lj_lambda_max::FT,
+) where {FT <: AbstractFloat}
+    if leg.is_vacuum
+        return Int[state_schedule.decoupled_state_idx]
+    end
+
+    endpoint_idxs = staged_decoupling_hotspot_state_indices(
+        leg,
+        state_schedule;
+        lj_lambda_max=lj_lambda_max,
+    )
+    if state_schedule.decoupled_state_idx ∉ endpoint_idxs
+        push!(endpoint_idxs, state_schedule.decoupled_state_idx)
+        sort!(endpoint_idxs)
+    end
+    return endpoint_idxs
+end
+
+function solvent_stage_a_tail_state_indices(
+    leg::ThermodynamicLegConfig,
+    state_schedule::ResolvedLegStateSchedule{FT};
+    lj_lambda_max::FT,
+) where {FT <: AbstractFloat}
+    return staged_decoupling_hotspot_state_indices(leg, state_schedule; lj_lambda_max=lj_lambda_max)
+end
+
+function solvent_stage_a_endpoint_state_indices(
+    leg::ThermodynamicLegConfig,
+    state_schedule::ResolvedLegStateSchedule{FT};
+    lj_lambda_max::FT,
+) where {FT <: AbstractFloat}
+    return staged_decoupling_endpoint_state_indices(leg, state_schedule; lj_lambda_max=lj_lambda_max)
+end
+
+function resolve_leg_stage_a_readiness_policy(
+    leg::ThermodynamicLegConfig,
+    state_schedule::ResolvedLegStateSchedule{FT};
+    awh_solvent_tail_lj_max::FT,
+    awh_solvent_tail_min_state_occupancy::FT,
+    awh_solvent_endpoint_min_fraction::FT,
+) where {FT <: AbstractFloat}
+    policy = leg.readiness_policy
+    preset = policy.preset
+
+    hotspot_state_idxs = if !isnothing(policy.hotspot_state_idxs)
+        sort(unique(Int.(policy.hotspot_state_idxs)))
+    elseif preset == :staged_decoupling
+        lj_lambda_max = isnothing(policy.hotspot_lj_lambda_max) ? awh_solvent_tail_lj_max : FT(policy.hotspot_lj_lambda_max)
+        staged_decoupling_hotspot_state_indices(leg, state_schedule; lj_lambda_max=lj_lambda_max)
+    else
+        Int[]
+    end
+
+    endpoint_state_idxs = if !isnothing(policy.endpoint_state_idxs)
+        sort(unique(Int.(policy.endpoint_state_idxs)))
+    elseif preset == :staged_decoupling
+        lj_lambda_max = isnothing(policy.hotspot_lj_lambda_max) ? awh_solvent_tail_lj_max : FT(policy.hotspot_lj_lambda_max)
+        staged_decoupling_endpoint_state_indices(leg, state_schedule; lj_lambda_max=lj_lambda_max)
+    else
+        Int[state_schedule.decoupled_state_idx]
+    end
+
+    hotspot_min_state_occupancy_floor = if !isnothing(policy.hotspot_min_state_occupancy_floor)
+        FT(policy.hotspot_min_state_occupancy_floor)
+    elseif preset == :staged_decoupling
+        max(zero(FT), awh_solvent_tail_min_state_occupancy)
+    else
+        zero(FT)
+    end
+
+    endpoint_high_min_fraction_abs = if !isnothing(policy.endpoint_high_min_fraction_abs)
+        FT(policy.endpoint_high_min_fraction_abs)
+    elseif preset == :staged_decoupling
+        max(zero(FT), awh_solvent_endpoint_min_fraction)
+    else
+        zero(FT)
+    end
+
+    return ResolvedStageAReadinessPolicy{FT}(
+        preset,
+        endpoint_state_idxs,
+        hotspot_state_idxs,
+        hotspot_min_state_occupancy_floor,
+        endpoint_high_min_fraction_abs,
+    )
+end
+
 """
     default_cycle_config(; target_dG_kcal_mol=-5.01, FT=Float32)
 
@@ -87,6 +235,7 @@ function default_cycle_config(; target_dG_kcal_mol::Real=-5.01, FT::DataType=Flo
             lambda_scheduler=:ele_scaled,
             coulomb_softcore_model=:gapsys,
             lj_softcore_model=:gapsys,
+            readiness_policy=StageAReadinessPolicyConfig(preset=:staged_decoupling),
         ),
         ThermodynamicLegConfig(
             name=:vacuum,
@@ -98,6 +247,7 @@ function default_cycle_config(; target_dG_kcal_mol::Real=-5.01, FT::DataType=Flo
             electrostatics_method=:none,
             coulomb_softcore_model=:gapsys,
             lj_softcore_model=:gapsys,
+            readiness_policy=StageAReadinessPolicyConfig(preset=:generic_alchemical),
         ),
     ]
     return ThermodynamicCycleConfig(
@@ -144,6 +294,7 @@ function default_simulation_config(; FT::DataType=Float32, AT=CuArray, device_id
         force_field=ForceFieldConfig(),
         cycle=nothing,
         parameter_reference_leg=nothing,
+        parameter_pools=ParameterPoolConfig[],
         parameter_bounds=ParameterBoundsConfig(),
         awh_control=AWHControlConfig(),
         ensemble_eval=EnsembleEvalConfig(),
@@ -282,6 +433,7 @@ function resolved_cycle_config(sim_cfg::SimulationConfig)
                 lambda_scheduler=:ele_scaled,
                 coulomb_softcore_model=:gapsys,
                 lj_softcore_model=:gapsys,
+                readiness_policy=StageAReadinessPolicyConfig(preset=:staged_decoupling),
             ),
             ThermodynamicLegConfig(
                 name=:vacuum,
@@ -297,6 +449,7 @@ function resolved_cycle_config(sim_cfg::SimulationConfig)
                 awh_seed_num_md_steps=100,
                 awh_bias_update_interval_md_steps=5000,
                 awh_initial_n_bias=20,
+                readiness_policy=StageAReadinessPolicyConfig(preset=:generic_alchemical),
             ),
         ],
         include_standard_state_correction=true,
@@ -381,6 +534,7 @@ function resolve_leg_state_schedule(
 ) where {FT <: AbstractFloat}
     _validate_leg_ensemble(leg)
     _validate_leg_alchemical_path(leg)
+    _validate_stage_a_readiness_policy(leg)
     schedule_source = isnothing(leg.lambda_schedule) ? default_lambda_schedule : leg.lambda_schedule
     validate_lambda_schedule(schedule_source)
     lambda_values = FT.(collect(schedule_source))
@@ -430,6 +584,7 @@ function validate_cycle_config(
         end
         push!(seen, leg.name)
         _validate_leg_ensemble(leg)
+        _validate_stage_a_readiness_policy(leg)
         if !isnothing(default_lambda_schedule)
             resolve_leg_state_schedule(leg, default_lambda_schedule, FT)
         end

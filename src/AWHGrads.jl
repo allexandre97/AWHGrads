@@ -42,6 +42,7 @@ target_rho = FT(1.0 / num_lambda_states)
 
 include("types.jl")
 include("config.jl")
+include("parameter_pools.jl")
 ff = MolecularForceField(FT, resolve_force_field_paths(default_simulation_config())...; units=true)
 include("gradients_core.jl")
 include("setup.jl")
@@ -58,8 +59,10 @@ export OptimizationConfig
 export ForceFieldConfig
 export AWHControlConfig
 export EnsembleEvalConfig
+export StageAReadinessPolicyConfig
 export ThermodynamicLegConfig
 export ThermodynamicCycleConfig
+export ParameterPoolConfig
 export ParameterBoundsConfig
 export RuntimeState
 export LegArtifacts
