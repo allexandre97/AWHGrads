@@ -137,13 +137,27 @@ Base.@kwdef struct ParameterPoolConfig
 end
 
 """
+    ChargeTrainingConfig
+
+Controls optional charge-equilibration training on top of the existing
+Lennard-Jones parameter optimization.
+"""
+Base.@kwdef struct ChargeTrainingConfig
+    enabled::Bool = false
+    typing_basis::Symbol = :atom_class
+    net_charge_constraint::Symbol = :molecule
+    hardness_floor::Float64 = 1e-3
+    reference_hardness::Float64 = 1.0
+end
+
+"""
     ParameterBoundsConfig
 
 Hard bounds for the optimized Lennard-Jones parameters. The optimization is
 performed in an unconstrained `ϕ` space and mapped back into these intervals.
 """
 Base.@kwdef struct ParameterBoundsConfig
-    sigma_hydrogen_min::Float64 = 0.1
+    sigma_hydrogen_min::Float64 = 0.05
     sigma_hydrogen_max::Float64 = 0.4
     sigma_heavy_min::Float64 = 0.2
     sigma_heavy_max::Float64 = 0.5
@@ -151,8 +165,8 @@ Base.@kwdef struct ParameterBoundsConfig
     epsilon_hydrogen_max::Float64 = 0.5
     epsilon_heavy_min::Float64 = 0.0
     epsilon_heavy_max::Float64 = 1.5
-    sigma_floor::Float64 = 0.15
-    epsilon_floor::Float64 = 1e-4
+    sigma_floor::Float64 = 0.1
+    epsilon_floor::Float64 = 1e-6
     reference_clamp_eps::Float64 = 1e-4
 end
 
@@ -223,6 +237,7 @@ Base.@kwdef struct SimulationConfig
     cycle::Union{Nothing, ThermodynamicCycleConfig} = nothing
     parameter_reference_leg::Union{Nothing, Symbol} = nothing
     parameter_pools::Vector{ParameterPoolConfig} = ParameterPoolConfig[]
+    charge_training::ChargeTrainingConfig = ChargeTrainingConfig()
     parameter_bounds::ParameterBoundsConfig = ParameterBoundsConfig()
     awh_control::AWHControlConfig = AWHControlConfig()
     ensemble_eval::EnsembleEvalConfig = EnsembleEvalConfig()
@@ -285,8 +300,6 @@ Base.@kwdef struct OptimizationConfig
     awh_stageB_split_extension_enabled::Bool = true
     awh_stageB_split_extension_max_segments::Int = 3
 
-    awh_min_initial_df_threshold = Float32(0.1)
-    awh_min_initial_state_occupancy = Float32(0.01)
     awh_stageB_soften_failures_threshold::Int = 3
     awh_stageB_soften_factor = Float32(0.5)
 
@@ -339,6 +352,8 @@ Base.@kwdef struct ResolvedParameterPool
     global_indices::Vector{Int} = Int[]
     sigma_global_indices::Vector{Int} = Int[]
     epsilon_global_indices::Vector{Int} = Int[]
+    charge_chi_global_indices::Vector{Int} = Int[]
+    charge_eta_global_indices::Vector{Int} = Int[]
     max_phi_step::Float64 = Inf
     max_sigma_drift::Union{Nothing, Float64} = nothing
     max_epsilon_drift::Union{Nothing, Float64} = nothing

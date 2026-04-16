@@ -170,6 +170,20 @@ def parse_probe_ess_map(text: str) -> Dict[str, float]:
     return data
 
 
+def parse_pool_drift_map(text: str) -> Dict[str, Dict[str, float]]:
+    data: Dict[str, Dict[str, float]] = {}
+    for chunk in text.split("|"):
+        item = chunk.strip()
+        if not item or "=" not in item:
+            continue
+        pool, payload = item.split("=", 1)
+        metrics: Dict[str, float] = {}
+        for label, value in re.findall(r"([^\d\-+.eE]+)([-\deE+.]+)", payload):
+            metrics[label.strip(" /")] = to_float(value)
+        data[pool.strip()] = metrics
+    return data
+
+
 def parse_index_list(raw: str) -> List[int]:
     text = raw.strip()
     if not text or text == "-":
@@ -407,17 +421,20 @@ class LogParser:
     production_re = re.compile(
         r"Production artifact \(([^)]+)\): frames=(\d+) \| .*?states=(\d+) \| eval_threads=(\d+) \| lambda_tile=(\d+) \| eval_schedule=([A-Za-z0-9_]+)"
     )
-    opt_epoch_re = re.compile(r">> Optimization Epoch: Active Block = (.+)")
+    opt_epoch_re = re.compile(r">> Optimization Epoch: Active (?:Block|Pools) = (.+)")
     clip_re = re.compile(r"Step clipped by infinity-norm \(Scaling: ([-\deE+.]+)\)")
-    ls_iter_re = re.compile(r"LS Iter (\d+) \(.*?=([-\deE+.]+)\): ESS\[(.*)\] \| Res = ([-\deE+.]+)")
-    opt_metrics_re = re.compile(r"--- Optimization Metrics \(Epoch (\d+) - Block: (.+)\) ---")
+    ls_iter_re = re.compile(r"LS Iter (\d+) \(.*?=([-\deE+.]+)\): ESS\[(.*?)\](?: \| Drift\[(.*?)\])? \| Res = ([-\deE+.]+)")
+    opt_metrics_re = re.compile(r"--- Optimization Metrics \(Epoch (\d+) - (?:Block:\s*)?(.+)\) ---")
     prediction_re = re.compile(r"Prediction:\s+.*?=\s*([-\deE+.]+)\s*kT\s+\|\s+Target\s*=\s*([-\deE+.]+)\s*kT")
     error_re = re.compile(r"Error:\s+Residual\s*=\s*([-\deE+.]+)\s+\|\s+Huber dL/dE\s*=\s*([-\deE+.]+)")
     accepted_re = re.compile(r"Accepted:\s+Residual\s*=\s*([-\deE+.]+)\s+\|\s+Extra req\s*=\s*([-\deE+.]+)")
     gradients_re = re.compile(r"Gradients:\s+Norm\s*=\s*([-\deE+.]+)\s+\|\s+Max\s*=\s*([-\deE+.]+)")
     fim_re = re.compile(r"FIM .*?Raw Cond Number\s*=\s*([-\deE+.]+)\s+\|\s+Truncated Eigs\s*=\s*(\d+)\s*/\s*(\d+)")
-    trust_region_re = re.compile(
+    trust_region_health_re = re.compile(
         r"Trust Reg\.:.*?Health\s*=\s*([-\deE+.]+) \(scale=([-\deE+.]+)\) \| Confidence\s*=\s*([-\deE+.]+) \| KL target\s*=\s*([-\deE+.]+) \| Max solute .*?=\s*([-\deE+.]+)"
+    )
+    trust_region_re = re.compile(
+        r"Trust Reg\.:.*?Confidence\s*=\s*([-\deE+.]+) \| KL target\s*=\s*([-\deE+.]+)(?: \| Max solute .*?=\s*([-\deE+.]+))?"
     )
     confidence_re = re.compile(
         r"Confidence:\s+endpoint_ΔG\s*=\s*([-\deE+.]+) \| cycle\s*=\s*([-\deE+.]+) \| gradient\s*=\s*([-\deE+.]+) \| eligible_legs\s*=\s*(\d+)"
@@ -946,8 +963,10 @@ class LogParser:
                     "iter": to_int(ls_iter_match.group(1)),
                     "alpha": to_float(ls_iter_match.group(2)),
                     "ess": parse_probe_ess_map(ls_iter_match.group(3)),
-                    "residual": to_float(ls_iter_match.group(4)),
+                    "residual": to_float(ls_iter_match.group(5)),
                 }
+                if ls_iter_match.group(4):
+                    iter_data["drift"] = parse_pool_drift_map(ls_iter_match.group(4))
                 self.current_opt_epoch.line_search_iters.append(iter_data)
                 return
 
@@ -1010,13 +1029,21 @@ class LogParser:
                 self.current_opt_epoch.fim_rank = to_int(fim_match.group(3))
                 return
 
+            trust_region_health_match = self.trust_region_health_re.search(message)
+            if trust_region_health_match:
+                self.current_opt_epoch.health_score = to_float(trust_region_health_match.group(1))
+                self.current_opt_epoch.health_scale = to_float(trust_region_health_match.group(2))
+                self.current_opt_epoch.confidence_scale = to_float(trust_region_health_match.group(3))
+                self.current_opt_epoch.kl_target = to_float(trust_region_health_match.group(4))
+                self.current_opt_epoch.max_solute_phi_step = to_float(trust_region_health_match.group(5))
+                return
+
             trust_region_match = self.trust_region_re.search(message)
             if trust_region_match:
-                self.current_opt_epoch.health_score = to_float(trust_region_match.group(1))
-                self.current_opt_epoch.health_scale = to_float(trust_region_match.group(2))
-                self.current_opt_epoch.confidence_scale = to_float(trust_region_match.group(3))
-                self.current_opt_epoch.kl_target = to_float(trust_region_match.group(4))
-                self.current_opt_epoch.max_solute_phi_step = to_float(trust_region_match.group(5))
+                self.current_opt_epoch.confidence_scale = to_float(trust_region_match.group(1))
+                self.current_opt_epoch.kl_target = to_float(trust_region_match.group(2))
+                if trust_region_match.group(3):
+                    self.current_opt_epoch.max_solute_phi_step = to_float(trust_region_match.group(3))
                 return
 
             confidence_match = self.confidence_re.search(message)
@@ -1043,6 +1070,7 @@ class LogParser:
             alpha_match = self.alpha_re.search(message)
             if alpha_match:
                 self.current_opt_epoch.line_search_alpha = to_float(alpha_match.group(1))
+                self.current_opt_epoch.line_search_converged = True
                 return
 
             step_match = self.step_re.search(message)
@@ -1374,9 +1402,23 @@ def write_multiplot_matplotlib(path: Path, title: str, panels: Sequence[PanelSpe
             if vline.label:
                 ax.text(vline.value, 0.98, vline.label, transform=ax.get_xaxis_transform(), ha="left", va="top", fontsize=8, color=vline.color)
 
+        maxd = -math.inf
+        minn = math.inf
+        maxx = -math.inf
+
         for series in panel.series:
             xs = [x for x, y in series.points if math.isfinite(x) and math.isfinite(y)]
-            ys = [y for x, y in series.points if math.isfinite(x) and math.isfinite(y)]
+            if "Parameter Trajectories" in panel.title:
+                ys = [100*(y - series.points[0][1])/series.points[0][1] for x, y in series.points if math.isfinite(x) and math.isfinite(y)]
+                d = abs(max(ys)-min(ys))
+                if d > maxd:
+                    maxd = d
+                if min(ys) < minn:
+                    minn = min(ys)
+                if max(ys) > maxx:
+                    maxx = max(ys)
+            else:
+                ys = [y for x, y in series.points if math.isfinite(x) and math.isfinite(y)]
             if not xs:
                 continue
             ax.plot(
@@ -1415,6 +1457,8 @@ def write_multiplot_matplotlib(path: Path, title: str, panels: Sequence[PanelSpe
                 bbox=dict(boxstyle="round,pad=0.25", facecolor="#ffffff", edgecolor="#dddddd", alpha=0.8),
             )
 
+    if "Parameter Trajectories" in panel.title:
+        ax.set_ylim(minn - maxd*0.05, maxx + maxd*0.05)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -1913,7 +1957,7 @@ def parameter_panels(run: RunRecord, chunk_size: int) -> List[Tuple[str, List[Pa
                     PanelSpec(
                         title=f"Parameter Trajectories ({file_idx})",
                         x_label="Global optimization epoch",
-                        y_label="parameter value",
+                        y_label="parameter drift (%)",
                         series=series,
                     )
                 ],

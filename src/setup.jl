@@ -461,16 +461,32 @@ function setup_alchemical_awh(
     # Safely sized seeds strictly above the optimization boundaries to prevent 1/r^12 singularity
     sigma_seed_local = isnothing(sigma_seed) ? FT(0.15)u"nm" : sigma_seed
     epsilon_seed_local = isnothing(epsilon_seed) ? FT(1e-4)u"kJ/mol" : epsilon_seed
+    charge_values = FT.(getproperty.(atoms_raw, :charge))
+
+    if !isnothing(optimized_params) && !isnothing(param_idxs)
+        atom_param_idxs = param_idxs[1]
+        if any(>(0), atom_param_idxs.charge_chi) || any(>(0), atom_param_idxs.charge_eta)
+            charge_values = solve_constrained_charges(
+                FT.(optimized_params),
+                atom_param_idxs.charge_chi,
+                atom_param_idxs.charge_eta,
+                atom_param_idxs.molecule_ids,
+                FT.(atom_param_idxs.molecule_charge_targets),
+                FT.(atom_param_idxs.reference_charges),
+            )
+        end
+    end
     
     for (i, a) in enumerate(atoms_raw)
         new_sigma = (ustrip(a.σ) <= FT(1e-6) || ustrip(a.σ) == one(FT)) ? sigma_seed_local : a.σ
         new_eps   = ustrip(a.ϵ) <= FT(1e-6) ? epsilon_seed_local : a.ϵ
+        new_charge = charge_values[i]
         
         # Optimized parameters are stored by atom type; the index maps project
         # them back onto per-atom σ/ϵ values for Molly.
         if !isnothing(optimized_params) && !isnothing(param_idxs)
-            idx_σ_map = param_idxs[1][2]
-            idx_ϵ_map = param_idxs[1][3]
+            idx_σ_map = param_idxs[1].sigma
+            idx_ϵ_map = param_idxs[1].epsilon
 
             if idx_σ_map[i] > 0
                 new_sigma = FT(optimized_params[idx_σ_map[i]]) * u"nm"
@@ -480,7 +496,7 @@ function setup_alchemical_awh(
             end
         end
         
-        push!(seeded_atoms, Atom(a.index, a.atom_type, a.mass, a.charge, new_sigma, new_eps, a.λ, a.alch_role))
+        push!(seeded_atoms, rebuild_atom_like(a; charge=new_charge, sigma=new_sigma, epsilon=new_eps))
     end
     
     sys_base = System(sys_raw; atoms=Molly.to_device([seeded_atoms...], array_type))
@@ -523,9 +539,9 @@ function setup_alchemical_awh(
         acopy = Atom[]  
         for (i, a) in enumerate(seeded_atoms)
             if a.index in solute_index_set
-                push!(acopy, Atom(a.index, a.atom_type, a.mass, a.charge, a.σ, a.ϵ, FT(λ_atom), Molly.InsertRole))
+                push!(acopy, rebuild_atom_like(a; lambda_value=FT(λ_atom), alch_role=Molly.InsertRole))
             else
-                push!(acopy, Atom(a.index, a.atom_type, a.mass, a.charge, a.σ, a.ϵ, a.λ, a.alch_role))  
+                push!(acopy, rebuild_atom_like(a))
             end
         end
 

@@ -169,6 +169,44 @@ end
     @test isapprox(pstate.theta_active[h_epsilon_idx], pstate.theta_ref[h_epsilon_idx]; atol=sim_cfg.FT(1e-4))
 end
 
+@testset "charge-training parameter state and index maps" begin
+    sim_cfg = AWHGrads.default_simulation_config(AT=Array)
+    cycle_cfg = AWHGrads.validate_cycle_config(
+        AWHGrads.resolved_cycle_config(sim_cfg);
+        default_lambda_schedule=sim_cfg.lambda_schedule,
+        FT=sim_cfg.FT,
+    )
+
+    pool_cfgs = [
+        AWHGrads.ParameterPoolConfig(
+            name=:inserted_region,
+            atom_indices=collect(1:9),
+            trainable_families=Symbol[:sigma, :epsilon, :charge_chi, :charge_eta],
+            max_phi_step=0.25,
+        ),
+    ]
+    sim_cfg_charge = AWHGrads.simulation_config_with(
+        sim_cfg;
+        parameter_pools=pool_cfgs,
+        parameter_reference_leg=:vacuum,
+        charge_training=AWHGrads.ChargeTrainingConfig(enabled=true),
+    )
+    opt_cfg = AWHGrads.default_optimization_config(FT=sim_cfg.FT)
+    pstate = AWHGrads.initialize_parameter_state(sim_cfg_charge, opt_cfg, cycle_cfg)
+
+    @test any(contains("_charge_"), pstate.param_names)
+    @test count(family -> family == :charge_chi, pstate.param_families) > 0
+    @test count(family -> family == :charge_eta, pstate.param_families) > 0
+    @test all(isfinite, pstate.theta_active)
+    @test all(isapprox.(pstate.theta_active, pstate.theta_ref; atol=sim_cfg.FT(1e-4)))
+
+    atom_idxs = pstate.idxs_by_leg[:vacuum][1]
+    @test any(>(0), atom_idxs.charge_chi[1:9])
+    @test any(>(0), atom_idxs.charge_eta[1:9])
+    @test length(atom_idxs.molecule_ids) == length(atom_idxs.reference_charges)
+    @test !isempty(atom_idxs.molecule_charge_targets)
+end
+
 @testset "line search residual tolerance" begin
     FT = Float32
     @test AWHGrads.line_search_noise_tolerance(FT(-5.0), FT(0.1)) == FT(0.5)

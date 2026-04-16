@@ -228,6 +228,7 @@ function initialize_parameter_state(
 )
     FT = sim_cfg.FT
     bounds_cfg = sim_cfg.parameter_bounds
+    charge_cfg = normalize_charge_training_config(sim_cfg.charge_training)
 
     ref_leg = resolve_parameter_reference_leg(sim_cfg, cycle_cfg)
     ref_nonbonded_method = resolve_base_nonbonded_method(
@@ -240,72 +241,110 @@ function initialize_parameter_state(
     pool_cfgs = resolved_parameter_pool_configs(sim_cfg, opt_cfg, sys_ref)
     pool_cfgs_by_name = Dict(pool.name => pool for pool in pool_cfgs)
     atom_pool_names = resolve_system_parameter_pool_names(sys_ref, pool_cfgs)
+    any(pool_trains_charge(pool) for pool in pool_cfgs) && !charge_cfg.enabled &&
+        throw(ArgumentError("Charge-training families were requested in `parameter_pools`, but `sim_cfg.charge_training.enabled` is false."))
+    for pool_cfg in pool_cfgs
+        if pool_trains_charge(pool_cfg) && !all(family -> family in pool_cfg.trainable_families, (:charge_chi, :charge_eta))
+            throw(ArgumentError("Parameter pool `$(pool_cfg.name)` must include both :charge_chi and :charge_eta when charge training is enabled."))
+        end
+    end
+    charge_reference_means = build_charge_reference_stats(sys_ref, atom_pool_names, pool_cfgs_by_name, charge_cfg, FT)
 
     theta_ref = Vector{FT}()
     param_names = String[]
-    param_kind = Symbol[]
+    param_families = Symbol[]
     param_is_hydrogen = Bool[]
-    param_indices_by_key = Dict{Tuple{Symbol, String}, Tuple{Int, Int}}()
+    lj_param_indices_by_key = Dict{Tuple{Symbol, String}, NamedTuple{(:sigma, :epsilon), Tuple{Int, Int}}}()
+    charge_param_indices_by_key = Dict{Tuple{Symbol, String}, NamedTuple{(:chi, :eta), Tuple{Int, Int}}}()
     pool_param_indices = Dict(pool.name => Int[] for pool in pool_cfgs)
     pool_sigma_indices = Dict(pool.name => Int[] for pool in pool_cfgs)
     pool_epsilon_indices = Dict(pool.name => Int[] for pool in pool_cfgs)
+    pool_charge_chi_indices = Dict(pool.name => Int[] for pool in pool_cfgs)
+    pool_charge_eta_indices = Dict(pool.name => Int[] for pool in pool_cfgs)
 
     sigma_floor = FT(bounds_cfg.sigma_floor)
     epsilon_floor = FT(bounds_cfg.epsilon_floor)
     clamp_eps = FT(bounds_cfg.reference_clamp_eps)
 
-    # Each pool/atom-type pair contributes one σ and one ϵ parameter (subject to
-    # the pool's selected trainable families). This allows multiple pools to
-    # carry distinct copies of the same force-field atom type.
     for idx in eachindex(atoms_cpu)
         pool_name = atom_pool_names[idx]
         isnothing(pool_name) && continue
 
         atom = atoms_cpu[idx]
         atom_data = sys_ref.atoms_data[idx]
-        atype = String(atom_data.atom_type)
-        key = (pool_name, atype)
-        if haskey(param_indices_by_key, key)
-            continue
-        end
         pool_cfg = pool_cfgs_by_name[pool_name]
-
         is_hydrogen = atom_data_is_hydrogen(atom_data)
-        sigma_idx = 0
-        epsilon_idx = 0
 
-        if :sigma in pool_cfg.trainable_families
-            sigma_raw = FT(ustrip(atom.σ))
-            if sigma_raw <= FT(1e-6) || sigma_raw == one(FT)
-                sigma_raw = sigma_floor
+        if pool_trains_lj(pool_cfg)
+            atype = String(atom_data.atom_type)
+            lj_key = (pool_name, atype)
+            if !haskey(lj_param_indices_by_key, lj_key)
+                sigma_idx = 0
+                epsilon_idx = 0
+
+                if :sigma in pool_cfg.trainable_families
+                    sigma_raw = FT(ustrip(atom.σ))
+                    if sigma_raw <= FT(1e-6) || sigma_raw == one(FT)
+                        sigma_raw = sigma_floor
+                    end
+                    push!(theta_ref, sigma_raw)
+                    push!(param_names, "pool_$(String(pool_name))_atom_$(atype)_σ")
+                    push!(param_families, :sigma)
+                    push!(param_is_hydrogen, is_hydrogen)
+                    sigma_idx = length(theta_ref)
+                    push!(pool_param_indices[pool_name], sigma_idx)
+                    push!(pool_sigma_indices[pool_name], sigma_idx)
+                end
+
+                if :epsilon in pool_cfg.trainable_families
+                    epsilon_raw = FT(ustrip(atom.ϵ))
+                    if epsilon_raw <= FT(1e-6)
+                        epsilon_raw = epsilon_floor
+                    end
+                    push!(theta_ref, epsilon_raw)
+                    push!(param_names, "pool_$(String(pool_name))_atom_$(atype)_ϵ")
+                    push!(param_families, :epsilon)
+                    push!(param_is_hydrogen, is_hydrogen)
+                    epsilon_idx = length(theta_ref)
+                    push!(pool_param_indices[pool_name], epsilon_idx)
+                    push!(pool_epsilon_indices[pool_name], epsilon_idx)
+                end
+
+                lj_param_indices_by_key[lj_key] = (sigma=sigma_idx, epsilon=epsilon_idx)
             end
-            push!(theta_ref, sigma_raw)
-            push!(param_names, "pool_$(String(pool_name))_atom_$(atype)_σ")
-            push!(param_kind, :sigma)
-            push!(param_is_hydrogen, is_hydrogen)
-            sigma_idx = length(theta_ref)
-            push!(pool_param_indices[pool_name], sigma_idx)
-            push!(pool_sigma_indices[pool_name], sigma_idx)
         end
 
-        if :epsilon in pool_cfg.trainable_families
-            epsilon_raw = FT(ustrip(atom.ϵ))
-            if epsilon_raw <= FT(1e-6)
-                epsilon_raw = epsilon_floor
-            end
-            push!(theta_ref, epsilon_raw)
-            push!(param_names, "pool_$(String(pool_name))_atom_$(atype)_ϵ")
-            push!(param_kind, :epsilon)
-            push!(param_is_hydrogen, is_hydrogen)
-            epsilon_idx = length(theta_ref)
-            push!(pool_param_indices[pool_name], epsilon_idx)
-            push!(pool_epsilon_indices[pool_name], epsilon_idx)
-        end
+        if pool_trains_charge(pool_cfg)
+            charge_key = resolve_charge_typing_key(atom_data, charge_cfg)
+            charge_index_key = (pool_name, charge_key)
+            if !haskey(charge_param_indices_by_key, charge_index_key)
+                mean_charge = get(charge_reference_means, charge_index_key, zero(FT))
+                reference_hardness = FT(charge_cfg.reference_hardness)
+                chi_idx = 0
+                eta_idx = 0
 
-        param_indices_by_key[key] = (sigma_idx, epsilon_idx)
+                push!(theta_ref, -reference_hardness * mean_charge)
+                push!(param_names, "pool_$(String(pool_name))_charge_$(charge_key)_χ")
+                push!(param_families, :charge_chi)
+                push!(param_is_hydrogen, false)
+                chi_idx = length(theta_ref)
+                push!(pool_param_indices[pool_name], chi_idx)
+                push!(pool_charge_chi_indices[pool_name], chi_idx)
+
+                push!(theta_ref, reference_hardness)
+                push!(param_names, "pool_$(String(pool_name))_charge_$(charge_key)_η")
+                push!(param_families, :charge_eta)
+                push!(param_is_hydrogen, false)
+                eta_idx = length(theta_ref)
+                push!(pool_param_indices[pool_name], eta_idx)
+                push!(pool_charge_eta_indices[pool_name], eta_idx)
+
+                charge_param_indices_by_key[charge_index_key] = (chi=chi_idx, eta=eta_idx)
+            end
+        end
     end
 
-    isempty(theta_ref) && throw(ArgumentError("No trainable LJ parameters were constructed. Check `parameter_pools` or the legacy `solute_idx`/`optimize_solvent` settings."))
+    isempty(theta_ref) && throw(ArgumentError("No trainable parameters were constructed. Check `parameter_pools` or the legacy `solute_idx`/`optimize_solvent` settings."))
 
     parameter_pools = ResolvedParameterPool[]
     default_pool_step = default_parameter_pool_max_phi_step(opt_cfg, length(pool_cfgs))
@@ -319,6 +358,8 @@ function initialize_parameter_state(
                 global_indices=global_indices,
                 sigma_global_indices=sort(copy(pool_sigma_indices[pool_cfg.name])),
                 epsilon_global_indices=sort(copy(pool_epsilon_indices[pool_cfg.name])),
+                charge_chi_global_indices=sort(copy(pool_charge_chi_indices[pool_cfg.name])),
+                charge_eta_global_indices=sort(copy(pool_charge_eta_indices[pool_cfg.name])),
                 max_phi_step=isnothing(pool_cfg.max_phi_step) ? default_pool_step : Float64(pool_cfg.max_phi_step),
                 max_sigma_drift=isnothing(pool_cfg.max_sigma_drift) ? nothing : Float64(pool_cfg.max_sigma_drift),
                 max_epsilon_drift=isnothing(pool_cfg.max_epsilon_drift) ? nothing : Float64(pool_cfg.max_epsilon_drift),
@@ -340,7 +381,7 @@ function initialize_parameter_state(
     phi_0 = zeros(FT, length(theta_ref))
 
     for i in eachindex(theta_ref)
-        if param_kind[i] == :sigma
+        if param_families[i] == :sigma
             if param_is_hydrogen[i]
                 theta_min[i] = FT(bounds_cfg.sigma_hydrogen_min)
                 theta_max[i] = FT(bounds_cfg.sigma_hydrogen_max)
@@ -348,7 +389,10 @@ function initialize_parameter_state(
                 theta_min[i] = FT(bounds_cfg.sigma_heavy_min)
                 theta_max[i] = FT(bounds_cfg.sigma_heavy_max)
             end
-        else
+            val_ref = clamp(theta_ref[i], theta_min[i] + clamp_eps, theta_max[i] - clamp_eps)
+            val = (theta_max[i] - val_ref) / (val_ref - theta_min[i])
+            phi_0[i] = (FT(1.0) / opt_cfg.k_sigmoid) * log(val)
+        elseif param_families[i] == :epsilon
             if param_is_hydrogen[i]
                 theta_min[i] = FT(bounds_cfg.epsilon_hydrogen_min)
                 theta_max[i] = FT(bounds_cfg.epsilon_hydrogen_max)
@@ -356,15 +400,25 @@ function initialize_parameter_state(
                 theta_min[i] = FT(bounds_cfg.epsilon_heavy_min)
                 theta_max[i] = FT(bounds_cfg.epsilon_heavy_max)
             end
+            val_ref = clamp(theta_ref[i], theta_min[i] + clamp_eps, theta_max[i] - clamp_eps)
+            val = (theta_max[i] - val_ref) / (val_ref - theta_min[i])
+            phi_0[i] = (FT(1.0) / opt_cfg.k_sigmoid) * log(val)
+        elseif param_families[i] == :charge_chi
+            theta_min[i] = -FT(Inf)
+            theta_max[i] = FT(Inf)
+            phi_0[i] = theta_ref[i]
+        elseif param_families[i] == :charge_eta
+            theta_min[i] = FT(charge_cfg.hardness_floor)
+            theta_max[i] = FT(Inf)
+            positive_part = max(theta_ref[i] - theta_min[i], FT(1e-6))
+            phi_0[i] = -log(exp(positive_part) - one(FT))
+        else
+            throw(ArgumentError("Unsupported parameter family `$(param_families[i])` while initializing transform metadata."))
         end
-
-        val_ref = clamp(theta_ref[i], theta_min[i] + clamp_eps, theta_max[i] - clamp_eps)
-        val = (theta_max[i] - val_ref) / (val_ref - theta_min[i])
-        phi_0[i] = (FT(1.0) / opt_cfg.k_sigmoid) * log(val)
     end
 
     phi_active = zeros(FT, length(theta_ref))
-    theta_active = map_phi_to_theta(phi_active, theta_min, theta_max, phi_0, opt_cfg.k_sigmoid)
+    theta_active = map_phi_to_theta(phi_active, theta_min, theta_max, phi_0, opt_cfg.k_sigmoid, param_families)
 
     # Rebuild injection maps for every leg so later reweighting can reuse the
     # same global parameter vector across different systems.
@@ -376,7 +430,7 @@ function initialize_parameter_state(
             leg.coulomb_softcore_model,
         )
         sys_leg = leg.name == ref_leg.name ? sys_ref : System(leg.pdb, ff; array_type=(leg.is_vacuum ? Array : AT), nonbonded_method=leg_nonbonded_method, nonbonded_energy_type=sim_cfg.nonbonded_energy_type)
-        idxs_by_leg[leg.name] = build_index_maps(sys_leg, param_indices_by_key, pool_cfgs)
+        idxs_by_leg[leg.name] = build_index_maps(sys_leg, lj_param_indices_by_key, charge_param_indices_by_key, pool_cfgs, charge_cfg)
     end
 
     return (
@@ -384,6 +438,7 @@ function initialize_parameter_state(
         theta_active=theta_active,
         theta_ref=copy(theta_ref),
         param_names=param_names,
+        param_families=param_families,
         trainable_param_names=trainable_param_names,
         trainable_param_indices=trainable_param_indices,
         trainable_position_map=trainable_position_map,
@@ -553,8 +608,6 @@ function run_readiness_loop!(
     awh_stageB_probe_max_factor::FT,
     awh_stageB_split_extension_enabled::Bool,
     awh_stageB_split_extension_max_segments::Int,
-    awh_min_initial_df_threshold::FT,
-    awh_min_initial_state_occupancy::FT,
     awh_stageB_soften_failures_threshold::Int,
     awh_stageB_soften_factor::FT,
     awh_stageA_streak_growth_factor::FT,
@@ -813,25 +866,10 @@ function run_readiness_loop!(
                     high_idx=state_schedule.decoupled_state_idx,
                 ))
 
-            if !awh_leg.state.in_initial_stage
-                df_ok = stageA_stats_by_leg[name].df_mean <= awh_min_initial_df_threshold
-                occ_ok = stageA_stats_by_leg[name].min_state_occupancy >= awh_min_initial_state_occupancy
-                if !(df_ok && occ_ok)
-                    @info "[!] Strict gating: Reverting Stage A ($(name)) to initial stage (df=$(round(stageA_stats_by_leg[name].df_mean, digits=4)), min_occ=$(round(stageA_stats_by_leg[name].min_state_occupancy, digits=4)))."
-                    awh_leg.state.in_initial_stage = true
-                    awh_leg.state.N_bias = FT(leg_awh_control.initial_n_bias)
-                    awh_leg.state.n_accum = 0
-                    fill!(awh_leg.state.w_seg, zero(FT))
-                    fill!(awh_leg.state.w2_seg, zero(FT))
-                    empty!(awh_leg.state.visited_windows)
-                end
-            end
-
-            if stageA_stats_by_leg[name].ready
-                stageA_streak[name] += 1
-            else
-                stageA_streak[name] = 0
-            end
+            stageA_streak[name] = advance_stage_a_streak(
+                stageA_streak[name],
+                stageA_stats_by_leg[name].ready,
+            )
 
             failures = stageB_consecutive_failures[name]
             retry_controls = stage_b_retry_controls(
@@ -1195,6 +1233,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
     theta_active = pstate.theta_active
     theta_ref = pstate.theta_ref
     param_names = pstate.param_names
+    param_families = pstate.param_families
     trainable_param_names = pstate.trainable_param_names
     trainable_param_indices = pstate.trainable_param_indices
     trainable_position_map = pstate.trainable_position_map
@@ -1272,8 +1311,6 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             FT(opt_cfg.awh_stageB_probe_max_factor),
             opt_cfg.awh_stageB_split_extension_enabled,
             opt_cfg.awh_stageB_split_extension_max_segments,
-            FT(opt_cfg.awh_min_initial_df_threshold),
-            FT(opt_cfg.awh_min_initial_state_occupancy),
             opt_cfg.awh_stageB_soften_failures_threshold,
             FT(opt_cfg.awh_stageB_soften_factor),
             FT(opt_cfg.awh_stageA_streak_growth_factor),
@@ -1336,6 +1373,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             trainable_param_indices,
             trainable_position_map,
             parameter_pools,
+            param_families,
             theta_ref,
             theta_min,
             theta_max,

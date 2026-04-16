@@ -19,6 +19,7 @@ function build_example_configs()
         AWHGrads.ParameterPoolConfig(
             name=:inserted_region,
             atom_indices=collect(1:9),
+            trainable_families=Symbol[:sigma, :epsilon, :charge_chi, :charge_eta],
             max_phi_step=0.25,
             max_sigma_drift=0.08,
             max_epsilon_drift=0.25,
@@ -27,6 +28,7 @@ function build_example_configs()
             name=:background_oxygen,
             residue_names=["HOH"],
             atom_types=["tip3p-O", "tip3p-H"],
+            trainable_families=Symbol[:sigma, :epsilon, :charge_chi, :charge_eta],
             max_phi_step=Float64(base_opt.max_phi_step_solvent),
             max_sigma_drift=0.03,
             max_epsilon_drift=0.08,
@@ -81,6 +83,7 @@ function build_example_configs()
             xml_files=["tip3p_standard.xml", "gaff.xml", "ethanol.xml"],
         ),
         parameter_pools=parameter_pools,
+        charge_training=AWHGrads.ChargeTrainingConfig(enabled=true),
         awh_control=AWHGrads.AWHControlConfig(
             lj_softcore_alpha=0.85,
             coul_softcore_alpha=0.3,

@@ -211,6 +211,10 @@ end
     @test bench_cfg.expected_frames >= bench_cfg.min_frames
     @test sim_cfg.ensemble_eval.lambda_tile == 4
     @test sim_cfg.ensemble_eval.progress
+    @test sim_cfg.charge_training.enabled
+    inserted_region_pool = only(filter(pool -> pool.name == :inserted_region, sim_cfg.parameter_pools))
+    @test :charge_chi in inserted_region_pool.trainable_families
+    @test :charge_eta in inserted_region_pool.trainable_families
     @test opt_cfg.max_macro_epochs == 1
     @test opt_cfg.max_inner_epochs == 1
 end

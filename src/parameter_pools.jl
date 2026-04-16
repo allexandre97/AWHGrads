@@ -17,8 +17,11 @@ end
 function normalize_parameter_pool_config(pool::ParameterPoolConfig)
     families = unique(Symbol.(pool.trainable_families))
     isempty(families) && throw(ArgumentError("Parameter pool `$(pool.name)` must train at least one parameter family."))
-    invalid_families = setdiff(families, [:sigma, :epsilon])
+    invalid_families = setdiff(families, [:sigma, :epsilon, :charge_chi, :charge_eta])
     isempty(invalid_families) || throw(ArgumentError("Parameter pool `$(pool.name)` has unsupported trainable families: $(join(string.(invalid_families), ", "))."))
+    any(f -> f in (:charge_chi, :charge_eta), families) &&
+        !all(f -> f in families, (:charge_chi, :charge_eta)) &&
+        throw(ArgumentError("Parameter pool `$(pool.name)` must include both :charge_chi and :charge_eta when enabling charge training."))
     _pool_selector_configured(pool) || throw(ArgumentError("Parameter pool `$(pool.name)` must define at least one selector."))
     pool.reference_penalty_strength >= 0 || throw(ArgumentError("Parameter pool `$(pool.name)` must have non-negative reference_penalty_strength."))
     !isnothing(pool.max_phi_step) && pool.max_phi_step <= 0 && throw(ArgumentError("Parameter pool `$(pool.name)` must have positive max_phi_step."))

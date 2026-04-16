@@ -788,6 +788,25 @@ function residence_length_summary(active_idx_history::Vector{Int}, ::Type{FT}) w
     )
 end
 
+function awh_state_count(awh_sim, low_idx::Int=1, high_idx::Int=1)
+    if hasproperty(awh_sim.state, :partition) && hasproperty(awh_sim.state.partition, :λ_atoms)
+        return length(awh_sim.state.partition.λ_atoms)
+    elseif hasproperty(awh_sim.state, :f)
+        return length(awh_sim.state.f)
+    elseif hasproperty(awh_sim.state, :rho)
+        return length(awh_sim.state.rho)
+    end
+
+    idx_history = get_awh_active_idx_history(awh_sim)
+    if isempty(idx_history)
+        return max(low_idx, high_idx)
+    end
+    return max(high_idx, maximum(idx_history))
+end
+
+function advance_stage_a_streak(current_streak::Int, stage_a_ready::Bool)
+    return stage_a_ready ? current_streak + 1 : 0
+end
 
 """
     evaluate_stage_a_readiness(awh_sim, awh_tol; kwargs...)
@@ -828,15 +847,7 @@ function evaluate_stage_a_readiness(
     round_trip_ready = round_trips >= min_round_trips
 
     endpoint_low, _ = endpoint_occupancy_fractions(idx_history_recent, low_idx, high_idx)
-    n_states = if hasproperty(awh_sim.state, :f)
-        length(awh_sim.state.f)
-    elseif hasproperty(awh_sim.state, :rho)
-        length(awh_sim.state.rho)
-    elseif isempty(idx_history_full)
-        max(low_idx, high_idx)
-    else
-        max(high_idx, maximum(idx_history_full))
-    end
+    n_states = awh_state_count(awh_sim, low_idx, high_idx)
     occupancies = state_occupancy_fractions(idx_history_recent, n_states, FT)
     valid_endpoint_state_idxs = sort(unique(filter(idx -> 1 <= idx <= length(occupancies), isempty(endpoint_state_idxs) ? [high_idx] : endpoint_state_idxs)))
     endpoint_high = isempty(valid_endpoint_state_idxs) ? zero(FT) : sum(occupancies[valid_endpoint_state_idxs])

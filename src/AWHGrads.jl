@@ -44,6 +44,7 @@ include("types.jl")
 include("config.jl")
 include("parameter_pools.jl")
 ff = MolecularForceField(FT, resolve_force_field_paths(default_simulation_config())...; units=true)
+include("charges.jl")
 include("gradients_core.jl")
 include("setup.jl")
 include("logging_utils.jl")
@@ -63,6 +64,7 @@ export StageAReadinessPolicyConfig
 export ThermodynamicLegConfig
 export ThermodynamicCycleConfig
 export ParameterPoolConfig
+export ChargeTrainingConfig
 export ParameterBoundsConfig
 export RuntimeState
 export LegArtifacts

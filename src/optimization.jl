@@ -515,6 +515,7 @@ function run_optimization_phase!(
     trainable_param_indices::Vector{Int},
     trainable_position_map::Dict{Int, Int},
     parameter_pools::Vector{ResolvedParameterPool},
+    param_families::Vector{Symbol},
     theta_ref::Vector{FT},
     theta_min::Vector{FT},
     theta_max::Vector{FT},
@@ -570,7 +571,7 @@ function run_optimization_phase!(
         pool_label = join(string.(getfield.(active_pools, :name)), ",")
         @info "  >> Optimization Epoch: Active Pools = $pool_label"
 
-        chain_rule_multiplier = get_chain_rule_multiplier(theta_active, theta_min, theta_max, opt_cfg.k_sigmoid)
+        chain_rule_multiplier = get_chain_rule_multiplier(phi_active, theta_active, theta_min, theta_max, phi_0, opt_cfg.k_sigmoid, param_families)
 
         fim_joint = zeros(AT, length(trainable_param_names), length(trainable_param_names))
         grad_cycle = zeros(AT, length(trainable_param_names))
@@ -733,7 +734,7 @@ function run_optimization_phase!(
         # with optional per-pool drift caps relative to the reference model.
         for ls_iter in 1:7
             phi_prop .= phi_active .- alpha .* update_direction
-            theta_prop .= map_phi_to_theta(phi_prop, theta_min, theta_max, phi_0, opt_cfg.k_sigmoid)
+            theta_prop .= map_phi_to_theta(phi_prop, theta_min, theta_max, phi_0, opt_cfg.k_sigmoid, param_families)
             drift_ok, pool_drifts_prop = pool_drift_metrics(theta_prop, theta_ref, active_pools)
 
             dG_pred_prop = AT(dG_std_corr)

@@ -114,11 +114,9 @@ potential energy for one stored frame.
 function evaluate_frame_energy(params::Vector{FT}, sys_ref::System{D, AT, FT}, 
                                coords_nounits, box_nounits, neighbors, 
                                atom_idxs, pairwise_idxs, specific_idxs, general_idxs) where {D, AT, FT}
-                               
-    idx_mass, idx_σ, idx_ϵ = atom_idxs
-    
-    # 1. Functional atom construction via broadcasting
-    new_atoms = Molly.inject_atom.(sys_ref.atoms, Ref(params), idx_mass, idx_σ, idx_ϵ)
+
+    # 1. Functional atom construction with optional constrained charge updates.
+    new_atoms = inject_atom_parameters(sys_ref.atoms, params, atom_idxs)
     
     # 2. Functional interaction updates
     new_pairwise = _update_pairwise(sys_ref.pairwise_inters, params, pairwise_idxs)

@@ -1,27 +1,20 @@
 \section{Implemented Pipeline}
 
-The current code organizes the method as a macro-epoch loop. At the beginning of
-each macro epoch, the pipeline constructs one AWH simulation per thermodynamic
-leg with the current physical parameters. Restart coordinates and velocities may
-be reused from the previous macro epoch. The AWH bias is reused only when restart
-continuity is preserved; a cold restart from the input structure does not reuse a
-previous bias profile.
+The current code organizes the method as a macro-epoch loop. At the beginning of each macro epoch, the pipeline constructs one AWH simulation per thermodynamic leg with the current physical parameters. Restart coordinates and velocities may be reused from the previous macro epoch. The AWH bias is reused only when restart continuity is preserved; a cold restart from the input structure does not reuse a previous bias profile. For each leg, the macro epoch proceeds through four stages:
 
-For each leg, the macro epoch proceeds through four stages:
 \begin{enumerate}
     \item optional rewarm of a reused simulation state,
     \item readiness-gated AWH sampling,
     \item frozen-bias production collection,
     \item offline optimization from the frozen production artifacts.
 \end{enumerate}
+%
 The optimizer never consumes data from an actively adapting AWH bias.
 
 \subsection{Stage A: Cheap Readiness Screening}
 
-Stage A is a low-cost check applied after each AWH block. It does not attempt to
-estimate free energies directly. Instead, it asks whether the adaptive AWH run is
-mixed and statistically mature enough to justify a frozen-bias probe. The current
-implementation monitors:
+Stage A is a low-cost check applied after each AWH block. It does not attempt to estimate free energies directly. Instead, it asks whether the adaptive AWH run is mixed and statistically mature enough to justify a frozen-bias probe. The current implementation monitors:
+
 \begin{itemize}
     \item recent mean bias-change magnitude,
     \item lambda-history effective sample size,
@@ -32,16 +25,12 @@ implementation monitors:
     solvent leg.
 \end{itemize}
 
-Only after a leg passes these Stage A criteria for a required stable streak does
-the pipeline launch a Stage B probe. Repeated Stage B failures can increase the
-required stable streak or introduce cooldown periods before the next probe.
+Only after a leg passes these Stage A criteria for a required stable streak does the pipeline launch a Stage B probe. Repeated Stage B failures can increase the required stable streak or introduce cooldown periods before the next probe.
 
 \subsection{Stage B: Frozen-Bias Probe and Parity Validation}
 
-Stage B is the decisive readiness check. The current leg is cloned into a frozen
-reference simulation, the AWH bias is held fixed, bias-update accumulators are
-cleared, and a short probe trajectory is generated. The probe frames are then
-processed offline:
+Stage B is the decisive readiness check. The current leg is cloned into a frozen reference simulation, the AWH bias is held fixed, bias-update accumulators are cleared, and a short probe trajectory is generated. The probe frames are then processed offline:
+
 \begin{enumerate}
     \item discard an initial fraction of the probe,
     \item apply stride and minimum/maximum retained-frame rules,
@@ -49,78 +38,59 @@ processed offline:
     \item evaluate each retained frame under every state Hamiltonian.
 \end{enumerate}
 
-The resulting energy matrix is used to compute two independent Stage B
-diagnostics.
+The resulting energy matrix is used to compute two independent Stage B diagnostics.
 
 \paragraph{Split-half convergence.}
-The retained frames are split into temporal halves. A coupled-minus-decoupled
-free energy is computed independently from each half, and the split gap is the
-absolute difference between those two estimates.
 
-\paragraph{MBAR/AWH parity.}
-The same retained frames are used to reconstruct a full lambda free-energy
-profile from the frozen reference mixture. That replayed profile is aligned to
-the coupled endpoint and compared against the frozen AWH profile that generated
-the frames. The implementation tracks:
+The retained frames are split into temporal halves. A coupled-minus-decoupled free energy is computed independently from each half, and the split gap is the absolute difference between those two estimates.
+
+\paragraph{MBAR/AWH parity.} 
+
+The same retained frames are used to reconstruct a full lambda free-energy profile from the frozen reference mixture. That replayed profile is aligned to the coupled endpoint and compared against the frozen AWH profile that generated the frames. The implementation tracks:
+
 \begin{itemize}
     \item the raw parity gap over all states,
-    \item the supported parity gap over states whose reweighting ESS exceeds a
-    configured support threshold,
+    \item the supported parity gap over states whose reweighting ESS exceeds a     configured support threshold,
     \item a separate endpoint parity gap,
     \item minimum support coverage over the full lambda schedule.
 \end{itemize}
 
-The default gate is therefore \emph{support-aware} but not support-blind: a leg
-must satisfy split convergence, supported parity, endpoint parity, and support
-coverage simultaneously.
+The default gate is therefore \emph{support-aware} but not support-blind: a leg must satisfy split convergence, supported parity, endpoint parity, and support coverage simultaneously.
 
 \paragraph{Split-only continuation.}
-The current code distinguishes true split-only failures from genuine parity
-failures. If split convergence fails while supported parity, endpoint parity, and
-support coverage all still pass, the pipeline does \emph{not} return immediately
-to adaptive AWH sampling. Instead, it continues the same frozen probe in place,
-appending one more segment under the unchanged frozen bias. The raw logger
-history is concatenated and the entire frame-selection procedure is rerun on the
-combined probe so that discard, stride, and frame-cap rules remain consistent.
-This continuation ends as soon as the failure mode is no longer split-only or the
-configured segment budget is exhausted.
+
+The current code distinguishes true split-only failures from genuine parity failures. If split convergence fails while supported parity, endpoint parity, and  support coverage all still pass, the pipeline does \emph{not} return immediately to adaptive AWH sampling. Instead, it continues the same frozen probe in place, appending one more segment under the unchanged frozen bias. The raw logger history is concatenated and the entire frame-selection procedure is rerun on the combined probe so that discard, stride, and frame-cap rules remain consistent. This continuation ends as soon as the failure mode is no longer split-only or the configured segment budget is exhausted.
 
 \paragraph{Retry policy.}
-When Stage B fails for lack of support or split convergence, the next probe is
-grown. When it fails on parity, the probe length is held fixed and the leg is
-sent back to Stage A so the adaptive bias can continue to improve. Near-pass
-behavior is leg-specific: by default, the solvent leg keeps the same probe length
-on a near-pass rather than shrinking it, while the vacuum leg may still shrink.
+
+When Stage B fails for lack of support or split convergence, the next probe is grown. When it fails on parity, the probe length is held fixed and the leg is  sent back to Stage A so the adaptive bias can continue to improve. Near-pass behavior is leg-specific: by default, the solvent leg keeps the same probe length on a near-pass rather than shrinking it, while the vacuum leg may still shrink.
 
 \subsection{Frozen-Bias Production Artifacts}
 
-Once every leg in the cycle has passed Stage B, the pipeline launches a second
-frozen-bias simulation for production collection. For each leg, the current code
-stores:
+Once every leg in the cycle has passed Stage B, the pipeline launches a second frozen-bias simulation for production collection. For each leg, the current code stores:
+
 \begin{itemize}
-    \item the logged coordinates, active lambda history, and, where relevant,
-    volume history,
+    \item the logged coordinates, active lambda history, and, where relevant, volume history,
     \item the frozen bias metadata,
     \item precomputed replay neighbor data,
     \item an ensemble-evaluation cache for CPU replay,
-    \item the reference energy matrix $U_{\mathrm{ref}}$ over all stored frames
-    and all lambda states.
+    \item the reference energy matrix $u_{\mathrm{ref},\ell}$ over all store frames and all lambda states.
 \end{itemize}
+
 These production artifacts are the only data used by the optimizer.
 
 \subsection{Offline Optimization and Step Acceptance}
 
-The optimizer evaluates the current candidate parameter vector on the frozen
-production artifacts and assembles three objects:
+The optimizer evaluates the current candidate parameter vector on the frozen production artifacts and assembles three objects:
+
 \begin{enumerate}
     \item the coefficient-weighted cycle free energy,
     \item the coefficient-weighted cycle gradient in latent space,
     \item the empirical Fisher matrix in latent space.
 \end{enumerate}
 
-The base step is formed by diagonal preconditioning, eigentruncation, KL-target
-scaling, and an infinity-norm cap on the latent update. The line search then
-proposes
+The base step is formed by diagonal preconditioning, eigentruncation, KL-target scaling, and an infinity-norm cap on the latent update. The line search then proposes
+
 \begin{equation}
     \phi_{\mathrm{prop}}
     =
@@ -128,34 +98,27 @@ proposes
     -
     \alpha \, \Delta \phi,
 \end{equation}
+%
 starting from $\alpha=1$ and halving repeatedly until two conditions hold:
+
 \begin{itemize}
     \item every leg remains above its effective sample size threshold,
     \item the residual improves enough to satisfy the acceptance test.
 \end{itemize}
 
-The residual test is not a simple monotonic decrease. The current implementation
-accepts a proposal only if the new residual lies inside a tolerance-adjusted
-window based on the current residual magnitude, and the required improvement is
-made stricter when the production split-half confidence is poor.
-
-\paragraph{Solvent Stage B health scaling.}
-Before each optimization epoch, the most recent validated solvent Stage B pass is
-converted into a health score in $[0,1]$ from the worst margin among supported
-parity, endpoint parity, split gap, and support coverage. This score scales the
-effective KL target and the effective maximum latent step for solute parameters,
-with a nonzero floor to avoid complete stalling.
+The residual test is not a simple monotonic decrease. The current implementation accepts a proposal only if the new residual lies inside a tolerance-adjusted window based on the current residual magnitude, and the required improvement is made stricter when the production split-half confidence is poor.
 
 \paragraph{Split-half confidence scaling.}
-The production artifacts are also split deterministically into first and second
-temporal halves. The code recomputes endpoint free energies and gradients on each
-half and forms three disagreement measures:
+The production artifacts are also split deterministically into first and second temporal halves. The code recomputes endpoint free energies and gradients on each half and forms three disagreement measures:
+
 \begin{itemize}
     \item the maximum per-leg endpoint $\Delta G$ disagreement,
     \item the disagreement in the full cycle contribution,
     \item the disagreement in the cycle gradient vector.
 \end{itemize}
+
 These are compressed into a confidence factor
+
 \begin{equation}
     s_{\mathrm{conf}}
     =
@@ -165,35 +128,22 @@ These are compressed into a confidence factor
         \frac{1}{1 + \kappa \, \delta_{\max}}
     \right),
 \end{equation}
-where $\delta_{\max}$ is the largest disagreement signal. The same split-half
-analysis also adds an extra residual-improvement requirement proportional to the
-cycle disagreement before a line-search step is accepted.
+%
+where $\delta_{\max}$ is the largest disagreement signal. The same split-half analysis also adds an extra residual-improvement requirement proportional to the cycle disagreement before a line-search step is accepted.
 
 \paragraph{Inner-loop exits.}
-If the accepted line-search step becomes too small, if the line search repeatedly
-hits a tiny $\alpha$, or if the configured inner-epoch cap is reached, the code
-restores the best state seen inside that macro epoch and returns to fresh
-resimulation. A fresh macro-epoch Stage B failure does not trigger a hard
-rejection of the previously accepted parameter set; it simply prevents additional
-optimization until new readiness is established.
+
+If the accepted line-search step becomes too small, if the line search repeatedly hits a tiny $\alpha$, or if the configured inner-epoch cap is reached, the code restores the best state seen inside that macro epoch and returns to fresh resimulation. A fresh macro-epoch Stage B failure does not trigger a hard rejection of the previously accepted parameter set; it simply prevents additional optimization until new readiness is established.
 
 \subsection{Current Scope and Default Example}
 
-The repository now supports a general thermodynamic cycle with arbitrary legs,
-coefficients, per-leg lambda schedules, and per-leg ensembles. The default
-example remains ethanol hydration. In that default setup:
+The repository now supports a general thermodynamic cycle with arbitrary legs, coefficients, per-leg lambda schedules, and per-leg ensembles. The default example remains ethanol hydration. In that default setup:
+
 \begin{itemize}
-    \item the solvent leg uses an NPT expanded ensemble with a staged,
-    charge-first and Lennard-Jones-second lambda schedule concentrated in the
-    low-Lennard-Jones tail,
-    \item the vacuum leg uses a simpler non-periodic leg with no pressure-volume
-    term,
-    \item optimization is solute-only unless solvent parameters are explicitly
-    enabled.
+    \item the solvent leg uses an NPT expanded ensemble with a staged, charge-first and Lennard-Jones-second lambda schedule concentrated in the low-Lennard-Jones tail,
+    \item the vacuum leg uses a simpler non-periodic leg with no pressure-volume term,
+    \item the optimization can jointly train Lennard-Jones parameters and partial charges. When charge training is enabled, the code uses a constrained charge-equilibration algorithm (predicting electronegativity and hardness per atom class) to solve for partial charges under exact molecular net-charge constraints before evaluating the force-field energy,
+    \item optimization is solute-only unless solvent parameters are explicitly enabled.
 \end{itemize}
 
-This is therefore no longer a speculative milestone roadmap. The implemented
-method is a readiness-gated, frozen-bias replay pipeline with support-aware Stage
-B validation, bounded latent-coordinate optimization, KL-limited natural-gradient
-steps, and deterministic confidence moderation from split-half production
-artifacts.
+This is therefore no longer a speculative milestone roadmap. The implemented method is a readiness-gated, frozen-bias replay pipeline with support-aware Stage B validation, bounded latent-coordinate optimization, KL-limited natural-gradient steps, and deterministic confidence moderation from split-half production artifacts.
