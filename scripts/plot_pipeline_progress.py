@@ -74,31 +74,17 @@ FAILURE_COLORS = {
     "not_checked": "#9aa0a6",
 }
 
-HAS_MATPLOTLIB = False
-MATPLOTLIB_IMPORT_ERROR: Optional[Exception] = None
-plt = None
-Line2D = None
-Patch = None
-
 if "MPLCONFIGDIR" not in os.environ:
     mpl_config_dir = Path(tempfile.gettempdir()) / "awhgrads_mplconfig"
     mpl_config_dir.mkdir(parents=True, exist_ok=True)
     os.environ["MPLCONFIGDIR"] = str(mpl_config_dir)
 
-try:
-    import matplotlib
+import matplotlib
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as _plt
-    from matplotlib.lines import Line2D as _Line2D
-    from matplotlib.patches import Patch as _Patch
-
-    plt = _plt
-    Line2D = _Line2D
-    Patch = _Patch
-    HAS_MATPLOTLIB = True
-except Exception as exc:  # pragma: no cover - exercised only in fallback envs.
-    MATPLOTLIB_IMPORT_ERROR = exc
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 
 def to_bool(value: str) -> bool:
@@ -1160,10 +1146,6 @@ class PanelSpec:
     notes: List[str] = field(default_factory=list)
 
 
-def figure_extension() -> str:
-    return "png" if HAS_MATPLOTLIB else "svg"
-
-
 def svg_escape(text: str) -> str:
     return (
         text.replace("&", "&amp;")
@@ -1171,21 +1153,6 @@ def svg_escape(text: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
-
-
-def fmt_tick(value: float) -> str:
-    if not math.isfinite(value):
-        return ""
-    abs_value = abs(value)
-    if abs_value >= 1000:
-        return f"{value:.0f}"
-    if abs_value >= 100:
-        return f"{value:.1f}"
-    if abs_value >= 10:
-        return f"{value:.2f}".rstrip("0").rstrip(".")
-    if abs_value >= 1:
-        return f"{value:.3f}".rstrip("0").rstrip(".")
-    return f"{value:.4f}".rstrip("0").rstrip(".")
 
 
 def compute_range(panel: PanelSpec) -> Tuple[float, float]:
@@ -1229,154 +1196,7 @@ def compute_x_range(panel: PanelSpec) -> Tuple[float, float]:
     return x_min, x_max
 
 
-def map_x(value: float, x_min: float, x_max: float, x0: float, width: float) -> float:
-    return x0 + (value - x_min) / (x_max - x_min) * width
-
-
-def map_y(value: float, y_min: float, y_max: float, y0: float, height: float) -> float:
-    return y0 + height - (value - y_min) / (y_max - y_min) * height
-
-
-def add_line(parts: List[str], x1: float, y1: float, x2: float, y2: float, color: str, width: float = 1.0, dashed: bool = False, opacity: float = 1.0) -> None:
-    dash_attr = ' stroke-dasharray="6,4"' if dashed else ""
-    parts.append(
-        f'<line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}" stroke="{color}" stroke-width="{width:.2f}" opacity="{opacity:.3f}"{dash_attr} />'
-    )
-
-
-def add_rect(parts: List[str], x: float, y: float, width: float, height: float, fill: str, stroke: str = "", opacity: float = 1.0) -> None:
-    stroke_attr = f' stroke="{stroke}"' if stroke else ""
-    parts.append(
-        f'<rect x="{x:.2f}" y="{y:.2f}" width="{width:.2f}" height="{height:.2f}" fill="{fill}" opacity="{opacity:.3f}"{stroke_attr} />'
-    )
-
-
-def add_text(parts: List[str], x: float, y: float, text: str, size: int = 13, anchor: str = "start", fill: str = "#222222", weight: str = "normal") -> None:
-    parts.append(
-        f'<text x="{x:.2f}" y="{y:.2f}" font-family="DejaVu Sans, Arial, sans-serif" font-size="{size}" text-anchor="{anchor}" fill="{fill}" font-weight="{weight}">{svg_escape(text)}</text>'
-    )
-
-
-def add_polyline(parts: List[str], points: Sequence[Tuple[float, float]], color: str, width: float = 2.0, dashed: bool = False, opacity: float = 1.0) -> None:
-    if len(points) < 2:
-        return
-    dash_attr = ' stroke-dasharray="6,4"' if dashed else ""
-    point_text = " ".join(f"{x:.2f},{y:.2f}" for x, y in points)
-    parts.append(
-        f'<polyline points="{point_text}" fill="none" stroke="{color}" stroke-width="{width:.2f}" stroke-linejoin="round" stroke-linecap="round" opacity="{opacity:.3f}"{dash_attr} />'
-    )
-
-
-def add_circle(parts: List[str], x: float, y: float, radius: float, fill: str, stroke: str = "#ffffff") -> None:
-    parts.append(
-        f'<circle cx="{x:.2f}" cy="{y:.2f}" r="{radius:.2f}" fill="{fill}" stroke="{stroke}" stroke-width="1.0" />'
-    )
-
-
-def draw_line_panel(parts: List[str], panel: PanelSpec, x0: float, y0: float, width: float, height: float, is_last: bool) -> None:
-    plot_left = x0 + 70
-    plot_top = y0 + 28
-    plot_width = width - 120
-    plot_height = height - 72
-    x_min, x_max = compute_x_range(panel)
-    y_min, y_max = compute_range(panel)
-
-    add_text(parts, x0 + 8, y0 + 20, panel.title, size=16, weight="bold")
-    add_rect(parts, plot_left, plot_top, plot_width, plot_height, "#ffffff", stroke="#d8d8d8")
-
-    for i in range(6):
-        frac = i / 5.0
-        y_val = y_min + (y_max - y_min) * frac
-        y_px = map_y(y_val, y_min, y_max, plot_top, plot_height)
-        add_line(parts, plot_left, y_px, plot_left + plot_width, y_px, "#eeeeee", width=1.0)
-        add_text(parts, plot_left - 8, y_px + 4, fmt_tick(y_val), size=11, anchor="end", fill="#666666")
-
-    for i in range(6):
-        frac = i / 5.0
-        x_val = x_min + (x_max - x_min) * frac
-        x_px = map_x(x_val, x_min, x_max, plot_left, plot_width)
-        add_line(parts, x_px, plot_top, x_px, plot_top + plot_height, "#f2f2f2", width=1.0)
-        add_text(parts, x_px, plot_top + plot_height + 18, fmt_tick(x_val), size=11, anchor="middle", fill="#666666")
-
-    add_line(parts, plot_left, plot_top + plot_height, plot_left + plot_width, plot_top + plot_height, "#888888", width=1.2)
-    add_line(parts, plot_left, plot_top, plot_left, plot_top + plot_height, "#888888", width=1.2)
-
-    for hline in panel.hlines:
-        y_px = map_y(hline.value, y_min, y_max, plot_top, plot_height)
-        add_line(parts, plot_left, y_px, plot_left + plot_width, y_px, hline.color, width=1.4, dashed=hline.dashed, opacity=0.85)
-        if hline.label:
-            add_text(parts, plot_left + plot_width - 4, y_px - 4, hline.label, size=11, anchor="end", fill=hline.color)
-
-    for vline in panel.vlines:
-        x_px = map_x(vline.value, x_min, x_max, plot_left, plot_width)
-        add_line(parts, x_px, plot_top, x_px, plot_top + plot_height, vline.color, width=1.4, dashed=vline.dashed, opacity=0.7)
-        if vline.label:
-            add_text(parts, x_px + 4, plot_top + 12, vline.label, size=11, fill=vline.color)
-
-    legend_y = plot_top + 16
-    legend_x = plot_left + 10
-    if panel.legend:
-        for idx, series in enumerate(panel.series):
-            row = idx // 4
-            col = idx % 4
-            item_x = legend_x + col * 190
-            item_y = legend_y + row * 16
-            add_line(parts, item_x, item_y, item_x + 20, item_y, series.color, width=2.5, dashed=series.dashed)
-            add_text(parts, item_x + 26, item_y + 4, series.name, size=11)
-
-    for series in panel.series:
-        mapped_points = [
-            (map_x(x, x_min, x_max, plot_left, plot_width), map_y(y, y_min, y_max, plot_top, plot_height))
-            for x, y in series.points
-            if math.isfinite(x) and math.isfinite(y)
-        ]
-        add_polyline(parts, mapped_points, series.color, width=series.stroke_width, dashed=series.dashed)
-        if series.draw_markers:
-            for x_px, y_px in mapped_points:
-                add_circle(parts, x_px, y_px, 2.8, series.color)
-
-    for marker in panel.markers:
-        if not (math.isfinite(marker.x) and math.isfinite(marker.y)):
-            continue
-        x_px = map_x(marker.x, x_min, x_max, plot_left, plot_width)
-        y_px = map_y(marker.y, y_min, y_max, plot_top, plot_height)
-        add_circle(parts, x_px, y_px, marker.radius, marker.color)
-        if marker.label:
-            add_text(parts, x_px + 6, y_px - 6, marker.label, size=11, fill=marker.color)
-
-    add_text(parts, plot_left + plot_width / 2.0, y0 + height - 16, panel.x_label, size=12, anchor="middle", fill="#444444")
-    add_text(parts, x0 + 18, plot_top + plot_height / 2.0, panel.y_label, size=12, fill="#444444")
-
-    if panel.notes:
-        note_y = y0 + height - 34
-        for idx, note in enumerate(panel.notes):
-            add_text(parts, plot_left + plot_width - 4, note_y - idx * 14, note, size=10, anchor="end", fill="#666666")
-
-    if not is_last:
-        add_line(parts, x0, y0 + height + 8, x0 + width, y0 + height + 8, "#e6e6e6", width=1.0)
-
-
-def write_multiplot_svg(path: Path, title: str, panels: Sequence[PanelSpec], width: int = 1400, panel_height: int = 250) -> None:
-    outer_margin = 18
-    title_height = 34
-    gap = 24
-    height = outer_margin * 2 + title_height + len(panels) * panel_height + max(0, len(panels) - 1) * gap
-    parts = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
-        '<rect width="100%" height="100%" fill="#fbfbfd" />',
-    ]
-    add_text(parts, outer_margin, outer_margin + 20, title, size=22, weight="bold")
-    y_cursor = outer_margin + title_height
-    for idx, panel in enumerate(panels):
-        draw_line_panel(parts, panel, outer_margin, y_cursor, width - outer_margin * 2, panel_height, idx == len(panels) - 1)
-        y_cursor += panel_height + gap
-    parts.append("</svg>")
-    path.write_text("\n".join(parts), encoding="utf-8")
-
-
-def write_multiplot_matplotlib(path: Path, title: str, panels: Sequence[PanelSpec], width: int = 1400, panel_height: int = 250) -> None:
-    if not HAS_MATPLOTLIB:
-        raise RuntimeError("matplotlib backend unavailable")
+def write_multiplot(path: Path, title: str, panels: Sequence[PanelSpec], width: int = 1400, panel_height: int = 250) -> None:
 
     fig_height = max(3.0, len(panels) * (panel_height / 100.0) + 0.8)
     fig, axes = plt.subplots(len(panels), 1, figsize=(width / 100.0, fig_height), squeeze=False)
@@ -1409,7 +1229,11 @@ def write_multiplot_matplotlib(path: Path, title: str, panels: Sequence[PanelSpe
         for series in panel.series:
             xs = [x for x, y in series.points if math.isfinite(x) and math.isfinite(y)]
             if "Parameter Trajectories" in panel.title:
-                ys = [100*(y - series.points[0][1])/series.points[0][1] for x, y in series.points if math.isfinite(x) and math.isfinite(y)]
+                v0 = series.points[0][1]
+                if v0 == 0.0:
+                    ys = [y for x, y in series.points if math.isfinite(x) and math.isfinite(y)]
+                else:
+                    ys = [100*(y - v0)/v0 for x, y in series.points if math.isfinite(x) and math.isfinite(y)]
                 d = abs(max(ys)-min(ys))
                 if d > maxd:
                     maxd = d
@@ -1464,72 +1288,7 @@ def write_multiplot_matplotlib(path: Path, title: str, panels: Sequence[PanelSpe
     plt.close(fig)
 
 
-def write_timeline_svg(path: Path, run: RunRecord) -> None:
-    width = 1400
-    height = 360
-    margin = 18
-    title_height = 34
-    plot_left = 140
-    plot_top = 90
-    plot_width = width - plot_left - 28
-    row_height = 56
-    legs = ["solvent", "vacuum"]
-    cumulative_segments: List[Tuple[str, str, float, float]] = []
-    cumulative_by_leg = {leg: 0.0 for leg in legs}
-    for event in run.phase_events:
-        if event.kind != "end" or event.md_ns is None or event.leg not in cumulative_by_leg:
-            continue
-        start = cumulative_by_leg[event.leg]
-        end = start + event.md_ns
-        cumulative_segments.append((event.leg, event.phase, start, end))
-        cumulative_by_leg[event.leg] = end
-    max_x = max((end for _, _, _, end in cumulative_segments), default=1.0)
-    parts = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
-        '<rect width="100%" height="100%" fill="#fbfbfd" />',
-    ]
-    add_text(parts, margin, margin + 20, "AWH Timeline", size=22, weight="bold")
-    add_text(parts, margin, margin + 42, "Global cumulative MD ns per leg. Colors encode the sampled phase.", size=12, fill="#555555")
-
-    for i in range(6):
-        frac = i / 5.0
-        x_val = max_x * frac
-        x_px = plot_left + plot_width * frac
-        add_line(parts, x_px, plot_top - 8, x_px, plot_top + row_height * len(legs) + 12, "#ececec", width=1.0)
-        add_text(parts, x_px, plot_top + row_height * len(legs) + 32, fmt_tick(x_val), size=11, anchor="middle", fill="#666666")
-
-    for row, leg in enumerate(legs):
-        y = plot_top + row * row_height
-        add_text(parts, margin + 8, y + 22, leg.capitalize(), size=15, weight="bold")
-        add_rect(parts, plot_left, y, plot_width, 24, "#ffffff", stroke="#d8d8d8")
-        for seg_leg, phase, start, end in cumulative_segments:
-            if seg_leg != leg:
-                continue
-            x1 = plot_left + (start / max_x) * plot_width
-            x2 = plot_left + (end / max_x) * plot_width
-            add_rect(parts, x1, y + 1, max(1.0, x2 - x1), 22, PHASE_COLORS.get(phase, "#888888"), opacity=0.85)
-        freeze_events = [event for event in run.control_events if event.leg == leg and event.event_type == "leg_frozen" and event.global_ns is not None]
-        for freeze in freeze_events:
-            x_px = plot_left + (freeze.global_ns / max_x) * plot_width
-            add_line(parts, x_px, y - 6, x_px, y + 30, "#2a9d8f", width=2.0, dashed=True)
-            add_text(parts, x_px + 4, y - 10, f"freeze m{freeze.macro_index}", size=10, fill="#2a9d8f")
-
-    legend_x = plot_left
-    legend_y = plot_top - 34
-    for idx, (phase, color) in enumerate(PHASE_COLORS.items()):
-        x = legend_x + idx * 220
-        add_rect(parts, x, legend_y, 18, 12, color)
-        add_text(parts, x + 24, legend_y + 11, phase, size=11)
-
-    add_text(parts, plot_left + plot_width / 2.0, height - 18, "Global cumulative AWH MD ns", size=12, anchor="middle", fill="#444444")
-    parts.append("</svg>")
-    path.write_text("\n".join(parts), encoding="utf-8")
-
-
-def write_timeline_matplotlib(path: Path, run: RunRecord) -> None:
-    if not HAS_MATPLOTLIB:
-        raise RuntimeError("matplotlib backend unavailable")
-
+def write_timeline(path: Path, run: RunRecord) -> None:
     fig, ax = plt.subplots(figsize=(14, 4.2))
     legs = ["solvent", "vacuum"]
     cumulative_segments: List[Tuple[str, str, float, float]] = []
@@ -1566,20 +1325,6 @@ def write_timeline_matplotlib(path: Path, run: RunRecord) -> None:
     fig.tight_layout()
     fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
-
-
-def write_multiplot(path: Path, title: str, panels: Sequence[PanelSpec], width: int = 1400, panel_height: int = 250) -> None:
-    if path.suffix.lower() == ".png" and HAS_MATPLOTLIB:
-        write_multiplot_matplotlib(path, title, panels, width=width, panel_height=panel_height)
-    else:
-        write_multiplot_svg(path, title, panels, width=width, panel_height=panel_height)
-
-
-def write_timeline(path: Path, run: RunRecord) -> None:
-    if path.suffix.lower() == ".png" and HAS_MATPLOTLIB:
-        write_timeline_matplotlib(path, run)
-    else:
-        write_timeline_svg(path, run)
 
 
 def by_leg(records: Sequence[object], leg_name: str) -> List[object]:
@@ -1912,21 +1657,56 @@ def make_optimization_panels(run: RunRecord) -> List[PanelSpec]:
     return panels
 
 
-def chunked(items: Sequence[str], size: int) -> Iterable[Sequence[str]]:
-    for start in range(0, len(items), size):
-        yield items[start : start + size]
+def _pool_name_of(param_name: str) -> str:
+    """Extract the pool name from a parameter name of the form pool_<pool>_atom_... or pool_<pool>_charge_..."""
+    raw = param_name[len("derived_charge:"):] if param_name.startswith("derived_charge:") else param_name
+    if raw.startswith("pool_"):
+        rest = raw[len("pool_"):]
+        for sep in ("_atom_", "_charge_"):
+            idx = rest.find(sep)
+            if idx != -1:
+                return rest[:idx]
+    return ""
 
 
-def parameter_panels(run: RunRecord, chunk_size: int) -> List[Tuple[str, List[PanelSpec]]]:
+def parameter_panels(run: RunRecord) -> List[Tuple[str, List[PanelSpec]]]:
+    """One panel per parameter pool, each containing all raw parameters and derived partial charges for that pool."""
     epochs = run.optimization_epochs
     if not epochs:
         return []
-    param_names = []
+    param_names: List[str] = []
     for epoch in epochs:
         for name in epoch.parameters:
             if name not in param_names:
                 param_names.append(name)
-    panels_by_file: List[Tuple[str, List[PanelSpec]]] = []
+
+    # Build derived partial-charge series: q = -χ/η for each matching chi/eta pair.
+    # Stored as synthetic_key -> (display_label, chi_key, eta_key).
+    derived_charges: Dict[str, Tuple[str, str, str]] = {}
+    for name in param_names:
+        if name.endswith("_χ"):
+            eta_key = name[:-1] + "η"
+            if eta_key in param_names:
+                label = name
+                if label.startswith("pool_"):
+                    label = label[len("pool_"):]
+                if label.endswith("_χ"):
+                    label = label[:-2]
+                label = label.replace("_charge_", "/") + " (q)"
+                derived_charges[f"derived_charge:{name}"] = (label, name, eta_key)
+
+    all_names = param_names + list(derived_charges.keys())
+
+    # Group names by pool, preserving insertion order.
+    pools_ordered: List[str] = []
+    by_pool: Dict[str, List[str]] = {}
+    for name in all_names:
+        pool = _pool_name_of(name)
+        if pool not in by_pool:
+            pools_ordered.append(pool)
+            by_pool[pool] = []
+        by_pool[pool].append(name)
+
     palette = [
         "#c2552d",
         "#2d6db6",
@@ -1937,28 +1717,57 @@ def parameter_panels(run: RunRecord, chunk_size: int) -> List[Tuple[str, List[Pa
         "#118ab2",
         "#6d597a",
     ]
-    for file_idx, chunk in enumerate(chunked(param_names, max(1, chunk_size)), start=1):
-        series = []
-        for idx, name in enumerate(chunk):
-            points = [
-                (epoch.global_epoch_index, epoch.parameters.get(name))
-                for epoch in epochs
-                if name in epoch.parameters
-            ]
-            filtered = [(x, y) for x, y in points if y is not None]
-            if filtered:
-                series.append(SeriesSpec(name, filtered, palette[idx % len(palette)]))
+    # Vertical lines at the first epoch of each macro after the first.
+    macro_boundaries: List[VLineSpec] = []
+    seen_macros: set = set()
+    for epoch in epochs:
+        m = epoch.macro_index
+        if m not in seen_macros:
+            seen_macros.add(m)
+            if m > 1:
+                macro_boundaries.append(
+                    VLineSpec(epoch.global_epoch_index, "#888888", label=f"M{m}", dashed=True)
+                )
+
+    panels_by_file: List[Tuple[str, List[PanelSpec]]] = []
+    for pool in pools_ordered:
+        series: List[SeriesSpec] = []
+        for idx, name in enumerate(by_pool[pool]):
+            color = palette[idx % len(palette)]
+            if name in derived_charges:
+                label, chi_key, eta_key = derived_charges[name]
+                points = []
+                for epoch in epochs:
+                    chi = epoch.parameters.get(chi_key)
+                    eta = epoch.parameters.get(eta_key)
+                    if chi is not None and eta is not None and eta != 0.0:
+                        points.append((epoch.global_epoch_index, -chi / eta))
+            else:
+                raw = [
+                    (epoch.global_epoch_index, epoch.parameters.get(name))
+                    for epoch in epochs
+                    if name in epoch.parameters
+                ]
+                points = [(x, y) for x, y in raw if y is not None]
+                label = name
+
+            if points:
+                series.append(SeriesSpec(label, points, color))
+
         if not series:
             continue
+        file_slug = pool if pool else "other"
+        title = f"Parameter Trajectories – {pool}" if pool else "Parameter Trajectories"
         panels_by_file.append(
             (
-                f"parameter_trajectories_{file_idx:02d}.{figure_extension()}",
+                f"parameter_trajectories_{file_slug}.png",
                 [
                     PanelSpec(
-                        title=f"Parameter Trajectories ({file_idx})",
+                        title=title,
                         x_label="Global optimization epoch",
-                        y_label="parameter drift (%)",
+                        y_label="drift (%)",
                         series=series,
+                        vlines=macro_boundaries,
                     )
                 ],
             )
@@ -2033,10 +1842,10 @@ def build_report_text(run: RunRecord) -> str:
     return "\n".join(lines)
 
 
-def write_report(outdir: Path, run: RunRecord, max_params_per_figure: int) -> List[str]:
+def write_report(outdir: Path, run: RunRecord) -> List[str]:
     figure_names: List[str] = []
     write_summary_json(outdir, run)
-    ext = figure_extension()
+    ext = "png"
 
     timeline_name = f"awh_timeline.{ext}"
     write_timeline(outdir / timeline_name, run)
@@ -2066,7 +1875,7 @@ def write_report(outdir: Path, run: RunRecord, max_params_per_figure: int) -> Li
         write_multiplot(outdir / name, "Optimization Metrics", opt_panels, panel_height=240)
         figure_names.append(name)
 
-    for name, panels in parameter_panels(run, max_params_per_figure):
+    for name, panels in parameter_panels(run):
         write_multiplot(outdir / name, "Parameter Trajectories", panels, panel_height=260)
         figure_names.append(name)
 
@@ -2082,7 +1891,6 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--output-dir", default="plots", help="Base output directory. Default: plots")
     parser.add_argument("--overwrite", action="store_true", help="Allow overwriting an existing per-log output directory.")
     parser.add_argument("--summary-only", action="store_true", help="Parse logs and write summary files without rendering figures.")
-    parser.add_argument("--max-params-per-figure", type=int, default=8, help="Maximum parameter traces per figure. Default: 8")
     return parser.parse_args(argv)
 
 
@@ -2113,13 +1921,13 @@ def main(argv: Sequence[str]) -> int:
         (outdir / "report.txt").write_text(report_txt + "\n", encoding="utf-8")
         figure_names: List[str] = []
         if not args.summary_only:
-            figure_names = write_report(outdir, run, args.max_params_per_figure)
+            figure_names = write_report(outdir, run)
         else:
             write_index_html(outdir, log_path.stem, figure_names, report_txt)
         wrote_any = True
         print(f"[ok] parsed {log_path} -> {outdir}")
         print(f"     stage_a={len(run.stage_a)} stage_b={len(run.stage_b)} optimization_epochs={len(run.optimization_epochs)}")
-        print(f"     figure_backend={'matplotlib/png' if HAS_MATPLOTLIB else 'svg-fallback'}")
+        print(f"     figure_backend=matplotlib/png")
         if figure_names:
             print(f"     figures={len(figure_names)} index={outdir / 'index.html'}")
         if run.warnings:
