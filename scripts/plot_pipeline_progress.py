@@ -253,6 +253,9 @@ class StageASnapshot:
     tail_low_states: List[int] = field(default_factory=list)
     occ_min: Optional[float] = None
     low_occ_states: List[int] = field(default_factory=list)
+    rollback: Optional[str] = None
+    occ_floor: Optional[float] = None
+    frac_above_floor: Optional[float] = None
     n_hist_recent: Optional[int] = None
     n_hist_total: Optional[int] = None
     streak: Optional[int] = None
@@ -580,6 +583,12 @@ class LogParser:
                 data["occ_min"] = to_float(segment.split("=", 1)[1])
             elif segment.startswith("low_occ="):
                 data["low_occ_states"] = parse_index_list(segment.split("=", 1)[1])
+            elif segment.startswith("rollback="):
+                data["rollback"] = segment.split("=", 1)[1].strip()
+            elif segment.startswith("occ_floor="):
+                data["occ_floor"] = to_float(segment.split("=", 1)[1])
+            elif segment.startswith("frac_above_floor="):
+                data["frac_above_floor"] = to_float(segment.split("=", 1)[1])
             elif segment.startswith("n_hist_recent="):
                 data["n_hist_recent"] = to_int(segment.split("=", 1)[1])
             elif segment.startswith("n_hist_total="):
@@ -1096,14 +1105,16 @@ class LogParser:
             return
 
 
+
 @dataclass
 class SeriesSpec:
     name: str
     points: List[Tuple[float, float]]
     color: str
-    stroke_width: float = 2.0
+    stroke_width: float = 2.2
     dashed: bool = False
     draw_markers: bool = False
+    alpha: float = 1.0
 
 
 @dataclass
@@ -1112,6 +1123,7 @@ class HLineSpec:
     color: str
     label: str = ""
     dashed: bool = True
+    alpha: float = 0.9
 
 
 @dataclass
@@ -1120,6 +1132,7 @@ class VLineSpec:
     color: str
     label: str = ""
     dashed: bool = True
+    alpha: float = 0.8
 
 
 @dataclass
@@ -1129,6 +1142,7 @@ class MarkerSpec:
     color: str
     label: str = ""
     radius: float = 4.0
+    marker: str = "o"
 
 
 @dataclass
@@ -1146,6 +1160,64 @@ class PanelSpec:
     notes: List[str] = field(default_factory=list)
 
 
+import numpy as np
+from bisect import bisect_right
+from collections import defaultdict
+from matplotlib.patches import Rectangle
+from matplotlib import colors as mcolors
+
+
+STATUS_COLORS = {
+    "pass": "#2a9d8f",
+    "fail": "#d62828",
+    "warn": "#f4a261",
+    "muted": "#adb5bd",
+    "info": "#457b9d",
+    "vacuum": LEG_COLORS["vacuum"],
+    "solvent": LEG_COLORS["solvent"],
+}
+
+PHASE_MARKERS = {
+    "Initial Rewarm": "s",
+    "Stage A Block": "o",
+    "Stage B Probe MD": "^",
+    "Stage B Neighbor Precompute": "D",
+    "Stage B Ensemble Eval": "P",
+    "Stage B Split-Parity": "X",
+}
+
+STAGE_B_STATE_ORDER = [
+    "none",
+    "cached_pass",
+    "cached_fail",
+    "fresh_pass",
+    "fresh_fail",
+    "cooldown",
+]
+
+STAGE_B_STATE_COLORS = {
+    "none": "#e9ecef",
+    "cached_pass": "#b7e4c7",
+    "cached_fail": "#ffd6a5",
+    "fresh_pass": "#2a9d8f",
+    "fresh_fail": "#d62828",
+    "cooldown": "#4d96ff",
+}
+
+LAMBDA_FLAG_COLORS = {
+    0: "#f8f9fa",
+    1: "#ffd166",
+    2: "#ef476f",
+    3: "#7b2cbf",
+}
+
+GATE_PASS_COLORS = {
+    -1: "#f1f3f5",
+    0: "#f28482",
+    1: "#84a98c",
+}
+
+
 def svg_escape(text: str) -> str:
     return (
         text.replace("&", "&amp;")
@@ -1153,6 +1225,791 @@ def svg_escape(text: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+
+
+def sanitize_json(data: object) -> object:
+    if isinstance(data, dict):
+        return {str(key): sanitize_json(value) for key, value in data.items()}
+    if isinstance(data, list):
+        return [sanitize_json(value) for value in data]
+    if isinstance(data, float):
+        return data if math.isfinite(data) else None
+    return data
+
+
+def write_summary_json(outdir: Path, run: RunRecord) -> None:
+    payload = sanitize_json(asdict(run))
+    (outdir / "summary.json").write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def apply_axis_style(ax: plt.Axes) -> None:
+    ax.set_facecolor("#ffffff")
+    ax.grid(True, which="major", color="#e9ecef", linewidth=0.8)
+    for spine in ax.spines.values():
+        spine.set_color("#d0d7de")
+
+
+def leg_title(leg: str) -> str:
+    return leg.capitalize()
+
+
+def get_leg_stage_a(run: RunRecord, leg: str) -> List[StageASnapshot]:
+    return [snap for snap in run.stage_a if snap.leg == leg]
+
+
+def get_leg_stage_b(run: RunRecord, leg: str) -> List[StageBSnapshot]:
+    return [snap for snap in run.stage_b if snap.leg == leg]
+
+
+def block_line_numbers(run: RunRecord, leg: str) -> List[int]:
+    return [snap.line_no for snap in get_leg_stage_a(run, leg)]
+
+
+def block_index_for_line(run: RunRecord, leg: str, line_no: int) -> Optional[int]:
+    lines = block_line_numbers(run, leg)
+    if not lines:
+        return None
+    idx = bisect_right(lines, line_no) - 1
+    if idx < 0:
+        return None
+    return idx
+
+
+def macro_boundaries_from_stage_a(run: RunRecord, leg: str) -> List[Tuple[int, int]]:
+    snaps = get_leg_stage_a(run, leg)
+    boundaries: List[Tuple[int, int]] = []
+    last_macro: Optional[int] = None
+    for idx, snap in enumerate(snaps):
+        if last_macro is None:
+            last_macro = snap.macro_index
+            continue
+        if snap.macro_index != last_macro:
+            boundaries.append((idx, snap.macro_index))
+            last_macro = snap.macro_index
+    return boundaries
+
+
+def macro_boundaries_from_epochs(run: RunRecord) -> List[VLineSpec]:
+    seen: set = set()
+    boundaries: List[VLineSpec] = []
+    for epoch in run.optimization_epochs:
+        macro = epoch.macro_index
+        if macro not in seen:
+            seen.add(macro)
+            if macro > 1:
+                boundaries.append(VLineSpec(epoch.global_epoch_index, "#999999", label=f"M{macro}"))
+    return boundaries
+
+
+def latest_stage_a_snapshot(run: RunRecord, leg: str) -> Optional[StageASnapshot]:
+    snaps = get_leg_stage_a(run, leg)
+    return snaps[-1] if snaps else None
+
+
+def latest_stage_b_snapshot(run: RunRecord, leg: str) -> Optional[StageBSnapshot]:
+    snaps = get_leg_stage_b(run, leg)
+    return snaps[-1] if snaps else None
+
+
+def latest_cached_stage_b_event(run: RunRecord, leg: str) -> Optional[ControlEvent]:
+    events = [
+        ev for ev in run.control_events
+        if ev.leg == leg and ev.event_type == "stage_b_cached"
+    ]
+    return events[-1] if events else None
+
+
+def stage_a_gate_value(snapshot: StageASnapshot, gate: str) -> int:
+    if gate == "df":
+        return -1 if snapshot.df_ok is None else int(bool(snapshot.df_ok))
+    if gate == "ESS":
+        return -1 if snapshot.ess_ok is None else int(bool(snapshot.ess_ok))
+    if gate == "linN":
+        return -1 if snapshot.lin_neff_ok is None else int(bool(snapshot.lin_neff_ok))
+    if gate == "RT":
+        return -1 if snapshot.round_trips_ok is None else int(bool(snapshot.round_trips_ok))
+    if gate == "endpoint":
+        return -1 if snapshot.endpoint_ok is None else int(bool(snapshot.endpoint_ok))
+    if gate == "tail":
+        return -1 if snapshot.tail_ok is None else int(bool(snapshot.tail_ok))
+    if gate == "occ":
+        if snapshot.occ_min is None:
+            return -1
+        return 0 if snapshot.low_occ_states else 1
+    if gate == "ready":
+        return int(bool(snapshot.stage_ready))
+    raise KeyError(gate)
+
+
+def stage_a_primary_blocker(snapshot: Optional[StageASnapshot]) -> str:
+    if snapshot is None:
+        return "no Stage A data"
+    checks = [
+        (snapshot.df_ok is False, "df"),
+        (snapshot.ess_ok is False, "ESS"),
+        (snapshot.lin_neff_ok is False, "linear N_eff"),
+        (snapshot.round_trips_ok is False, "round trips"),
+        (snapshot.endpoint_ok is False, "endpoint occupancy"),
+        (snapshot.tail_ok is False, "tail occupancy"),
+        (bool(snapshot.low_occ_states), "low-occ λ"),
+    ]
+    failed = [name for cond, name in checks if cond]
+    if failed:
+        return ", ".join(failed[:3])
+    return "none"
+
+
+def stage_b_status_text(run: RunRecord, leg: str) -> str:
+    snap = latest_stage_b_snapshot(run, leg)
+    cached = latest_cached_stage_b_event(run, leg)
+    if snap is not None:
+        mode = snap.failure_mode or "unknown"
+        if snap.fresh_probe_result:
+            return f"fresh {mode}"
+        return mode
+    if cached is not None:
+        return f"cached {cached.details.get('failure', 'unknown')}"
+    return "not checked"
+
+
+def status_color_from_text(text: str) -> str:
+    lower = text.lower()
+    if "pass" in lower or "frozen" in lower:
+        return STATUS_COLORS["pass"]
+    if "cached" in lower or "cooldown" in lower or "near" in lower:
+        return STATUS_COLORS["warn"]
+    if "not checked" in lower:
+        return STATUS_COLORS["muted"]
+    return STATUS_COLORS["fail"]
+
+
+def max_lambda_state(run: RunRecord) -> int:
+    values: List[int] = []
+    for snap in run.stage_a:
+        values.extend(snap.tail_low_states)
+        values.extend(snap.low_occ_states)
+    for snap in run.stage_b:
+        if snap.n_states:
+            values.append(snap.n_states)
+    for artifact in run.production_artifacts:
+        values.append(artifact.lambda_states)
+    return max(values) if values else 1
+
+
+def safe_log10(value: Optional[float]) -> Optional[float]:
+    if value is None or not math.isfinite(value) or value <= 0:
+        return None
+    return math.log10(value)
+
+
+def finite_xy(points: Sequence[Tuple[Optional[float], Optional[float]]]) -> List[Tuple[float, float]]:
+    result: List[Tuple[float, float]] = []
+    for x, y in points:
+        if x is None or y is None:
+            continue
+        if math.isfinite(x) and math.isfinite(y):
+            result.append((float(x), float(y)))
+    return result
+
+
+def write_dashboard(path: Path, run: RunRecord) -> None:
+    fig = plt.figure(figsize=(14, 8))
+    ax = fig.add_subplot(111)
+    ax.set_axis_off()
+    fig.patch.set_facecolor("#fbfbfd")
+
+    ax.text(0.02, 0.96, "AWH Progress Dashboard", fontsize=22, fontweight="bold", va="top")
+    ax.text(0.02, 0.92, Path(run.log_path).name, fontsize=11, color="#666666", va="top")
+
+    card_positions = {
+        "solvent": (0.02, 0.53, 0.29, 0.31),
+        "vacuum": (0.35, 0.53, 0.29, 0.31),
+        "totals": (0.68, 0.53, 0.30, 0.31),
+        "notes": (0.02, 0.10, 0.96, 0.32),
+    }
+
+    def card(x: float, y: float, w: float, h: float, title: str) -> None:
+        ax.add_patch(Rectangle((x, y), w, h, facecolor="#ffffff", edgecolor="#d9dce3", linewidth=1.0))
+        ax.text(x + 0.02, y + h - 0.04, title, fontsize=14, fontweight="bold", va="top")
+
+    for title, (x, y, w, h) in card_positions.items():
+        label = title.capitalize() if title in {"solvent", "vacuum"} else ("Run Totals" if title == "totals" else "Current Interpretation")
+        card(x, y, w, h, label)
+
+    for leg in ("solvent", "vacuum"):
+        x, y, w, h = card_positions[leg]
+        snap = latest_stage_a_snapshot(run, leg)
+        stage_b = latest_stage_b_snapshot(run, leg)
+        cached = latest_cached_stage_b_event(run, leg)
+        stage_b_text = stage_b_status_text(run, leg)
+        stage_b_color = status_color_from_text(stage_b_text)
+        spent = snap.macro_spent_ns if snap and snap.macro_spent_ns is not None else 0.0
+        budget = snap.budget_ns if snap and snap.budget_ns is not None else 1.0
+        frac = 0.0 if budget <= 0 else max(0.0, min(1.0, spent / budget))
+        ax.text(x + 0.02, y + 0.21, f"Stage A blocks: {len(get_leg_stage_a(run, leg))}", fontsize=11)
+        ax.text(x + 0.02, y + 0.17, f"Fresh Stage B probes: {sum(1 for s in get_leg_stage_b(run, leg) if s.fresh_probe_result)}", fontsize=11)
+        ax.text(x + 0.02, y + 0.13, f"Latest Stage B: {stage_b_text}", fontsize=11, color=stage_b_color)
+        ax.text(x + 0.02, y + 0.09, f"Primary Stage A blocker: {stage_a_primary_blocker(snap)}", fontsize=11)
+        if snap is not None:
+            low_states = snap.low_occ_states or snap.tail_low_states
+            if low_states:
+                ax.text(x + 0.02, y + 0.05, f"Weak λ states: {', '.join('λ'+str(v) for v in low_states[:5])}", fontsize=10, color="#666666")
+            elif snap.rollback:
+                ax.text(x + 0.02, y + 0.05, f"Rollback state: {snap.rollback}", fontsize=10, color="#666666")
+        ax.add_patch(Rectangle((x + 0.02, y + 0.025), w - 0.04, 0.022, facecolor="#edf2f7", edgecolor="#d9dce3", linewidth=0.6))
+        ax.add_patch(Rectangle((x + 0.02, y + 0.025), (w - 0.04) * frac, 0.022, facecolor=LEG_COLORS[leg], edgecolor="none"))
+        ax.text(x + w - 0.02, y + 0.052, f"{spent:.1f}/{budget:.1f} ns", fontsize=10, ha="right", color="#555555")
+
+    x, y, w, h = card_positions["totals"]
+    macros = max((m.macro_index for m in run.macro_starts), default=0)
+    ax.text(x + 0.02, y + 0.22, f"Macros detected: {macros}", fontsize=11)
+    ax.text(x + 0.02, y + 0.18, f"Optimization epochs: {len(run.optimization_epochs)}", fontsize=11)
+    ax.text(x + 0.02, y + 0.14, f"Production artifacts: {len(run.production_artifacts)}", fontsize=11)
+    ax.text(x + 0.02, y + 0.10, f"Fresh Stage B probes: {sum(1 for s in run.stage_b if s.fresh_probe_result)}", fontsize=11)
+    ax.text(x + 0.02, y + 0.06, f"Warnings: {len(run.warnings)}", fontsize=11)
+    if run.optimization_epochs:
+        last = run.optimization_epochs[-1]
+        ax.text(x + 0.02, y + 0.02, f"Last residual: {last.residual:.3f}" if last.residual is not None else "Last residual: -", fontsize=10, color="#555555")
+
+    x, y, w, h = card_positions["notes"]
+    lines: List[str] = []
+    solvent_last = latest_stage_a_snapshot(run, "solvent")
+    vacuum_last = latest_stage_a_snapshot(run, "vacuum")
+    if solvent_last is not None:
+        lines.append(
+            f"Solvent is currently limited by {stage_a_primary_blocker(solvent_last)}; latest rollback state: {solvent_last.rollback or '-'}"
+        )
+    if vacuum_last is not None:
+        lines.append(
+            f"Vacuum status is {stage_b_status_text(run, 'vacuum')} with Stage A blocker {stage_a_primary_blocker(vacuum_last)}."
+        )
+    if run.optimization_epochs:
+        last = run.optimization_epochs[-1]
+        lines.append(
+            f"The most recent optimization epoch targeted pools '{last.block_name}' with accepted residual {last.accepted_residual if last.accepted_residual is not None else last.residual}."
+        )
+    if not lines:
+        lines.append("No summary interpretation available.")
+    y_text = y + h - 0.07
+    for line in lines:
+        ax.text(x + 0.02, y_text, line, fontsize=11, va="top")
+        y_text -= 0.08
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def write_timeline_and_performance(path: Path, run: RunRecord) -> None:
+    fig, (ax_timeline, ax_perf) = plt.subplots(2, 1, figsize=(14, 8), gridspec_kw={"height_ratios": [2.2, 1.4]})
+
+    legs = ["solvent", "vacuum"]
+    y_map = {"solvent": 1.0, "vacuum": 0.0}
+    cumulative_by_leg = {leg: 0.0 for leg in legs}
+    perf_points: Dict[str, List[Tuple[float, float, str]]] = defaultdict(list)
+    phase_segments: List[Tuple[str, str, float, float]] = []
+    for event in run.phase_events:
+        if event.leg not in y_map:
+            continue
+        if event.kind == "end" and event.md_ns is not None:
+            start = cumulative_by_leg[event.leg]
+            end = start + event.md_ns
+            phase_segments.append((event.leg, event.phase, start, end))
+            cumulative_by_leg[event.leg] = end
+            if event.steps_per_s is not None:
+                perf_points[event.leg].append((end, event.steps_per_s, event.phase))
+
+    apply_axis_style(ax_timeline)
+    for leg, phase, start, end in phase_segments:
+        ax_timeline.broken_barh(
+            [(start, max(end - start, 1e-6))],
+            (y_map[leg] - 0.18, 0.36),
+            facecolors=PHASE_COLORS.get(phase, "#888888"),
+            edgecolors="none",
+            alpha=0.95,
+        )
+    event_styles = {
+        "probe_enter": ("^", "#f77f00", "probe"),
+        "probe_continue": ("^", "#f77f00", "probe cont."),
+        "cooldown": ("x", "#4d96ff", "cooldown"),
+        "leg_frozen": ("|", "#2a9d8f", "frozen"),
+        "probe_retry_keep": ("s", "#e76f51", "retry keep"),
+        "probe_retry_grow": ("s", "#e76f51", "retry grow"),
+        "probe_retry_near_pass": ("D", "#f4a261", "near pass"),
+        "split_only_continue": ("P", "#7b2cbf", "split cont."),
+    }
+    used_labels: set = set()
+    for event in run.control_events:
+        if event.leg not in y_map or event.global_ns is None or event.event_type not in event_styles:
+            continue
+        marker, color, label = event_styles[event.event_type]
+        ax_timeline.scatter(
+            [event.global_ns],
+            [y_map[event.leg] + 0.28],
+            marker=marker,
+            color=color,
+            s=60,
+            label=label if label not in used_labels else "",
+            zorder=4,
+        )
+        used_labels.add(label)
+
+    ax_timeline.set_yticks([1.0, 0.0], ["Solvent", "Vacuum"])
+    max_x = max((end for _, _, _, end in phase_segments), default=1.0)
+    ax_timeline.set_xlim(0.0, max_x * 1.02)
+    ax_timeline.set_xlabel("Cumulative AWH MD time (ns)")
+    ax_timeline.set_title("Phase Timeline And Control Events", loc="left", fontsize=15, fontweight="bold")
+    phase_handles = [Patch(facecolor=color, edgecolor="none", label=phase) for phase, color in PHASE_COLORS.items()]
+    event_handles = [
+        Line2D([0], [0], marker=event_styles[name][0], color="w", markerfacecolor=event_styles[name][1], markeredgecolor=event_styles[name][1], linestyle="None", label=event_styles[name][2])
+        for name in event_styles if event_styles[name][2] in used_labels
+    ]
+    ax_timeline.legend(handles=phase_handles + event_handles, loc="upper center", bbox_to_anchor=(0.5, 1.22), ncol=4, frameon=False, fontsize=9)
+
+    apply_axis_style(ax_perf)
+    for leg in legs:
+        pts = perf_points.get(leg, [])
+        if not pts:
+            continue
+        xs = [x for x, _, _ in pts]
+        ys = [y for _, y, _ in pts]
+        ax_perf.plot(xs, ys, color=LEG_COLORS[leg], linewidth=2.2, label=leg_title(leg))
+        for x, y, phase in pts:
+            ax_perf.scatter(x, y, color=LEG_COLORS[leg], marker=PHASE_MARKERS.get(phase, "o"), s=38, alpha=0.95)
+    ax_perf.set_title("Throughput By Completed Phase", loc="left", fontsize=14, fontweight="bold")
+    ax_perf.set_xlabel("Cumulative AWH MD time (ns)")
+    ax_perf.set_ylabel("steps / s")
+    ax_perf.legend(loc="upper left", frameon=False)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def write_stage_a_gate_heatmap(path: Path, run: RunRecord) -> None:
+    gates = ["df", "ESS", "linN", "RT", "endpoint", "tail", "occ", "ready"]
+    gate_labels = ["df", "ESS", "lin N_eff", "round trips", "endpoint", "tail", "low-occ", "stable streak"]
+    cmap = mcolors.ListedColormap([GATE_PASS_COLORS[-1], GATE_PASS_COLORS[0], GATE_PASS_COLORS[1]])
+    bounds = [-1.5, -0.5, 0.5, 1.5]
+    norm = mcolors.BoundaryNorm(bounds, cmap.N)
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=False)
+    for ax, leg in zip(axes, ("solvent", "vacuum")):
+        snaps = get_leg_stage_a(run, leg)
+        if not snaps:
+            ax.set_axis_off()
+            continue
+        mat = np.full((len(gates), len(snaps)), -1, dtype=float)
+        for j, snap in enumerate(snaps):
+            for i, gate in enumerate(gates):
+                mat[i, j] = stage_a_gate_value(snap, gate)
+        ax.imshow(mat, aspect="auto", interpolation="nearest", cmap=cmap, norm=norm)
+        ax.set_yticks(range(len(gates)), gate_labels)
+        ax.set_xticks(range(len(snaps)))
+        ax.set_xticklabels([str(i + 1) for i in range(len(snaps))], fontsize=8)
+        ax.set_title(f"Stage A Gate Matrix — {leg_title(leg)}", loc="left", fontsize=14, fontweight="bold")
+        ax.set_ylabel("gate")
+        for xpos, macro in macro_boundaries_from_stage_a(run, leg):
+            ax.axvline(xpos - 0.5, color="#495057", linewidth=1.0, linestyle="--", alpha=0.8)
+            ax.text(xpos - 0.35, -0.85, f"M{macro}", fontsize=8, color="#495057")
+        ax.set_xlim(-0.5, len(snaps) - 0.5)
+        ax.grid(False)
+        for spine in ax.spines.values():
+            spine.set_color("#d0d7de")
+    axes[-1].set_xlabel("Stage A block index")
+    fig.suptitle("Stage A Readiness Gates", x=0.05, ha="left", fontsize=18, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def write_stage_a_metric_traces(path: Path, run: RunRecord) -> None:
+    fig, axes = plt.subplots(4, 1, figsize=(14, 11), sharex=True)
+    configs = [
+        ("df", "df", lambda s: s.df, lambda s: s.df_ok),
+        ("ESS", "ESS", lambda s: s.ess, lambda s: s.ess_ok),
+        ("Endpoint band / requirement", "occupancy", None, None),
+        ("Tail min / occ min", "occupancy", None, None),
+    ]
+    for ax, (title, ylabel, getter, ok_getter) in zip(axes, configs):
+        apply_axis_style(ax)
+        ax.set_title(title, loc="left", fontsize=14, fontweight="bold")
+        for leg in ("solvent", "vacuum"):
+            snaps = get_leg_stage_a(run, leg)
+            xs = list(range(1, len(snaps) + 1))
+            if getter is not None:
+                ys = [getter(s) for s in snaps]
+                pts = [(x, y) for x, y in zip(xs, ys) if y is not None]
+                if pts:
+                    ax.plot([x for x, _ in pts], [y for _, y in pts], color=LEG_COLORS[leg], linewidth=2.2, label=leg_title(leg))
+                if ok_getter is not None:
+                    good = [(x, getter(s)) for x, s in zip(xs, snaps) if getter(s) is not None and ok_getter(s) is True]
+                    bad = [(x, getter(s)) for x, s in zip(xs, snaps) if getter(s) is not None and ok_getter(s) is False]
+                    if good:
+                        ax.scatter([x for x, _ in good], [y for _, y in good], color="#2a9d8f", s=24, zorder=4)
+                    if bad:
+                        ax.scatter([x for x, _ in bad], [y for _, y in bad], color="#d62828", s=24, zorder=4)
+            elif title.startswith("Endpoint"):
+                band = [(x, s.endpoint_band) for x, s in zip(xs, snaps) if s.endpoint_band is not None]
+                low = [(x, s.endpoint_low) for x, s in zip(xs, snaps) if s.endpoint_low is not None]
+                req = [(x, s.endpoint_required) for x, s in zip(xs, snaps) if s.endpoint_required is not None]
+                if band:
+                    ax.plot([x for x, _ in band], [y for _, y in band], color=LEG_COLORS[leg], linewidth=2.0, label=f"{leg_title(leg)} band")
+                if low:
+                    ax.plot([x for x, _ in low], [y for _, y in low], color=LEG_COLORS[leg], linewidth=1.5, linestyle="--", alpha=0.9, label=f"{leg_title(leg)} endpoint low")
+                if req:
+                    ax.plot([x for x, _ in req], [y for _, y in req], color=LEG_COLORS[leg], linewidth=1.0, linestyle=":", alpha=0.85, label=f"{leg_title(leg)} requirement")
+            else:
+                tail = [(x, s.tail_min) for x, s in zip(xs, snaps) if s.tail_min is not None]
+                occ = [(x, s.occ_min) for x, s in zip(xs, snaps) if s.occ_min is not None]
+                if tail:
+                    ax.plot([x for x, _ in tail], [y for _, y in tail], color=LEG_COLORS[leg], linewidth=2.0, label=f"{leg_title(leg)} tail min")
+                if occ:
+                    ax.plot([x for x, _ in occ], [y for _, y in occ], color=LEG_COLORS[leg], linewidth=1.5, linestyle="--", alpha=0.95, label=f"{leg_title(leg)} occ min")
+        ax.set_ylabel(ylabel)
+        ax.legend(loc="upper left", ncol=3, fontsize=8, frameon=False)
+    axes[-1].set_xlabel("Stage A block index")
+    fig.suptitle("Stage A Metric Traces", x=0.05, ha="left", fontsize=18, fontweight="bold")
+    fig.subplots_adjust(top=0.88, hspace=0.45, wspace=0.2)
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def write_lambda_issue_heatmap(path: Path, run: RunRecord) -> None:
+    n_lambda = max_lambda_state(run)
+    cmap = mcolors.ListedColormap([LAMBDA_FLAG_COLORS[i] for i in range(4)])
+    bounds = [-0.5, 0.5, 1.5, 2.5, 3.5]
+    norm = mcolors.BoundaryNorm(bounds, cmap.N)
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=False)
+    for ax, leg in zip(axes, ("solvent", "vacuum")):
+        snaps = get_leg_stage_a(run, leg)
+        mat = np.zeros((n_lambda, max(1, len(snaps))), dtype=int)
+        for block_idx, snap in enumerate(snaps):
+            for lam in snap.low_occ_states:
+                if 1 <= lam <= n_lambda:
+                    mat[n_lambda - lam, block_idx] |= 1
+            for lam in snap.tail_low_states:
+                if 1 <= lam <= n_lambda:
+                    mat[n_lambda - lam, block_idx] |= 2
+        ax.imshow(mat, aspect="auto", interpolation="nearest", cmap=cmap, norm=norm)
+        ax.set_title(f"Problematic λ-State Incidence — {leg_title(leg)}", loc="left", fontsize=14, fontweight="bold")
+        ax.set_ylabel("λ state")
+        ax.set_yticks(np.linspace(0, n_lambda - 1, min(n_lambda, 8)).astype(int))
+        ax.set_yticklabels([str(n_lambda - int(v)) for v in np.linspace(0, n_lambda - 1, min(n_lambda, 8)).astype(int)])
+        ax.set_xticks(range(len(snaps)))
+        ax.set_xticklabels([str(i + 1) for i in range(len(snaps))], fontsize=8)
+        for xpos, macro in macro_boundaries_from_stage_a(run, leg):
+            ax.axvline(xpos - 0.5, color="#495057", linewidth=1.0, linestyle="--", alpha=0.8)
+            ax.text(xpos - 0.35, -0.85, f"M{macro}", fontsize=8, color="#495057")
+        ax.grid(False)
+        for spine in ax.spines.values():
+            spine.set_color("#d0d7de")
+    axes[-1].set_xlabel("Stage A block index")
+    handles = [
+        Patch(facecolor=LAMBDA_FLAG_COLORS[0], edgecolor="none", label="none"),
+        Patch(facecolor=LAMBDA_FLAG_COLORS[1], edgecolor="none", label="low_occ"),
+        Patch(facecolor=LAMBDA_FLAG_COLORS[2], edgecolor="none", label="tail_low"),
+        Patch(facecolor=LAMBDA_FLAG_COLORS[3], edgecolor="none", label="both"),
+    ]
+    axes[0].legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 1.25), ncol=4, frameon=False)
+    fig.suptitle("Where Stage A Is Struggling", x=0.05, ha="left", fontsize=18, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def stage_b_state_strip(run: RunRecord, leg: str) -> np.ndarray:
+    blocks = len(get_leg_stage_a(run, leg))
+    state = np.zeros(max(1, blocks), dtype=int)
+    lines = block_line_numbers(run, leg)
+    if not lines:
+        return state
+    cached_events = [ev for ev in run.control_events if ev.leg == leg and ev.event_type == "stage_b_cached"]
+    cooldown_events = [ev for ev in run.control_events if ev.leg == leg and ev.event_type == "cooldown"]
+    for ev in cached_events:
+        idx = block_index_for_line(run, leg, ev.line_no)
+        if idx is None:
+            continue
+        failure = str(ev.details.get("failure", ""))
+        state[idx] = STAGE_B_STATE_ORDER.index("cached_pass" if failure == "passed" else "cached_fail")
+    for ev in cooldown_events:
+        idx = block_index_for_line(run, leg, ev.line_no)
+        if idx is None:
+            continue
+        state[idx] = STAGE_B_STATE_ORDER.index("cooldown")
+    for snap in get_leg_stage_b(run, leg):
+        idx = block_index_for_line(run, leg, snap.line_no)
+        if idx is None:
+            continue
+        state[idx] = STAGE_B_STATE_ORDER.index("fresh_pass" if (snap.failure_mode == "passed") else "fresh_fail")
+    return state.reshape(1, -1)
+
+
+def write_stage_b_decisions(path: Path, run: RunRecord) -> None:
+    fig = plt.figure(figsize=(14, 10))
+    gs = fig.add_gridspec(4, 2, height_ratios=[0.35, 1.75, 0.35, 1.75], hspace=0.45, wspace=0.2)
+    cmap = mcolors.ListedColormap([STAGE_B_STATE_COLORS[name] for name in STAGE_B_STATE_ORDER])
+    bounds = np.arange(len(STAGE_B_STATE_ORDER) + 1) - 0.5
+    norm = mcolors.BoundaryNorm(bounds, cmap.N)
+
+    for col, leg in enumerate(("solvent", "vacuum")):
+        ax_strip = fig.add_subplot(gs[0, col])
+        strip = stage_b_state_strip(run, leg)
+        ax_strip.imshow(strip, aspect="auto", interpolation="nearest", cmap=cmap, norm=norm)
+        ax_strip.set_title(f"Stage B decision strip — {leg_title(leg)}", loc="left", fontsize=13, fontweight="bold")
+        ax_strip.set_yticks([])
+        ax_strip.set_xticks(range(strip.shape[1]))
+        ax_strip.set_xticklabels([str(i + 1) for i in range(strip.shape[1])], fontsize=8)
+        ax_strip.set_xlabel("Stage A block index")
+        for xpos, macro in macro_boundaries_from_stage_a(run, leg):
+            ax_strip.axvline(xpos - 0.5, color="#495057", linewidth=1.0, linestyle="--", alpha=0.8)
+            ax_strip.text(xpos - 0.35, -0.8, f"M{macro}", fontsize=8, color="#495057")
+        for spine in ax_strip.spines.values():
+            spine.set_color("#d0d7de")
+
+        ax = fig.add_subplot(gs[1, col])
+        apply_axis_style(ax)
+        fresh = [snap for snap in get_leg_stage_b(run, leg) if snap.fresh_probe_result and snap.attempt_index is not None]
+        if fresh:
+            split = finite_xy([(snap.attempt_index, snap.split_gap) for snap in fresh])
+            parity = finite_xy([(snap.attempt_index, snap.parity_gap) for snap in fresh])
+            endpoint = finite_xy([(snap.attempt_index, snap.endpoint_parity_gap) for snap in fresh])
+            support = finite_xy([
+                (snap.attempt_index, (snap.n_supported_states / snap.n_states) if snap.n_supported_states is not None and snap.n_states else None)
+                for snap in fresh
+            ])
+            if split:
+                ax.plot([x for x, _ in split], [y for _, y in split], color=METRIC_COLORS["split_gap"], linewidth=2.1, label="split gap")
+            if parity:
+                ax.plot([x for x, _ in parity], [y for _, y in parity], color=METRIC_COLORS["parity_gap"], linewidth=2.1, label="parity gap")
+            if endpoint:
+                ax.plot([x for x, _ in endpoint], [y for _, y in endpoint], color=METRIC_COLORS["endpoint_parity_gap"], linewidth=1.8, linestyle="--", label="endpoint parity")
+            for snap in fresh:
+                if snap.attempt_index is None or snap.parity_gap is None:
+                    continue
+                color = FAILURE_COLORS.get(snap.failure_mode or "not_checked", "#888888")
+                ax.scatter([snap.attempt_index], [snap.parity_gap], color=color, s=45, zorder=4)
+            ax2 = ax.twinx()
+            ax2.grid(False)
+            if support:
+                ax2.plot([x for x, _ in support], [y for _, y in support], color=METRIC_COLORS["support_fraction"], linewidth=1.6, alpha=0.9, label="support frac")
+                ax2.set_ylim(0.0, 1.05)
+                ax2.set_ylabel("support fraction")
+            else:
+                ax2.set_yticks([])
+            ax.set_xlabel("Fresh Stage B probe attempt")
+            ax.set_ylabel("gap (kT)")
+            ax.set_title(f"Fresh Stage B probes — {leg_title(leg)}", loc="left", fontsize=13, fontweight="bold")
+            lines1, labels1 = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right", frameon=False, fontsize=8)
+        else:
+            ax.text(0.5, 0.5, "No fresh Stage B probes", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+
+        ax3 = fig.add_subplot(gs[3, col])
+        apply_axis_style(ax3)
+        fresh_frames = finite_xy([(snap.attempt_index, float(snap.frames)) for snap in fresh if snap.attempt_index is not None and snap.frames is not None])
+        probe_size_points: List[Tuple[float, float]] = []
+        c = 0
+        for ev in run.control_events:
+            if ev.leg != leg or ev.event_type not in {"probe_enter", "probe_continue", "probe_retry_keep", "probe_retry_grow", "probe_retry_near_pass", "split_only_continue"}:
+                continue
+            probe_steps = ev.details.get("probe_steps") or ev.details.get("next_probe_steps")
+            if isinstance(probe_steps, (int, float)):
+                c += 1
+                probe_size_points.append((float(c), float(probe_steps)))
+        if fresh_frames:
+            ax3.plot([x for x, _ in fresh_frames], [y for _, y in fresh_frames], color=METRIC_COLORS["frames"], linewidth=2.1, label="retained frames")
+        if probe_size_points:
+            ax3_t = ax3.twinx()
+            ax3_t.grid(False)
+            ax3_t.plot([x for x, _ in probe_size_points], [y for _, y in probe_size_points], color=METRIC_COLORS["probe_ns"], linewidth=1.8, linestyle="--", label="probe steps")
+            ax3_t.set_ylabel("probe steps")
+            lines1, labels1 = ax3.get_legend_handles_labels()
+            lines2, labels2 = ax3_t.get_legend_handles_labels()
+            ax3.legend(lines1 + lines2, labels1 + labels2, loc="upper right", frameon=False, fontsize=8)
+        ax3.set_title(f"Frame retention and probe growth — {leg_title(leg)}", loc="left", fontsize=13, fontweight="bold")
+        ax3.set_xlabel("Attempt / control-event index")
+        ax3.set_ylabel("retained frames")
+
+    handles = [Patch(facecolor=STAGE_B_STATE_COLORS[name], edgecolor="none", label=name.replace("_", " ")) for name in STAGE_B_STATE_ORDER]
+    fig.legend(handles=handles, loc="upper center", ncol=6, frameon=False, bbox_to_anchor=(0.5, 1.01), fontsize=9)
+    fig.suptitle("Stage B Decision History", x=0.05, ha="left", fontsize=18, fontweight="bold")
+    fig.subplots_adjust(top=0.88, hspace=0.45, wspace=0.2)
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def write_optimization_panels(path: Path, run: RunRecord) -> None:
+    epochs = run.optimization_epochs
+    if not epochs:
+        return
+    boundaries = macro_boundaries_from_epochs(run)
+    fig, axes = plt.subplots(3, 2, figsize=(14, 12), sharex=True)
+    axes = axes.ravel()
+
+    def add_boundaries(ax: plt.Axes) -> None:
+        for v in boundaries:
+            ax.axvline(v.value, color=v.color, linestyle="--", linewidth=1.0, alpha=v.alpha)
+            if v.label:
+                ax.text(v.value, 0.98, v.label, transform=ax.get_xaxis_transform(), ha="left", va="top", fontsize=8, color=v.color)
+
+    x = [e.global_epoch_index for e in epochs]
+    plots = [
+        (axes[0], "Residuals", "kT", [
+            ("Residual", [e.residual for e in epochs], METRIC_COLORS["residual"]),
+            ("Accepted", [e.accepted_residual for e in epochs], METRIC_COLORS["accepted_residual"]),
+            ("Prediction", [e.prediction for e in epochs], METRIC_COLORS["prediction"]),
+            ("Target", [e.target for e in epochs], METRIC_COLORS["target"]),
+        ]),
+        (axes[1], "Trust region", "KL / alpha / step", [
+            ("Est. KL", [e.kl_est for e in epochs], METRIC_COLORS["kl_est"]),
+            ("KL scaling", [e.kl_scaling for e in epochs], METRIC_COLORS["kl_scaling"]),
+            ("Alpha", [e.line_search_alpha for e in epochs], METRIC_COLORS["line_search_alpha"]),
+            ("Max φ step", [e.actual_max_phi_step for e in epochs], METRIC_COLORS["max_phi_step"]),
+        ]),
+        (axes[2], "Gradients", "norm", [
+            ("Grad norm", [e.grad_norm for e in epochs], METRIC_COLORS["grad_norm"]),
+            ("Grad max", [e.grad_max for e in epochs], METRIC_COLORS["grad_max"]),
+        ]),
+        (axes[3], "Fisher conditioning", "log10(cond) / trunc", [
+            ("log10(cond)", [safe_log10(e.fim_raw_cond) for e in epochs], METRIC_COLORS["fim_cond"]),
+            ("Truncated eigs", [float(e.truncated_eigs) if e.truncated_eigs is not None else None for e in epochs], METRIC_COLORS["truncated_eigs"]),
+        ]),
+        (axes[4], "Per-leg dG", "kT", [
+            ("Solvent dG", [e.leg_metrics.get("solvent", {}).get("dG") for e in epochs], LEG_COLORS["solvent"]),
+            ("Vacuum dG", [e.leg_metrics.get("vacuum", {}).get("dG") for e in epochs], LEG_COLORS["vacuum"]),
+        ]),
+        (axes[5], "Per-leg support", "ESS / log10(N_active)", [
+            ("Solvent ESS", [e.leg_metrics.get("solvent", {}).get("ESS") for e in epochs], LEG_COLORS["solvent"]),
+            ("Vacuum ESS", [e.leg_metrics.get("vacuum", {}).get("ESS") for e in epochs], LEG_COLORS["vacuum"]),
+            ("Solvent log10(N_active)", [safe_log10(e.leg_metrics.get("solvent", {}).get("N_active")) for e in epochs], "#b56576"),
+            ("Vacuum log10(N_active)", [safe_log10(e.leg_metrics.get("vacuum", {}).get("N_active")) for e in epochs], "#6d597a"),
+        ]),
+    ]
+
+    for ax, title, ylabel, series_list in plots:
+        apply_axis_style(ax)
+        for name, values, color in series_list:
+            pts = finite_xy(list(zip(x, values)))
+            if pts:
+                linestyle = "--" if name in {"Prediction", "Target", "Solvent log10(N_active)", "Vacuum log10(N_active)"} else "-"
+                ax.plot([a for a, _ in pts], [b for _, b in pts], color=color, linewidth=2.0, linestyle=linestyle, label=name)
+        add_boundaries(ax)
+        ax.set_title(title, loc="left", fontsize=13, fontweight="bold")
+        ax.set_ylabel(ylabel)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(loc="upper left", fontsize=8, frameon=False)
+    axes[-2].set_xlabel("Global optimization epoch")
+    axes[-1].set_xlabel("Global optimization epoch")
+    fig.suptitle("Optimization Diagnostics", x=0.05, ha="left", fontsize=18, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _pool_name_of(param_name: str) -> str:
+    raw = param_name[len("derived_charge:"):] if param_name.startswith("derived_charge:") else param_name
+    if raw.startswith("pool_"):
+        rest = raw[len("pool_"):]
+        for sep in ("_atom_", "_charge_"):
+            idx = rest.find(sep)
+            if idx != -1:
+                return rest[:idx]
+    return ""
+
+
+def parameter_panels(run: RunRecord) -> List[Tuple[str, List[PanelSpec]]]:
+    epochs = run.optimization_epochs
+    if not epochs:
+        return []
+    param_names: List[str] = []
+    for epoch in epochs:
+        for name in epoch.parameters:
+            if name not in param_names:
+                param_names.append(name)
+
+    derived_charges: Dict[str, Tuple[str, str, str]] = {}
+    for name in param_names:
+        if name.endswith("_χ"):
+            eta_key = name[:-1] + "η"
+            if eta_key in param_names:
+                label = name
+                if label.startswith("pool_"):
+                    label = label[len("pool_"):]
+                if label.endswith("_χ"):
+                    label = label[:-2]
+                label = label.replace("_charge_", "/") + " (q)"
+                derived_charges[f"derived_charge:{name}"] = (label, name, eta_key)
+
+    all_names = param_names + list(derived_charges.keys())
+    pools_ordered: List[str] = []
+    by_pool: Dict[str, List[str]] = {}
+    for name in all_names:
+        pool = _pool_name_of(name)
+        if pool not in by_pool:
+            pools_ordered.append(pool)
+            by_pool[pool] = []
+        by_pool[pool].append(name)
+
+    palette = [
+        "#c2552d", "#2d6db6", "#3a7d44", "#7b2cbf", "#d17b0f", "#ef476f", "#118ab2", "#6d597a", "#4c956c", "#264653",
+    ]
+    macro_boundaries = macro_boundaries_from_epochs(run)
+    panels_by_file: List[Tuple[str, List[PanelSpec]]] = []
+    for pool in pools_ordered:
+        series: List[SeriesSpec] = []
+        zero_based = False
+        for idx, name in enumerate(by_pool[pool]):
+            color = palette[idx % len(palette)]
+            if name in derived_charges:
+                label, chi_key, eta_key = derived_charges[name]
+                raw_points: List[Tuple[float, float]] = []
+                for epoch in epochs:
+                    chi = epoch.parameters.get(chi_key)
+                    eta = epoch.parameters.get(eta_key)
+                    if chi is not None and eta is not None and eta != 0.0:
+                        raw_points.append((epoch.global_epoch_index, -chi / eta))
+            else:
+                raw_points = [
+                    (epoch.global_epoch_index, epoch.parameters[name])
+                    for epoch in epochs
+                    if name in epoch.parameters and epoch.parameters[name] is not None
+                ]
+                label = name
+            if not raw_points:
+                continue
+            baseline = raw_points[0][1]
+            if abs(baseline) > 1e-12:
+                points = [(x, 100.0 * (y - baseline) / baseline) for x, y in raw_points]
+                display_label = label
+            else:
+                zero_based = True
+                points = [(x, y - baseline) for x, y in raw_points]
+                display_label = label + " (Δ)"
+            series.append(SeriesSpec(display_label, points, color, stroke_width=2.0))
+        if not series:
+            continue
+        pool_slug = pool if pool else "other"
+        note = "Percent drift from the first optimization epoch." if not zero_based else "Percent drift from epoch 1; zero-based series are shown as absolute deltas."
+        panels_by_file.append(
+            (
+                f"parameter_trajectories_{pool_slug}.png",
+                [
+                    PanelSpec(
+                        title=f"Parameter motion — {pool}" if pool else "Parameter motion",
+                        x_label="Global optimization epoch",
+                        y_label="drift (%) / Δ",
+                        series=series,
+                        vlines=macro_boundaries,
+                        notes=[note],
+                    )
+                ],
+            )
+        )
+    return panels_by_file
 
 
 def compute_range(panel: PanelSpec) -> Tuple[float, float]:
@@ -1196,78 +2053,50 @@ def compute_x_range(panel: PanelSpec) -> Tuple[float, float]:
     return x_min, x_max
 
 
-def write_multiplot(path: Path, title: str, panels: Sequence[PanelSpec], width: int = 1400, panel_height: int = 250) -> None:
-
+def write_multiplot(path: Path, title: str, panels: Sequence[PanelSpec], width: int = 1400, panel_height: int = 260) -> None:
     fig_height = max(3.0, len(panels) * (panel_height / 100.0) + 0.8)
     fig, axes = plt.subplots(len(panels), 1, figsize=(width / 100.0, fig_height), squeeze=False)
     axes_flat = [ax for row in axes for ax in row]
     fig.suptitle(title, fontsize=18, fontweight="bold", x=0.05, ha="left")
-
     for ax, panel in zip(axes_flat, panels):
+        apply_axis_style(ax)
         x_min, x_max = compute_x_range(panel)
         y_min, y_max = compute_range(panel)
         ax.set_title(panel.title, fontsize=13, fontweight="bold", loc="left")
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(y_min, y_max)
-        ax.grid(True, which="major", color="#e9e9ef", linewidth=0.8)
-        ax.set_facecolor("#ffffff")
-
         for hline in panel.hlines:
-            ax.axhline(hline.value, color=hline.color, linewidth=1.3, linestyle="--" if hline.dashed else "-")
+            ax.axhline(hline.value, color=hline.color, linewidth=1.3, linestyle="--" if hline.dashed else "-", alpha=hline.alpha)
             if hline.label:
                 ax.text(0.995, hline.value, hline.label, transform=ax.get_yaxis_transform(), ha="right", va="bottom", fontsize=8, color=hline.color)
-
         for vline in panel.vlines:
-            ax.axvline(vline.value, color=vline.color, linewidth=1.2, linestyle="--" if vline.dashed else "-", alpha=0.75)
+            ax.axvline(vline.value, color=vline.color, linewidth=1.2, linestyle="--" if vline.dashed else "-", alpha=vline.alpha)
             if vline.label:
                 ax.text(vline.value, 0.98, vline.label, transform=ax.get_xaxis_transform(), ha="left", va="top", fontsize=8, color=vline.color)
-
-        maxd = -math.inf
-        minn = math.inf
-        maxx = -math.inf
-
         for series in panel.series:
-            xs = [x for x, y in series.points if math.isfinite(x) and math.isfinite(y)]
-            if "Parameter Trajectories" in panel.title:
-                v0 = series.points[0][1]
-                if v0 == 0.0:
-                    ys = [y for x, y in series.points if math.isfinite(x) and math.isfinite(y)]
-                else:
-                    ys = [100*(y - v0)/v0 for x, y in series.points if math.isfinite(x) and math.isfinite(y)]
-                d = abs(max(ys)-min(ys))
-                if d > maxd:
-                    maxd = d
-                if min(ys) < minn:
-                    minn = min(ys)
-                if max(ys) > maxx:
-                    maxx = max(ys)
-            else:
-                ys = [y for x, y in series.points if math.isfinite(x) and math.isfinite(y)]
-            if not xs:
+            pts = finite_xy(series.points)
+            if not pts:
                 continue
             ax.plot(
-                xs,
-                ys,
+                [x for x, _ in pts],
+                [y for _, y in pts],
                 label=series.name,
                 color=series.color,
                 linewidth=series.stroke_width,
                 linestyle="--" if series.dashed else "-",
                 marker="o" if series.draw_markers else None,
                 markersize=3.0 if series.draw_markers else None,
+                alpha=series.alpha,
             )
-
         for marker in panel.markers:
-            if not (math.isfinite(marker.x) and math.isfinite(marker.y)):
-                continue
-            ax.scatter([marker.x], [marker.y], s=max(18.0, marker.radius * marker.radius * 2.4), color=marker.color, edgecolors="#ffffff", linewidths=0.8, zorder=4)
-            if marker.label:
-                ax.annotate(marker.label, (marker.x, marker.y), textcoords="offset points", xytext=(5, 6), fontsize=8, color=marker.color)
-
+            if math.isfinite(marker.x) and math.isfinite(marker.y):
+                ax.scatter([marker.x], [marker.y], s=max(18.0, marker.radius * marker.radius * 2.4), color=marker.color, marker=marker.marker, edgecolors="#ffffff", linewidths=0.8, zorder=4)
+                if marker.label:
+                    ax.annotate(marker.label, (marker.x, marker.y), textcoords="offset points", xytext=(5, 6), fontsize=8, color=marker.color)
         ax.set_xlabel(panel.x_label)
         ax.set_ylabel(panel.y_label)
         if panel.legend and panel.series:
             ax.legend(loc="upper left", fontsize=8, ncol=min(4, max(1, len(panel.series))), frameon=False)
-
         if panel.notes:
             ax.text(
                 0.995,
@@ -1280,533 +2109,9 @@ def write_multiplot(path: Path, title: str, panels: Sequence[PanelSpec], width: 
                 color="#666666",
                 bbox=dict(boxstyle="round,pad=0.25", facecolor="#ffffff", edgecolor="#dddddd", alpha=0.8),
             )
-
-    if "Parameter Trajectories" in panel.title:
-        ax.set_ylim(minn - maxd*0.05, maxx + maxd*0.05)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
-
-
-def write_timeline(path: Path, run: RunRecord) -> None:
-    fig, ax = plt.subplots(figsize=(14, 4.2))
-    legs = ["solvent", "vacuum"]
-    cumulative_segments: List[Tuple[str, str, float, float]] = []
-    cumulative_by_leg = {leg: 0.0 for leg in legs}
-    for event in run.phase_events:
-        if event.kind != "end" or event.md_ns is None or event.leg not in cumulative_by_leg:
-            continue
-        start = cumulative_by_leg[event.leg]
-        end = start + event.md_ns
-        cumulative_segments.append((event.leg, event.phase, start, end))
-        cumulative_by_leg[event.leg] = end
-
-    y_pos = {"solvent": 1.0, "vacuum": 0.0}
-    for leg, phase, start, end in cumulative_segments:
-        ax.broken_barh([(start, end - start)], (y_pos[leg] - 0.18, 0.36), facecolors=PHASE_COLORS.get(phase, "#888888"), edgecolors="none", alpha=0.9)
-
-    for event in run.control_events:
-        if event.event_type != "leg_frozen" or event.global_ns is None or event.leg not in y_pos:
-            continue
-        ax.axvline(event.global_ns, color="#2a9d8f", linestyle="--", linewidth=1.4, alpha=0.9)
-        ax.annotate(f"{event.leg} freeze m{event.macro_index}", (event.global_ns, y_pos[event.leg] + 0.2), textcoords="offset points", xytext=(4, 2), fontsize=8, color="#2a9d8f")
-
-    max_x = max((end for _, _, _, end in cumulative_segments), default=1.0)
-    ax.set_xlim(0.0, max_x * 1.02)
-    ax.set_ylim(-0.5, 1.5)
-    ax.set_yticks([1.0, 0.0], ["Solvent", "Vacuum"])
-    ax.set_xlabel("Global cumulative AWH MD ns")
-    ax.set_title("AWH Timeline", fontsize=18, fontweight="bold", loc="left")
-    ax.grid(True, axis="x", color="#ececec", linewidth=0.9)
-    ax.set_facecolor("#ffffff")
-    legend_handles = [Patch(facecolor=color, edgecolor="none", label=phase) for phase, color in PHASE_COLORS.items()]
-    legend_handles.append(Line2D([0], [0], color="#2a9d8f", linestyle="--", label="Leg frozen"))
-    ax.legend(handles=legend_handles, loc="upper center", ncol=min(4, len(legend_handles)), frameon=False, fontsize=9)
-    fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-
-def by_leg(records: Sequence[object], leg_name: str) -> List[object]:
-    return [record for record in records if getattr(record, "leg", None) == leg_name]
-
-
-def make_stage_a_panels(run: RunRecord) -> List[PanelSpec]:
-    panels: List[PanelSpec] = []
-    for metric_key, title, y_label, color in [
-        ("df", "Stage A Bias-Change", "df_mean", METRIC_COLORS["df"]),
-        ("ess", "Stage A Lambda ESS", "ESS", METRIC_COLORS["ess"]),
-        ("lin_neff", "Stage A Linear N_eff", "linear N_eff", METRIC_COLORS["lin_neff"]),
-        ("round_trips", "Stage A Round Trips", "round trips", METRIC_COLORS["round_trips"]),
-    ]:
-        series: List[SeriesSpec] = []
-        markers: List[MarkerSpec] = []
-        for leg in ("solvent", "vacuum"):
-            points = [
-                (snapshot.global_ns, getattr(snapshot, metric_key))
-                for snapshot in by_leg(run.stage_a, leg)
-                if snapshot.global_ns is not None and getattr(snapshot, metric_key) is not None
-            ]
-            if points:
-                series.append(SeriesSpec(leg.capitalize(), points, LEG_COLORS[leg], draw_markers=False))
-            ready_points = [
-                (snapshot.global_ns, getattr(snapshot, metric_key))
-                for snapshot in by_leg(run.stage_a, leg)
-                if snapshot.global_ns is not None and getattr(snapshot, metric_key) is not None and snapshot.stage_ready
-            ]
-            for x_val, y_val in ready_points:
-                markers.append(MarkerSpec(x_val, y_val, "#2a9d8f", radius=3.4))
-        panels.append(
-            PanelSpec(
-                title=title,
-                x_label="Global cumulative AWH MD ns",
-                y_label=y_label,
-                series=series,
-                markers=markers,
-                notes=["Green dots indicate Stage A ready blocks."],
-            )
-        )
-    return panels
-
-
-def make_stage_a_occupancy_panels(run: RunRecord) -> List[PanelSpec]:
-    panels: List[PanelSpec] = []
-    solvent = by_leg(run.stage_a, "solvent")
-    vacuum = by_leg(run.stage_a, "vacuum")
-    solvent_series = [
-        SeriesSpec(
-            "Endpoint band",
-            [(snap.global_ns, snap.endpoint_band) for snap in solvent if snap.global_ns is not None and snap.endpoint_band is not None],
-            METRIC_COLORS["endpoint_band"],
-        ),
-        SeriesSpec(
-            "Endpoint low",
-            [(snap.global_ns, snap.endpoint_low) for snap in solvent if snap.global_ns is not None and snap.endpoint_low is not None],
-            METRIC_COLORS["endpoint_low"],
-            dashed=True,
-        ),
-        SeriesSpec(
-            "Tail sum",
-            [(snap.global_ns, snap.tail_sum) for snap in solvent if snap.global_ns is not None and snap.tail_sum is not None],
-            METRIC_COLORS["tail_sum"],
-        ),
-        SeriesSpec(
-            "Tail min",
-            [(snap.global_ns, snap.tail_min) for snap in solvent if snap.global_ns is not None and snap.tail_min is not None],
-            METRIC_COLORS["tail_min"],
-            dashed=True,
-        ),
-        SeriesSpec(
-            "Occ min",
-            [(snap.global_ns, snap.occ_min) for snap in solvent if snap.global_ns is not None and snap.occ_min is not None],
-            METRIC_COLORS["occ_min"],
-        ),
-    ]
-    panels.append(
-        PanelSpec(
-            title="Stage A Occupancy: Solvent",
-            x_label="Global cumulative AWH MD ns",
-            y_label="occupancy",
-            series=solvent_series,
-        )
-    )
-    vacuum_series = [
-        SeriesSpec(
-            "Endpoint band",
-            [(snap.global_ns, snap.endpoint_band) for snap in vacuum if snap.global_ns is not None and snap.endpoint_band is not None],
-            METRIC_COLORS["endpoint_band"],
-        ),
-        SeriesSpec(
-            "Endpoint low",
-            [(snap.global_ns, snap.endpoint_low) for snap in vacuum if snap.global_ns is not None and snap.endpoint_low is not None],
-            METRIC_COLORS["endpoint_low"],
-            dashed=True,
-        ),
-        SeriesSpec(
-            "Occ min",
-            [(snap.global_ns, snap.occ_min) for snap in vacuum if snap.global_ns is not None and snap.occ_min is not None],
-            METRIC_COLORS["occ_min"],
-        ),
-    ]
-    panels.append(
-        PanelSpec(
-            title="Stage A Occupancy: Vacuum",
-            x_label="Global cumulative AWH MD ns",
-            y_label="occupancy",
-            series=vacuum_series,
-        )
-    )
-    return panels
-
-
-def make_stage_b_panels(run: RunRecord) -> List[PanelSpec]:
-    panels: List[PanelSpec] = []
-    for leg in ("solvent", "vacuum"):
-        fresh = [snap for snap in by_leg(run.stage_b, leg) if snap.fresh_probe_result and snap.attempt_index is not None]
-        if not fresh:
-            continue
-        series = [
-            SeriesSpec("Split gap", [(snap.attempt_index, snap.split_gap) for snap in fresh if snap.split_gap is not None], METRIC_COLORS["split_gap"]),
-            SeriesSpec("Parity gap", [(snap.attempt_index, snap.parity_gap) for snap in fresh if snap.parity_gap is not None], METRIC_COLORS["parity_gap"]),
-            SeriesSpec(
-                "Supported parity",
-                [(snap.attempt_index, snap.supported_parity_gap) for snap in fresh if snap.supported_parity_gap is not None],
-                METRIC_COLORS["supported_parity_gap"],
-                dashed=True,
-            ),
-            SeriesSpec(
-                "Endpoint parity",
-                [(snap.attempt_index, snap.endpoint_parity_gap) for snap in fresh if snap.endpoint_parity_gap is not None],
-                METRIC_COLORS["endpoint_parity_gap"],
-                dashed=True,
-            ),
-        ]
-        markers = [
-            MarkerSpec(
-                snap.attempt_index,
-                snap.parity_gap if snap.parity_gap is not None else 0.0,
-                FAILURE_COLORS.get(snap.failure_mode or "not_checked", "#777777"),
-                label="pass" if (snap.failure_mode or "") == "passed" else "",
-                radius=4.2,
-            )
-            for snap in fresh
-            if snap.parity_gap is not None
-        ]
-        panels.append(
-            PanelSpec(
-                title=f"Stage B Gaps: {leg.capitalize()}",
-                x_label="Fresh Stage B probe attempt",
-                y_label="gap (kT)",
-                series=series,
-                markers=markers,
-                notes=["Marker color encodes the Stage B failure mode."],
-            )
-        )
-        support_series = [
-            SeriesSpec(
-                "Support fraction",
-                [
-                    (snap.attempt_index, snap.n_supported_states / snap.n_states)
-                    for snap in fresh
-                    if snap.n_supported_states is not None and snap.n_states
-                ],
-                METRIC_COLORS["support_fraction"],
-            )
-        ]
-        panels.append(
-            PanelSpec(
-                title=f"Stage B Support Coverage: {leg.capitalize()}",
-                x_label="Fresh Stage B probe attempt",
-                y_label="fraction",
-                series=support_series,
-                y_min=0.0,
-                y_max=1.05,
-            )
-        )
-        probe_series = [
-            SeriesSpec(
-                "Retained frames",
-                [(snap.attempt_index, snap.frames) for snap in fresh if snap.frames is not None],
-                METRIC_COLORS["frames"],
-            )
-        ]
-        control_ns = []
-        for event in run.control_events:
-            if event.leg != leg:
-                continue
-            if event.event_type in {"probe_retry_keep", "probe_retry_grow", "probe_retry_near_pass"}:
-                probe_ns = event.details.get("next_probe_ns")
-                if isinstance(probe_ns, (int, float)):
-                    idx = len(control_ns) + 1
-                    control_ns.append((idx, float(probe_ns)))
-        if control_ns:
-            probe_series.append(SeriesSpec("Next probe ns", control_ns, METRIC_COLORS["probe_ns"], dashed=True))
-        panels.append(
-            PanelSpec(
-                title=f"Stage B Frames And Probe Size: {leg.capitalize()}",
-                x_label="Fresh Stage B probe attempt",
-                y_label="frames / ns",
-                series=probe_series,
-            )
-        )
-    return panels
-
-
-def make_optimization_panels(run: RunRecord) -> List[PanelSpec]:
-    epochs = run.optimization_epochs
-    if not epochs:
-        return []
-    boundaries = sorted({epoch.global_epoch_index for epoch in epochs if epoch.epoch_in_macro == 1})
-    panels: List[PanelSpec] = []
-    panels.append(
-        PanelSpec(
-            title="Optimization Residuals",
-            x_label="Global optimization epoch",
-            y_label="kT",
-            series=[
-                SeriesSpec(
-                    "Residual",
-                    [(epoch.global_epoch_index, epoch.residual) for epoch in epochs if epoch.residual is not None],
-                    METRIC_COLORS["residual"],
-                ),
-                SeriesSpec(
-                    "Accepted residual",
-                    [(epoch.global_epoch_index, epoch.accepted_residual) for epoch in epochs if epoch.accepted_residual is not None],
-                    METRIC_COLORS["accepted_residual"],
-                ),
-                SeriesSpec(
-                    "Prediction",
-                    [(epoch.global_epoch_index, epoch.prediction) for epoch in epochs if epoch.prediction is not None],
-                    METRIC_COLORS["prediction"],
-                    dashed=True,
-                ),
-                SeriesSpec(
-                    "Target",
-                    [(epoch.global_epoch_index, epoch.target) for epoch in epochs if epoch.target is not None],
-                    METRIC_COLORS["target"],
-                    dashed=True,
-                ),
-            ],
-            vlines=[VLineSpec(value, "#bbbbbb", label=f"m{epochs[value - 1].macro_index}" if 0 < value <= len(epochs) else "", dashed=True) for value in boundaries],
-        )
-    )
-    panels.append(
-        PanelSpec(
-            title="Optimization Trust Region",
-            x_label="Global optimization epoch",
-            y_label="KL / scaling / alpha / step",
-            series=[
-                SeriesSpec("Est. KL", [(epoch.global_epoch_index, epoch.kl_est) for epoch in epochs if epoch.kl_est is not None], METRIC_COLORS["kl_est"]),
-                SeriesSpec("KL scaling", [(epoch.global_epoch_index, epoch.kl_scaling) for epoch in epochs if epoch.kl_scaling is not None], METRIC_COLORS["kl_scaling"]),
-                SeriesSpec(
-                    "Line-search alpha",
-                    [(epoch.global_epoch_index, epoch.line_search_alpha) for epoch in epochs if epoch.line_search_alpha is not None],
-                    METRIC_COLORS["line_search_alpha"],
-                ),
-                SeriesSpec(
-                    "Max phi step",
-                    [(epoch.global_epoch_index, epoch.actual_max_phi_step) for epoch in epochs if epoch.actual_max_phi_step is not None],
-                    METRIC_COLORS["max_phi_step"],
-                ),
-            ],
-        )
-    )
-    panels.append(
-        PanelSpec(
-            title="Optimization Gradients And Fisher Conditioning",
-            x_label="Global optimization epoch",
-            y_label="gradient / condition / truncation",
-            series=[
-                SeriesSpec("Grad norm", [(epoch.global_epoch_index, epoch.grad_norm) for epoch in epochs if epoch.grad_norm is not None], METRIC_COLORS["grad_norm"]),
-                SeriesSpec("Grad max", [(epoch.global_epoch_index, epoch.grad_max) for epoch in epochs if epoch.grad_max is not None], METRIC_COLORS["grad_max"]),
-                SeriesSpec(
-                    "Truncated eigs",
-                    [(epoch.global_epoch_index, float(epoch.truncated_eigs)) for epoch in epochs if epoch.truncated_eigs is not None],
-                    METRIC_COLORS["truncated_eigs"],
-                ),
-                SeriesSpec(
-                    "log10(cond)",
-                    [
-                        (epoch.global_epoch_index, math.log10(epoch.fim_raw_cond))
-                        for epoch in epochs
-                        if epoch.fim_raw_cond is not None and epoch.fim_raw_cond > 0 and math.isfinite(epoch.fim_raw_cond)
-                    ],
-                    METRIC_COLORS["fim_cond"],
-                ),
-            ],
-            notes=["Fisher condition number is plotted as log10(cond)."],
-        )
-    )
-    for leg in ("solvent", "vacuum"):
-        leg_dg = []
-        leg_ess = []
-        leg_active_log = []
-        for epoch in epochs:
-            metric = epoch.leg_metrics.get(leg)
-            if not metric:
-                continue
-            leg_dg.append((epoch.global_epoch_index, metric.get("dG")))
-            leg_ess.append((epoch.global_epoch_index, metric.get("ESS")))
-            n_active = metric.get("N_active")
-            if n_active is not None and n_active > 0:
-                leg_active_log.append((epoch.global_epoch_index, math.log10(n_active)))
-        if leg_dg:
-            panels.append(
-                PanelSpec(
-                    title=f"Optimization dG: {leg.capitalize()}",
-                    x_label="Global optimization epoch",
-                    y_label="dG (kT)",
-                    series=[
-                        SeriesSpec("dG", [(x, y) for x, y in leg_dg if y is not None], METRIC_COLORS["dG"]),
-                    ],
-                )
-            )
-        if leg_ess or leg_active_log:
-            panels.append(
-                PanelSpec(
-                    title=f"Optimization Support: {leg.capitalize()}",
-                    x_label="Global optimization epoch",
-                    y_label="ESS / log10(N_active)",
-                    series=[
-                        SeriesSpec("ESS", [(x, y) for x, y in leg_ess if y is not None], METRIC_COLORS["ESS"]),
-                        SeriesSpec("log10(N_active)", [(x, y) for x, y in leg_active_log if y is not None], METRIC_COLORS["N_active"]),
-                    ],
-                    notes=["N_active is plotted as log10(N_active)."],
-                )
-            )
-    return panels
-
-
-def _pool_name_of(param_name: str) -> str:
-    """Extract the pool name from a parameter name of the form pool_<pool>_atom_... or pool_<pool>_charge_..."""
-    raw = param_name[len("derived_charge:"):] if param_name.startswith("derived_charge:") else param_name
-    if raw.startswith("pool_"):
-        rest = raw[len("pool_"):]
-        for sep in ("_atom_", "_charge_"):
-            idx = rest.find(sep)
-            if idx != -1:
-                return rest[:idx]
-    return ""
-
-
-def parameter_panels(run: RunRecord) -> List[Tuple[str, List[PanelSpec]]]:
-    """One panel per parameter pool, each containing all raw parameters and derived partial charges for that pool."""
-    epochs = run.optimization_epochs
-    if not epochs:
-        return []
-    param_names: List[str] = []
-    for epoch in epochs:
-        for name in epoch.parameters:
-            if name not in param_names:
-                param_names.append(name)
-
-    # Build derived partial-charge series: q = -χ/η for each matching chi/eta pair.
-    # Stored as synthetic_key -> (display_label, chi_key, eta_key).
-    derived_charges: Dict[str, Tuple[str, str, str]] = {}
-    for name in param_names:
-        if name.endswith("_χ"):
-            eta_key = name[:-1] + "η"
-            if eta_key in param_names:
-                label = name
-                if label.startswith("pool_"):
-                    label = label[len("pool_"):]
-                if label.endswith("_χ"):
-                    label = label[:-2]
-                label = label.replace("_charge_", "/") + " (q)"
-                derived_charges[f"derived_charge:{name}"] = (label, name, eta_key)
-
-    all_names = param_names + list(derived_charges.keys())
-
-    # Group names by pool, preserving insertion order.
-    pools_ordered: List[str] = []
-    by_pool: Dict[str, List[str]] = {}
-    for name in all_names:
-        pool = _pool_name_of(name)
-        if pool not in by_pool:
-            pools_ordered.append(pool)
-            by_pool[pool] = []
-        by_pool[pool].append(name)
-
-    palette = [
-        "#c2552d",
-        "#2d6db6",
-        "#3a7d44",
-        "#7b2cbf",
-        "#d17b0f",
-        "#ef476f",
-        "#118ab2",
-        "#6d597a",
-    ]
-    # Vertical lines at the first epoch of each macro after the first.
-    macro_boundaries: List[VLineSpec] = []
-    seen_macros: set = set()
-    for epoch in epochs:
-        m = epoch.macro_index
-        if m not in seen_macros:
-            seen_macros.add(m)
-            if m > 1:
-                macro_boundaries.append(
-                    VLineSpec(epoch.global_epoch_index, "#888888", label=f"M{m}", dashed=True)
-                )
-
-    panels_by_file: List[Tuple[str, List[PanelSpec]]] = []
-    for pool in pools_ordered:
-        series: List[SeriesSpec] = []
-        for idx, name in enumerate(by_pool[pool]):
-            color = palette[idx % len(palette)]
-            if name in derived_charges:
-                label, chi_key, eta_key = derived_charges[name]
-                points = []
-                for epoch in epochs:
-                    chi = epoch.parameters.get(chi_key)
-                    eta = epoch.parameters.get(eta_key)
-                    if chi is not None and eta is not None and eta != 0.0:
-                        points.append((epoch.global_epoch_index, -chi / eta))
-            else:
-                raw = [
-                    (epoch.global_epoch_index, epoch.parameters.get(name))
-                    for epoch in epochs
-                    if name in epoch.parameters
-                ]
-                points = [(x, y) for x, y in raw if y is not None]
-                label = name
-
-            if points:
-                series.append(SeriesSpec(label, points, color))
-
-        if not series:
-            continue
-        file_slug = pool if pool else "other"
-        title = f"Parameter Trajectories – {pool}" if pool else "Parameter Trajectories"
-        panels_by_file.append(
-            (
-                f"parameter_trajectories_{file_slug}.png",
-                [
-                    PanelSpec(
-                        title=title,
-                        x_label="Global optimization epoch",
-                        y_label="drift (%)",
-                        series=series,
-                        vlines=macro_boundaries,
-                    )
-                ],
-            )
-        )
-    return panels_by_file
-
-
-def write_index_html(outdir: Path, stem: str, figure_names: Sequence[str], report_txt: str) -> None:
-    blocks = [
-        "<!doctype html>",
-        "<html><head><meta charset='utf-8' />",
-        f"<title>{svg_escape(stem)} progress report</title>",
-        "<style>body{font-family:DejaVu Sans,Arial,sans-serif;margin:24px;background:#fbfbfd;color:#222} img{max-width:100%;border:1px solid #ddd;background:#fff;margin:18px 0} pre{background:#fff;border:1px solid #ddd;padding:16px;overflow:auto}</style>",
-        "</head><body>",
-        f"<h1>{svg_escape(stem)} progress report</h1>",
-        "<h2>Summary</h2>",
-        f"<pre>{svg_escape(report_txt)}</pre>",
-        "<h2>Figures</h2>",
-    ]
-    for name in figure_names:
-        blocks.append(f"<h3>{svg_escape(name)}</h3>")
-        blocks.append(f"<img src='{svg_escape(name)}' alt='{svg_escape(name)}' />")
-    blocks.append("</body></html>")
-    (outdir / "index.html").write_text("\n".join(blocks), encoding="utf-8")
-
-
-def sanitize_json(data: object) -> object:
-    if isinstance(data, dict):
-        return {str(key): sanitize_json(value) for key, value in data.items()}
-    if isinstance(data, list):
-        return [sanitize_json(value) for value in data]
-    if isinstance(data, float):
-        return data if math.isfinite(data) else None
-    return data
-
-
-def write_summary_json(outdir: Path, run: RunRecord) -> None:
-    payload = sanitize_json(asdict(run))
-    (outdir / "summary.json").write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def build_report_text(run: RunRecord) -> str:
@@ -1820,15 +2125,22 @@ def build_report_text(run: RunRecord) -> str:
         f"production_artifacts: {len(run.production_artifacts)}",
     ]
     for leg in ("solvent", "vacuum"):
-        leg_stage_b = [snap for snap in run.stage_b if snap.leg == leg]
-        fresh = [snap for snap in leg_stage_b if snap.fresh_probe_result]
-        last_snapshot = leg_stage_b[-1] if leg_stage_b else None
-        lines.append(
-            f"{leg}: stage_a={sum(1 for snap in run.stage_a if snap.leg == leg)} fresh_stage_b={len(fresh)}"
-        )
-        if last_snapshot is not None:
+        stage_a = get_leg_stage_a(run, leg)
+        snap = latest_stage_a_snapshot(run, leg)
+        lines.append(f"{leg}: stage_a_blocks={len(stage_a)} stage_b_status={stage_b_status_text(run, leg)}")
+        if snap is not None:
             lines.append(
-                f"  final_stage_b: failure={last_snapshot.failure_mode} split_gap={last_snapshot.split_gap} parity_gap={last_snapshot.parity_gap} support={last_snapshot.n_supported_states}/{last_snapshot.n_states}"
+                f"  spent={snap.macro_spent_ns}/{snap.budget_ns} ns blocker={stage_a_primary_blocker(snap)} rollback={snap.rollback} streak={snap.streak} cooldown={snap.cooldown}"
+            )
+        sb = latest_stage_b_snapshot(run, leg)
+        if sb is not None:
+            lines.append(
+                f"  latest_stage_b: failure={sb.failure_mode} split_gap={sb.split_gap} parity_gap={sb.parity_gap} support={sb.n_supported_states}/{sb.n_states} mode={sb.accumulation_mode}"
+            )
+        cached = latest_cached_stage_b_event(run, leg)
+        if cached is not None:
+            lines.append(
+                f"  latest_cached_stage_b: failure={cached.details.get('failure')} age_blocks={cached.details.get('age_blocks')} cooldown={cached.details.get('cooldown')} streak={cached.details.get('streak')}"
             )
     if run.optimization_epochs:
         last_epoch = run.optimization_epochs[-1]
@@ -1842,46 +2154,82 @@ def build_report_text(run: RunRecord) -> str:
     return "\n".join(lines)
 
 
+def write_index_html(outdir: Path, stem: str, figure_names: Sequence[str], report_txt: str, run: Optional[RunRecord] = None) -> None:
+    figure_labels = {
+        "dashboard.png": "Dashboard",
+        "timeline_and_performance.png": "Timeline and throughput",
+        "stage_a_gates.png": "Stage A gate heatmaps",
+        "stage_a_metrics.png": "Stage A raw metric traces",
+        "stage_a_lambda_issues.png": "Problematic λ-state incidence",
+        "stage_b_decisions.png": "Stage B decisions",
+        "optimization_metrics.png": "Optimization diagnostics",
+    }
+    blocks = [
+        "<!doctype html>",
+        "<html><head><meta charset='utf-8' />",
+        f"<title>{svg_escape(stem)} progress report</title>",
+        "<style>body{font-family:Inter,Segoe UI,Arial,sans-serif;margin:0;background:#f6f8fb;color:#1f2937}main{max-width:1200px;margin:0 auto;padding:28px}h1{margin:0 0 6px 0}p.meta{color:#667085;margin-top:0}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:18px 0 26px 0}.card{background:#fff;border:1px solid #d9dee8;border-radius:12px;padding:16px}.card h3{margin:0 0 8px 0;font-size:15px}.small{font-size:13px;color:#667085}.figure{background:#fff;border:1px solid #d9dee8;border-radius:12px;padding:16px;margin:18px 0}.figure img{max-width:100%;display:block;border:1px solid #e5e7eb;background:#fff}.summary{white-space:pre-wrap;background:#fff;border:1px solid #d9dee8;border-radius:12px;padding:16px;overflow:auto}</style>",
+        "</head><body><main>",
+        f"<h1>{svg_escape(stem)} progress report</h1>",
+        f"<p class='meta'>{svg_escape(Path(stem).name)}</p>",
+        "<div class='cards'>",
+        f"<div class='card'><h3>Artifacts</h3><div class='small'>{len(figure_names)} figures<br>{svg_escape(Path(outdir).name)} directory</div></div>",
+        f"<div class='card'><h3>Stage A snapshots</h3><div class='small'>{len(run.stage_a) if run is not None else '-'} total<br>{len(run.stage_b) if run is not None else '-'} Stage B snapshots</div></div>",
+        "<div class='card'><h3>Summary files</h3><div class='small'>summary.json<br>report.txt</div></div>",
+        "</div>",
+        "<h2>Summary</h2>",
+        f"<div class='summary'>{svg_escape(report_txt)}</div>",
+        "<h2>Figures</h2>",
+    ]
+    for name in figure_names:
+        blocks.append("<section class='figure'>")
+        blocks.append(f"<h3>{svg_escape(figure_labels.get(name, name))}</h3>")
+        blocks.append(f"<img src='{svg_escape(name)}' alt='{svg_escape(name)}' />")
+        blocks.append("</section>")
+    blocks.append("</main></body></html>")
+    (outdir / "index.html").write_text("\n".join(blocks), encoding="utf-8")
+
+
 def write_report(outdir: Path, run: RunRecord) -> List[str]:
     figure_names: List[str] = []
     write_summary_json(outdir, run)
-    ext = "png"
-
-    timeline_name = f"awh_timeline.{ext}"
-    write_timeline(outdir / timeline_name, run)
-    figure_names.append(timeline_name)
-
-    stage_a_panels = make_stage_a_panels(run)
-    if stage_a_panels:
-        name = f"stage_a_convergence.{ext}"
-        write_multiplot(outdir / name, "Stage A Convergence", stage_a_panels)
-        figure_names.append(name)
-
-    occupancy_panels = make_stage_a_occupancy_panels(run)
-    if occupancy_panels:
-        name = f"stage_a_occupancy.{ext}"
-        write_multiplot(outdir / name, "Stage A Occupancy", occupancy_panels)
-        figure_names.append(name)
-
-    stage_b_panels = make_stage_b_panels(run)
-    if stage_b_panels:
-        name = f"stage_b_convergence.{ext}"
-        write_multiplot(outdir / name, "Stage B Convergence", stage_b_panels)
-        figure_names.append(name)
-
-    opt_panels = make_optimization_panels(run)
-    if opt_panels:
-        name = f"optimization_metrics.{ext}"
-        write_multiplot(outdir / name, "Optimization Metrics", opt_panels, panel_height=240)
-        figure_names.append(name)
-
-    for name, panels in parameter_panels(run):
-        write_multiplot(outdir / name, "Parameter Trajectories", panels, panel_height=260)
-        figure_names.append(name)
-
     report_txt = build_report_text(run)
     (outdir / "report.txt").write_text(report_txt + "\n", encoding="utf-8")
-    write_index_html(outdir, Path(run.log_path).stem, figure_names, report_txt)
+
+    dashboard_name = "dashboard.png"
+    write_dashboard(outdir / dashboard_name, run)
+    figure_names.append(dashboard_name)
+
+    timeline_name = "timeline_and_performance.png"
+    write_timeline_and_performance(outdir / timeline_name, run)
+    figure_names.append(timeline_name)
+
+    stage_a_gates_name = "stage_a_gates.png"
+    write_stage_a_gate_heatmap(outdir / stage_a_gates_name, run)
+    figure_names.append(stage_a_gates_name)
+
+    stage_a_metrics_name = "stage_a_metrics.png"
+    write_stage_a_metric_traces(outdir / stage_a_metrics_name, run)
+    figure_names.append(stage_a_metrics_name)
+
+    lambda_issue_name = "stage_a_lambda_issues.png"
+    write_lambda_issue_heatmap(outdir / lambda_issue_name, run)
+    figure_names.append(lambda_issue_name)
+
+    stage_b_name = "stage_b_decisions.png"
+    write_stage_b_decisions(outdir / stage_b_name, run)
+    figure_names.append(stage_b_name)
+
+    if run.optimization_epochs:
+        opt_name = "optimization_metrics.png"
+        write_optimization_panels(outdir / opt_name, run)
+        figure_names.append(opt_name)
+
+    for name, panels in parameter_panels(run):
+        write_multiplot(outdir / name, "Parameter Motion", panels, panel_height=260)
+        figure_names.append(name)
+
+    write_index_html(outdir, Path(run.log_path).stem, figure_names, report_txt, run)
     return figure_names
 
 
@@ -1923,7 +2271,7 @@ def main(argv: Sequence[str]) -> int:
         if not args.summary_only:
             figure_names = write_report(outdir, run)
         else:
-            write_index_html(outdir, log_path.stem, figure_names, report_txt)
+            write_index_html(outdir, log_path.stem, figure_names, report_txt, run)
         wrote_any = True
         print(f"[ok] parsed {log_path} -> {outdir}")
         print(f"     stage_a={len(run.stage_a)} stage_b={len(run.stage_b)} optimization_epochs={len(run.optimization_epochs)}")

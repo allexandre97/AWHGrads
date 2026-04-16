@@ -842,26 +842,65 @@ where
 
 The full thermodynamic cycle Fisher matrix is the sum of the leg contributions in the shared latent parameter space.
 
-Because the first nonzero KL term is $\frac{1}{2} \delta \phi^\top \mathcal{I}(\phi) \delta \phi$, the optimizer uses the empirical Fisher matrix to define a trust region,
+\section{Numerical Conditioning and Step Control}
+
+The raw empirical Fisher matrix $\widehat{\mathcal{I}}(\phi)$ is often ill-conditioned. This is a practical consequence of finite sampling: some parameter directions, or linear combinations thereof, may only weakly affect the sampled ensemble, so the corresponding eigenvalues are very small and the formal natural-gradient step becomes numerically unstable. The role of this section is therefore not to introduce a new geometric identity, but to describe how the implementation converts the empirical Fisher estimate into a robust update. The current code applies four postprocessing stages: diagonal regularization, Jacobi preconditioning, eigentruncation, and KL-target scaling.
+
+\subsection{Diagonal Regularization}
+
+A small regularization term is added to the diagonal of the empirical Fisher matrix. In the current implementation, this term is motivated by the quadratic reference-model penalty used to discourage the parameters from drifting too far from their starting values. In latent coordinates, that penalty contributes an additional diagonal curvature, so if $\lambda_p$ is the penalty strength for parameter $p$, the matrix is updated as:
 
 \begin{equation}
-    D_{\mathrm{KL}}
-    \approx
-    \frac{1}{2}
-    \Delta \phi^\top
-    \widehat{\mathcal{I}}(\phi)
-    \Delta \phi.
+    \widehat{\mathcal{I}}_{pp} \leftarrow \widehat{\mathcal{I}}_{pp} + \lambda_p \left( \frac{d\theta_p}{d\phi_p} \right)^2
+    \label{eq:diagreg}
+\end{equation}
+
+This term should be viewed as a numerical curvature regularizer motivated by the reference penalty, rather than as a separate Fisher identity. Its practical effect is to lift poorly informed diagonal directions and reduce the risk of unstable steps. If the added diagonal contribution is strictly positive in all retained directions, the regularized matrix becomes strictly positive definite; more generally, it still improves conditioning even when that stronger statement does not hold globally.
+
+\subsection{Jacobi Preconditioning}
+
+Before eigentruncation, the code applies a diagonal normalization, also known as Jacobi preconditioning. Its main purpose is to make the truncation criterion insensitive to the arbitrary physical scales and units of the force-field parameters (e.g., kJ/mol vs.\ nm vs.\ elementary charge). Let $D$ be the diagonal matrix of the empirical Fisher matrix, $D = \mathrm{diag}(\widehat{\mathcal{I}})$. The preconditioned Fisher matrix and scaled gradient are formed as:
+
+\begin{equation}
+    \widehat{\mathcal{I}}_{\mathrm{corr}} = D^{-1/2} \widehat{\mathcal{I}} D^{-1/2}, \quad \mathbf{g}_{\mathrm{scaled}} = D^{-1/2} \nabla_\phi \mathcal{L}
+    \label{eq:jacobi}
+\end{equation}
+
+In the limit of exact inversion, this diagonal rescaling does not change the final natural-gradient step, because the factors of $D$ cancel out when the matrix is inverted and mapped back to the original coordinates. Its practical importance appears once eigentruncation is introduced: after rescaling, the retained and discarded directions are determined by the correlation structure of the empirical Fisher matrix rather than by the raw magnitudes induced by parameter units.
+
+Without Jacobi preconditioning, eigentruncation could discard physically relevant directions simply because those coordinates have small numerical curvature in their native units. After rescaling, each coordinate is measured relative to its own local diagonal curvature, making $\widehat{\mathcal{I}}_{\mathrm{corr}}$ behave like a correlation-like matrix. The subsequent truncation then preferentially removes directions that are weakly informed by the sampled reference ensemble, rather than directions that merely happen to be expressed in small numerical units.
+
+\subsection{Eigentruncation}
+
+The preconditioned matrix $\widehat{\mathcal{I}}_{\mathrm{corr}}$ is then decomposed into its eigenvalues $\lambda_j$ and eigenvectors $\mathbf{v}_j$. Directions corresponding to eigenvalues below a relative tolerance $\epsilon_{\mathrm{tol}}$ (typically $10^{-5}$ of the maximum eigenvalue) are treated as weakly informed or nearly redundant and are truncated. The regularized inverse is constructed as:
+\begin{equation}
+    \widehat{\mathcal{I}}_{\mathrm{corr}}^{\dagger} = \sum_{\lambda_j > \epsilon_{\mathrm{tol}} \lambda_{\max}} \frac{1}{\lambda_j} \mathbf{v}_j \mathbf{v}_j^\top.
+\end{equation}
+This eigentruncation prevents the optimizer from taking very large steps along directions for which the empirical Fisher provides little reliable curvature information.
+
+\subsection{KL-Target Scaling and Confidence Moderation}
+
+The base latent-space step is then computed as
+\[
+    \Delta \phi_{\mathrm{base}} = D^{-1/2} \widehat{\mathcal{I}}_{\mathrm{corr}}^{\dagger} \mathbf{g}_{\mathrm{scaled}}.
+\]
+The optimizer next imposes a trust-region bound in distribution space. Because the first nonzero term in the local KL expansion is $\frac{1}{2} \delta \phi^\top \mathcal{I}(\phi) \delta \phi$, the code uses the quadratic KL model to rescale the base step so that the predicted divergence does not exceed a target value $\delta_{\mathrm{KL}}$:
+
+\begin{equation}
+    \Delta \phi = \alpha \, \Delta \phi_{\mathrm{base}}, \quad \text{with } \alpha = \min\left(1, \sqrt{\frac{2 \delta_{\mathrm{KL}}}{\Delta \phi_{\mathrm{base}}^\top \widehat{\mathcal{I}} \Delta \phi_{\mathrm{base}}}}\right)
     \label{eq:kltrust}
 \end{equation}
 
-The empirical Fisher matrix is therefore the operator that turns the Euclidean loss gradient into a natural-gradient-like base step, after which the optimizer applies diagonal normalization, eigentruncation, and KL-target scaling before the line search. The full logic is:
+The target $\delta_{\mathrm{KL}}$ is itself moderated by a confidence factor $s_{\mathrm{conf}} \in [s_{\min}, 1]$. In the implementation, this factor is obtained by comparing the optimization-relevant quantities estimated from the first and second halves of the production data, such as endpoint free energies and gradients. Large split-half disagreement is interpreted as evidence that the current replay estimates are noisy or insufficiently converged, in which case $s_{\mathrm{conf}}$ is reduced. This shrinks the trust region and makes the update more conservative. This confidence moderation is therefore an additional robustness heuristic layered on top of the KL trust region, not a separate geometric identity.
+
+The empirical Fisher matrix is therefore the operator that turns the Euclidean loss gradient into a natural-gradient-like base step, after which the optimizer applies the stabilization steps described above. The full logic is:
 
 \begin{enumerate}
     \item replay the frozen reference frames to obtain endpoint free energies and endpoint gradients,
     \item assemble the latent-space loss gradient from those endpoint contributions,
     \item estimate the empirical Fisher matrix from reweighted score vectors at the visited lambda states,
     \item use that Fisher matrix as the local metric tensor of the statistical manifold,
-    \item bound the proposed update through the quadratic KL model in Equation \eqref{eq:kltrust}.
+    \item stabilize and bound the proposed update through diagonal regularization, scale-invariant truncation, and the quadratic KL model in Equation \eqref{eq:kltrust}.
 \end{enumerate}
 %
 This is why a KL target, rather than a raw Euclidean step length, is the natural quantity to bound. A step that is small in Euclidean coordinates can still be large in distribution space if it distorts the ensemble strongly, while a step that is large in a weakly constrained coordinate may still be statistically safe. The Fisher metric captures that distinction directly. In that sense, the endpoint replay machinery determines which direction lowers the objective, whereas the empirical Fisher determines how far the optimizer can move in that direction before the induced ensemble changes too much.

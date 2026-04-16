@@ -89,7 +89,7 @@ The optimizer evaluates the current candidate parameter vector on the frozen pro
     \item the empirical Fisher matrix in latent space.
 \end{enumerate}
 
-The base step is formed by diagonal preconditioning, eigentruncation, KL-target scaling, and an infinity-norm cap on the latent update. The line search then proposes
+The base step is formed by regularizing the Fisher matrix with a reference-model penalty, applying diagonal Jacobi preconditioning to account for parameter scales, and truncating the eigenvectors of the resulting correlation-like matrix to ignore statistically "slack" directions. The step size is then determined by scaling the resulting natural-gradient direction to satisfy a Kullback-Leibler (KL) divergence target in distribution space, followed by an infinity-norm cap on the latent update to ensure stability. The line search then proposes
 
 \begin{equation}
     \phi_{\mathrm{prop}}
