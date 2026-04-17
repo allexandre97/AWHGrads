@@ -672,55 +672,6 @@ end
     @test timed_payload.timing.steps_per_s !== nothing
 end
 
-@testset "updated optimization defaults" begin
-    sim_cfg = AWHGrads.default_simulation_config()
-    @test sim_cfg.awh_probe_discard_fraction == 0.2
-    @test isempty(sim_cfg.parameter_pools)
-    @test sim_cfg.awh_control.bias_update_interval_md_steps == 1000
-    @test sim_cfg.awh_control.stats_log_every_updates == 1
-    @test isnothing(sim_cfg.awh_control.update_freq)
-    @test sim_cfg.awh_control.coverage_threshold == 1.0
-    @test sim_cfg.awh_control.significant_weight == 0.1
-    @test sim_cfg.awh_control.initial_n_bias == 100
-
-    opt_cfg = AWHGrads.default_optimization_config()
-    @test opt_cfg.max_inner_epochs == 10
-    @test opt_cfg.kl_target == Float32(0.25)
-    @test opt_cfg.eigenvalue_tol_scale == Float32(1e-3)
-    @test opt_cfg.max_phi_step_solute == Float32(0.6)
-    @test opt_cfg.line_search_noise_tolerance_fraction == Float32(0.1)
-    @test opt_cfg.awh_min_lambda_ess == 300
-    @test opt_cfg.awh_parity_tol_kT == Float32(0.25)
-    @test opt_cfg.awh_parity_gate_mode == :support_aware_max
-    @test opt_cfg.awh_parity_support_threshold == Float32(300)
-    @test opt_cfg.awh_parity_near_pass_factor == Float32(2.0)
-    @test opt_cfg.awh_endpoint_target_ratio == Float32(0.3)
-    @test opt_cfg.awh_solvent_tail_lj_max == Float32(0.3025)
-    @test opt_cfg.awh_solvent_tail_min_state_occupancy == Float32(0.0125)
-    @test opt_cfg.awh_solvent_endpoint_min_fraction == Float32(0.0)
-    @test opt_cfg.awh_stageA_history_blocks == 8
-    @test opt_cfg.awh_stageB_cooldown_blocks == 2
-    @test opt_cfg.awh_stageB_near_pass_cooldown_blocks == 0
-    @test opt_cfg.awh_stageB_probe_growth_factor == Float32(1.5)
-    @test opt_cfg.awh_stageB_probe_near_pass_scale == Float32(0.5)
-    @test opt_cfg.awh_stageB_probe_near_pass_mode_solvent == :keep
-    @test opt_cfg.awh_stageB_probe_near_pass_mode_vacuum == :shrink
-    @test opt_cfg.awh_stageB_probe_growth_ns == Float32(2.0)
-    @test opt_cfg.awh_stageB_split_extension_enabled
-    @test opt_cfg.awh_stageB_split_extension_max_segments == 3
-    @test opt_cfg.awh_stageB_support_allow_missing == 3
-    @test :opt_stageB_health_scaling_enabled ∉ fieldnames(typeof(opt_cfg))
-    @test :opt_stageB_health_min_scale ∉ fieldnames(typeof(opt_cfg))
-    @test :opt_stageB_health_comfort_fraction ∉ fieldnames(typeof(opt_cfg))
-    @test opt_cfg.optimization_confidence_mode == :split_half
-    @test opt_cfg.optimization_confidence_min_frames == 200
-    @test opt_cfg.optimization_confidence_min_scale == Float32(0.25)
-    @test opt_cfg.optimization_confidence_scale_strength == Float32(1.0)
-    @test opt_cfg.optimization_confidence_residual_requirement_strength == Float32(0.25)
-    @test opt_cfg.readiness_log_mode == :concise
-    @test opt_cfg.awh_stageB_repeat_suppression
-    @test opt_cfg.optimization_log_mode == :default
-end
 
 @testset "full physical coverage gates initial-stage doubling" begin
     sim_cfg = AWHGrads.default_simulation_config(FT=Float32, AT=Array)

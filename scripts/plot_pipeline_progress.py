@@ -370,6 +370,8 @@ class RunRecord:
     control_events: List[ControlEvent] = field(default_factory=list)
     production_artifacts: List[ProductionArtifact] = field(default_factory=list)
     optimization_epochs: List[OptimizationEpoch] = field(default_factory=list)
+    pre_opt_params_per_macro: Dict[int, Dict[str, float]] = field(default_factory=dict)
+    pre_opt_prediction_per_macro: Dict[int, Tuple[float, float, float]] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
 
@@ -438,6 +440,9 @@ class LogParser:
     )
     restored_re = re.compile(r"Restored best inner-loop state from Epoch (\d+) \(Residual = ([-\deE+.]+)\)")
     solvent_invariant_re = re.compile(r"Solvent Invariant: max \|.*?\| = ([-\deE+.]+)")
+    initial_prediction_re = re.compile(
+        r"Initial Prediction:.*?=\s*([-\deE+.]+)\s*kT\s*\|\s*Target\s*=\s*([-\deE+.]+)\s*kT\s*\|\s*Residual\s*=\s*([-\deE+.]+)"
+    )
 
     def __init__(self, path: Path):
         self.path = path
@@ -449,6 +454,7 @@ class LogParser:
         self.stage_b_attempt_counter: Dict[str, int] = {}
         self.current_opt_epoch: Optional[OptimizationEpoch] = None
         self.in_param_block = False
+        self.in_initial_param_block = False
 
     def parse(self) -> RunRecord:
         with self.path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -935,9 +941,27 @@ class LogParser:
             )
             return
 
+        if message.startswith("--- Initial Parameter State"):
+            self._finalize_current_opt_epoch()
+            self.in_initial_param_block = True
+            self.run.pre_opt_params_per_macro.setdefault(self.current_macro, {})
+            return
+
+        if self.in_initial_param_block:
+            if message.startswith("---") or self.opt_epoch_re.search(message):
+                self.in_initial_param_block = False
+            elif ":" in message:
+                name, value = message.split(":", 1)
+                try:
+                    self.run.pre_opt_params_per_macro[self.current_macro][name.strip()] = to_float(value)
+                except ValueError:
+                    pass
+                return
+
         opt_epoch_match = self.opt_epoch_re.search(message)
         if opt_epoch_match:
             self._finalize_current_opt_epoch()
+            self.in_initial_param_block = False
             self.current_opt_epoch = OptimizationEpoch(
                 macro_index=self.current_macro,
                 global_epoch_index=len(self.run.optimization_epochs) + 1,
@@ -991,6 +1015,16 @@ class LogParser:
             if opt_metrics_match:
                 self.current_opt_epoch.epoch_in_macro = to_int(opt_metrics_match.group(1))
                 self.current_opt_epoch.block_name = opt_metrics_match.group(2).strip()
+                return
+
+            init_pred_match = self.initial_prediction_re.search(message)
+            if init_pred_match:
+                macro = self.current_opt_epoch.macro_index
+                self.run.pre_opt_prediction_per_macro[macro] = (
+                    to_float(init_pred_match.group(1)),
+                    to_float(init_pred_match.group(2)),
+                    to_float(init_pred_match.group(3)),
+                )
                 return
 
             prediction_match = self.prediction_re.search(message)
@@ -1855,6 +1889,13 @@ def write_optimization_panels(path: Path, run: RunRecord) -> None:
             if v.label:
                 ax.text(v.value, 0.98, v.label, transform=ax.get_xaxis_transform(), ha="left", va="top", fontsize=8, color=v.color)
 
+    # Map macro -> x-position of the pre-optimization snapshot for that macro.
+    macro_first_epoch: Dict[int, int] = {}
+    for e in epochs:
+        if e.macro_index not in macro_first_epoch:
+            macro_first_epoch[e.macro_index] = e.global_epoch_index
+    init_x = {macro: idx - 1 for macro, idx in macro_first_epoch.items()}
+
     x = [e.global_epoch_index for e in epochs]
     plots = [
         (axes[0], "Residuals", "kT", [
@@ -1902,6 +1943,22 @@ def write_optimization_panels(path: Path, run: RunRecord) -> None:
         handles, labels = ax.get_legend_handles_labels()
         if handles:
             ax.legend(loc="upper left", fontsize=8, frameon=False)
+
+    # Overlay each macro's pre-optimization prediction and residual as star markers.
+    labelled_init = False
+    for macro, (pred, target, residual) in run.pre_opt_prediction_per_macro.items():
+        xi = init_x.get(macro)
+        if xi is None:
+            continue
+        label_pred = "Pre-opt prediction" if not labelled_init else None
+        label_res = "Pre-opt residual" if not labelled_init else None
+        labelled_init = True
+        axes[0].scatter([xi], [pred], color=METRIC_COLORS["prediction"], marker="*", s=120, zorder=5, label=label_pred)
+        axes[0].scatter([xi], [residual], color=METRIC_COLORS["residual"], marker="*", s=120, zorder=5, label=label_res)
+    if labelled_init:
+        handles, labels = axes[0].get_legend_handles_labels()
+        axes[0].legend(handles, labels, loc="upper left", fontsize=8, frameon=False)
+
     axes[-2].set_xlabel("Global optimization epoch")
     axes[-1].set_xlabel("Global optimization epoch")
     fig.suptitle("Optimization Diagnostics", x=0.05, ha="left", fontsize=18, fontweight="bold")
@@ -1921,13 +1978,99 @@ def _pool_name_of(param_name: str) -> str:
     return ""
 
 
-def parameter_panels(run: RunRecord) -> List[Tuple[str, List[PanelSpec]]]:
+def _parameter_category_of(param_name: str) -> str:
+    if param_name.startswith("derived_charge:"):
+        return "charge"
+    if param_name.endswith("_σ"):
+        return "sigma"
+    if param_name.endswith("_ϵ"):
+        return "epsilon"
+    if param_name.endswith("_χ"):
+        return "chi"
+    if param_name.endswith("_η"):
+        return "eta"
+    return "other"
+
+
+def _parameter_target_of(param_name: str) -> str:
+    raw = param_name[len("derived_charge:"):] if param_name.startswith("derived_charge:") else param_name
+    if raw.startswith("pool_"):
+        rest = raw[len("pool_"):]
+        for sep in ("_atom_", "_charge_"):
+            idx = rest.find(sep)
+            if idx != -1:
+                tail = rest[idx + len(sep):]
+                for suffix in ("_σ", "_ϵ", "_χ", "_η"):
+                    if tail.endswith(suffix):
+                        tail = tail[: -len(suffix)]
+                        break
+                return tail
+    return raw
+
+
+def _pretty_parameter_label(param_name: str, derived_charges: Dict[str, Tuple[str, str, str]]) -> str:
+    if param_name in derived_charges:
+        raw_label = derived_charges[param_name][0]
+        return raw_label
+    target = _parameter_target_of(param_name)
+    category = _parameter_category_of(param_name)
+    suffix_map = {
+        "sigma": "σ",
+        "epsilon": "ϵ",
+        "chi": "χ",
+        "eta": "η",
+        "charge": "q",
+        "other": "",
+    }
+    suffix = suffix_map.get(category, "")
+    return f"{target} ({suffix})" if suffix else target
+
+
+def _parameter_category_title(category: str) -> str:
+    return {
+        "sigma": "LJ σ",
+        "epsilon": "LJ ϵ",
+        "charge": "Derived charges",
+        "chi": "Charge χ",
+        "eta": "Charge η",
+        "other": "Other parameters",
+    }.get(category, category)
+
+
+def _parameter_value_label(category: str) -> str:
+    return {
+        "sigma": "σ",
+        "epsilon": "ϵ",
+        "charge": "q",
+        "chi": "χ",
+        "eta": "η",
+        "other": "value",
+    }.get(category, "value")
+
+
+def _sort_series_points(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    return sorted(points, key=lambda item: (item[0], item[1]))
+
+
+def parameter_panels(run: RunRecord) -> List[Tuple[str, str, List[PanelSpec]]]:
     epochs = run.optimization_epochs
     if not epochs:
         return []
+
+    # Place each pre-optimization snapshot one tick before that macro's first optimization epoch.
+    macro_first_epoch: Dict[int, int] = {}
+    for e in epochs:
+        if e.macro_index not in macro_first_epoch:
+            macro_first_epoch[e.macro_index] = e.global_epoch_index
+    pre_opt_x: Dict[int, int] = {macro: idx - 1 for macro, idx in macro_first_epoch.items()}
+
     param_names: List[str] = []
     for epoch in epochs:
         for name in epoch.parameters:
+            if name not in param_names:
+                param_names.append(name)
+    for params in run.pre_opt_params_per_macro.values():
+        for name in params:
             if name not in param_names:
                 param_names.append(name)
 
@@ -1957,58 +2100,112 @@ def parameter_panels(run: RunRecord) -> List[Tuple[str, List[PanelSpec]]]:
     palette = [
         "#c2552d", "#2d6db6", "#3a7d44", "#7b2cbf", "#d17b0f", "#ef476f", "#118ab2", "#6d597a", "#4c956c", "#264653",
     ]
+    category_order = ["sigma", "epsilon", "charge", "chi", "eta", "other"]
     macro_boundaries = macro_boundaries_from_epochs(run)
-    panels_by_file: List[Tuple[str, List[PanelSpec]]] = []
+    panels_by_file: List[Tuple[str, str, List[PanelSpec]]] = []
+
     for pool in pools_ordered:
-        series: List[SeriesSpec] = []
-        zero_based = False
-        for idx, name in enumerate(by_pool[pool]):
-            color = palette[idx % len(palette)]
-            if name in derived_charges:
-                label, chi_key, eta_key = derived_charges[name]
-                raw_points: List[Tuple[float, float]] = []
-                for epoch in epochs:
-                    chi = epoch.parameters.get(chi_key)
-                    eta = epoch.parameters.get(eta_key)
-                    if chi is not None and eta is not None and eta != 0.0:
-                        raw_points.append((epoch.global_epoch_index, -chi / eta))
-            else:
-                raw_points = [
-                    (epoch.global_epoch_index, epoch.parameters[name])
-                    for epoch in epochs
-                    if name in epoch.parameters and epoch.parameters[name] is not None
-                ]
-                label = name
-            if not raw_points:
+        pool_names = by_pool[pool]
+        by_category: Dict[str, List[str]] = {category: [] for category in category_order}
+        for name in pool_names:
+            by_category.setdefault(_parameter_category_of(name), []).append(name)
+
+        panels: List[PanelSpec] = []
+        for category in category_order:
+            names = by_category.get(category, [])
+            if not names:
                 continue
-            baseline = raw_points[0][1]
-            if abs(baseline) > 1e-12:
-                points = [(x, 100.0 * (y - baseline) / baseline) for x, y in raw_points]
-                display_label = label
-            else:
-                zero_based = True
-                points = [(x, y - baseline) for x, y in raw_points]
-                display_label = label + " (Δ)"
-            series.append(SeriesSpec(display_label, points, color, stroke_width=2.0))
-        if not series:
+
+            absolute_series: List[SeriesSpec] = []
+            drift_series: List[SeriesSpec] = []
+            zero_baseline_labels: List[str] = []
+            for idx, name in enumerate(sorted(names, key=lambda item: (_parameter_target_of(item), item))):
+                color = palette[idx % len(palette)]
+                if name in derived_charges:
+                    label, chi_key, eta_key = derived_charges[name]
+                    raw_points: List[Tuple[float, float]] = []
+                    for macro, params in sorted(run.pre_opt_params_per_macro.items()):
+                        chi = params.get(chi_key)
+                        eta = params.get(eta_key)
+                        xi = pre_opt_x.get(macro)
+                        if chi is not None and eta is not None and eta != 0.0 and xi is not None:
+                            value = -chi / eta
+                            raw_points.append((xi, value))
+                    for epoch in epochs:
+                        chi = epoch.parameters.get(chi_key)
+                        eta = epoch.parameters.get(eta_key)
+                        if chi is not None and eta is not None and eta != 0.0:
+                            raw_points.append((epoch.global_epoch_index, -chi / eta))
+                else:
+                    raw_points = []
+                    for macro, params in sorted(run.pre_opt_params_per_macro.items()):
+                        val = params.get(name)
+                        xi = pre_opt_x.get(macro)
+                        if val is not None and xi is not None:
+                            raw_points.append((xi, val))
+                    raw_points += [
+                        (epoch.global_epoch_index, epoch.parameters[name])
+                        for epoch in epochs
+                        if name in epoch.parameters and epoch.parameters[name] is not None
+                    ]
+                    label = _pretty_parameter_label(name, derived_charges)
+                if not raw_points:
+                    continue
+                raw_points = _sort_series_points(raw_points)
+                absolute_series.append(SeriesSpec(label, raw_points, color, stroke_width=2.0))
+
+                baseline = raw_points[0][1]
+                if abs(baseline) > 1e-12:
+                    drift_points = [(x, 100.0 * (y - baseline) / baseline) for x, y in raw_points]
+                    drift_label = label
+                else:
+                    drift_points = [(x, y - baseline) for x, y in raw_points]
+                    drift_label = label + " (Δ)"
+                    zero_baseline_labels.append(label)
+                drift_series.append(SeriesSpec(drift_label, drift_points, color, stroke_width=2.0))
+
+            if not absolute_series:
+                continue
+
+            category_title = _parameter_category_title(category)
+            value_label = _parameter_value_label(category)
+            abs_notes = [
+                f"Absolute parameter values for {category_title.lower()}.",
+                "Pre-optimization snapshots are shown once per macro, immediately before that macro's optimization epochs.",
+            ]
+            drift_notes = ["Relative drift with respect to the original pre-optimization snapshot."]
+            if zero_baseline_labels:
+                joined = ", ".join(zero_baseline_labels[:4])
+                if len(zero_baseline_labels) > 4:
+                    joined += ", …"
+                drift_notes.append(f"Zero-baseline series shown as absolute Δ: {joined}.")
+
+            panels.append(
+                PanelSpec(
+                    title=f"{category_title} — actual values",
+                    x_label="Global optimization epoch",
+                    y_label=value_label,
+                    series=absolute_series,
+                    vlines=macro_boundaries,
+                    notes=abs_notes,
+                )
+            )
+            panels.append(
+                PanelSpec(
+                    title=f"{category_title} — relative drift",
+                    x_label="Global optimization epoch",
+                    y_label="drift (%) / Δ",
+                    series=drift_series,
+                    vlines=macro_boundaries,
+                    notes=drift_notes,
+                )
+            )
+
+        if not panels:
             continue
         pool_slug = pool if pool else "other"
-        note = "Percent drift from the first optimization epoch." if not zero_based else "Percent drift from epoch 1; zero-based series are shown as absolute deltas."
-        panels_by_file.append(
-            (
-                f"parameter_trajectories_{pool_slug}.png",
-                [
-                    PanelSpec(
-                        title=f"Parameter motion — {pool}" if pool else "Parameter motion",
-                        x_label="Global optimization epoch",
-                        y_label="drift (%) / Δ",
-                        series=series,
-                        vlines=macro_boundaries,
-                        notes=[note],
-                    )
-                ],
-            )
-        )
+        file_title = f"Parameter trajectories — {pool}" if pool else "Parameter trajectories"
+        panels_by_file.append((f"parameter_trajectories_{pool_slug}.png", file_title, panels))
     return panels_by_file
 
 
@@ -2182,8 +2379,12 @@ def write_index_html(outdir: Path, stem: str, figure_names: Sequence[str], repor
         "<h2>Figures</h2>",
     ]
     for name in figure_names:
+        label = figure_labels.get(name, name)
+        if name.startswith("parameter_trajectories_"):
+            pool_name = name[len("parameter_trajectories_"):-len(".png")].replace("_", " ")
+            label = f"Parameter trajectories — {pool_name}"
         blocks.append("<section class='figure'>")
-        blocks.append(f"<h3>{svg_escape(figure_labels.get(name, name))}</h3>")
+        blocks.append(f"<h3>{svg_escape(label)}</h3>")
         blocks.append(f"<img src='{svg_escape(name)}' alt='{svg_escape(name)}' />")
         blocks.append("</section>")
     blocks.append("</main></body></html>")
@@ -2225,8 +2426,8 @@ def write_report(outdir: Path, run: RunRecord) -> List[str]:
         write_optimization_panels(outdir / opt_name, run)
         figure_names.append(opt_name)
 
-    for name, panels in parameter_panels(run):
-        write_multiplot(outdir / name, "Parameter Motion", panels, panel_height=260)
+    for name, figure_title, panels in parameter_panels(run):
+        write_multiplot(outdir / name, figure_title, panels, panel_height=245)
         figure_names.append(name)
 
     write_index_html(outdir, Path(run.log_path).stem, figure_names, report_txt, run)

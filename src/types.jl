@@ -31,7 +31,7 @@ Base.@kwdef struct AWHControlConfig
     update_freq::Union{Nothing, Int} = nothing
     coverage_threshold::Float64 = 1.0
     significant_weight::Float64 = 0.1
-    initial_n_bias::Int = 100
+    initial_n_bias::Int = 10
     well_tempered_factor::Float64 = Inf
     coverage_type::Symbol = :physical
 end

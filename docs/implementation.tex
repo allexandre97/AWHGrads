@@ -1,5 +1,7 @@
 \section{Implemented Pipeline}
 
+This section describes the concrete algorithmic design used by the current code. Unlike the theory section, which derives replay estimators and the local Fisher geometry, the present section focuses on operational choices: readiness checks, probe growth policy, production collection, numerical stabilization, and acceptance logic.
+
 The current code organizes the method as a macro-epoch loop. At the beginning of each macro epoch, the pipeline constructs one AWH simulation per thermodynamic leg with the current physical parameters. Restart coordinates and velocities may be reused from the previous macro epoch. The AWH bias is reused only when restart continuity is preserved; a cold restart from the input structure does not reuse a previous bias profile. For each leg, the macro epoch proceeds through four stages:
 
 \begin{enumerate}
@@ -44,7 +46,7 @@ The resulting energy matrix is used to compute two independent Stage B diagnosti
 
 The retained frames are split into temporal halves. A coupled-minus-decoupled free energy is computed independently from each half, and the split gap is the absolute difference between those two estimates.
 
-\paragraph{MBAR/AWH parity.} 
+\paragraph{Replay/AWH parity.} 
 
 The same retained frames are used to reconstruct a full lambda free-energy profile from the frozen reference mixture. That replayed profile is aligned to the coupled endpoint and compared against the frozen AWH profile that generated the frames. The implementation tracks:
 
@@ -89,7 +91,9 @@ The optimizer evaluates the current candidate parameter vector on the frozen pro
     \item the empirical Fisher matrix in latent space.
 \end{enumerate}
 
-The base step is formed by regularizing the Fisher matrix with a reference-model penalty, applying diagonal Jacobi preconditioning to account for parameter scales, and truncating the eigenvectors of the resulting correlation-like matrix to ignore statistically "slack" directions. The step size is then determined by scaling the resulting natural-gradient direction to satisfy a Kullback-Leibler (KL) divergence target in distribution space, followed by an infinity-norm cap on the latent update to ensure stability. The line search then proposes
+The per-frame force-field gradients $\nabla_\theta U_\ell(\mathbf{x}_n, i; \theta)$ required for both the cycle gradient and the empirical Fisher estimate are obtained by differentiating the Molly potential-energy function with respect to the parameter vector via reverse-mode automatic differentiation, using Enzyme. The chain-rule factor $d\theta_p/d\phi_p$ from the family-specific latent-to-physical transform is then applied to convert these $\theta$-space gradients into latent-space gradients before the Fisher and cycle-gradient assembly.
+
+The base step is formed from the replay gradient and empirical Fisher matrix derived in the theory section, then stabilized through diagonal preconditioning, eigentruncation, KL-target scaling, and a per-pool infinity-norm cap on the latent update. The per-pool cap bounds the maximum absolute latent-coordinate change within each parameter pool independently, using a configurable \texttt{max\_phi\_step} per pool; this allows, for example, a tighter cap on Lennard-Jones $\sigma$ parameters than on partial-charge parameters. These are practical numerical design choices rather than additional formal identities. The line search then proposes
 
 \begin{equation}
     \phi_{\mathrm{prop}}
@@ -99,14 +103,32 @@ The base step is formed by regularizing the Fisher matrix with a reference-model
     \alpha \, \Delta \phi,
 \end{equation}
 %
-starting from $\alpha=1$ and halving repeatedly until two conditions hold:
+starting from $\alpha=1$ and halving up to a fixed maximum of seven iterations until three conditions hold simultaneously:
 
 \begin{itemize}
-    \item every leg remains above its effective sample size threshold,
-    \item the residual improves enough to satisfy the acceptance test.
+    \item the effective sample size, evaluated at the \emph{proposed} parameters $\phi_{\mathrm{prop}}$, remains above the per-leg threshold for every leg,
+    \item the per-pool physical parameter drift relative to the reference model remains within configured bounds for every pool,
+    \item the residual satisfies the acceptance test described below.
 \end{itemize}
 
-The residual test is not a simple monotonic decrease. The current implementation accepts a proposal only if the new residual lies inside a tolerance-adjusted window based on the current residual magnitude, and the required improvement is made stricter when the production split-half confidence is poor.
+The ESS is recomputed at $\phi_{\mathrm{prop}}$ on each halving step, not at the current parameters; it therefore checks whether the frozen reference ensemble still provides adequate importance-sampling support for the proposed candidate ensemble. The drift check is applied to the mapped physical parameters $\theta_{\mathrm{prop}} = \theta(\phi_{\mathrm{prop}})$ and gates per-pool families independently.
+
+The residual test is not a simple monotonic decrease. Let $\tau$ be a configurable relative noise tolerance and let $r_{\mathrm{add}} \geq 0$ be the additional improvement requirement from split-half confidence (defined below). A proposal is accepted when
+
+\begin{equation}
+    |\mathcal{E}_{\mathrm{prop}}|
+    \leq
+    \max\!\left(\varepsilon_{\mathrm{floor}},\;
+        |\mathcal{E}|
+        +
+        \tau \, |\mathcal{E}|
+        -
+        r_{\mathrm{add}}
+    \right),
+    \label{eq:lsaccept}
+\end{equation}
+%
+where $\mathcal{E}$ is the residual at the current parameters and $\varepsilon_{\mathrm{floor}}$ is a small positive floor derived from the noise tolerance. The window therefore widens by a fraction $\tau$ of the current residual magnitude, while $r_{\mathrm{add}}$ tightens it when production-data confidence is poor; the floor prevents the acceptance threshold from collapsing to zero. If all seven halvings are exhausted without satisfying all three conditions the line search is declared failed, which triggers an early exit from the inner optimization loop.
 
 \paragraph{Split-half confidence scaling.}
 The production artifacts are also split deterministically into first and second temporal halves. The code recomputes endpoint free energies and gradients on each half and forms three disagreement measures:
@@ -135,6 +157,43 @@ where $\delta_{\max}$ is the largest disagreement signal. The same split-half an
 
 If the accepted line-search step becomes too small, if the line search repeatedly hits a tiny $\alpha$, or if the configured inner-epoch cap is reached, the code restores the best state seen inside that macro epoch and returns to fresh resimulation. A fresh macro-epoch Stage B failure does not trigger a hard rejection of the previously accepted parameter set; it simply prevents additional optimization until new readiness is established.
 
+
+\subsection{Charge-Equilibration Parameterization}
+
+When charge training is enabled, the code uses a constrained charge-equilibration model as a model-specific parameterization layer on top of the general replay-and-optimization machinery. Rather than optimizing partial charges $q_i$ directly, the trainable physical parameters are the electronegativity $\chi_i$ and hardness $\eta_i$ associated with each atom type or class.
+
+For a molecule with target net charge $Q_{\mathrm{mol}}$, the partial charge on trainable atom $i$ is written as
+\begin{equation}
+    q_i
+    =
+    -\frac{\chi_i + \lambda_{\mathrm{mol}}}{\eta_i},
+    \label{eq:qi_charge}
+\end{equation}
+%
+where $\lambda_{\mathrm{mol}}$ is the molecule-specific Lagrange multiplier that enforces the net-charge constraint. Requiring
+\begin{equation}
+    \sum_{i \in \mathrm{trainable}} q_i
+    =
+    Q_{\mathrm{mol}} - \sum_{j \in \mathrm{fixed}} q_j,
+\end{equation}
+%
+yields the analytic solution
+\begin{equation}
+    \lambda_{\mathrm{mol}}
+    =
+    -
+    \frac{
+        Q_{\mathrm{mol}} - \sum_{j \in \mathrm{fixed}} q_j
+        +
+        \sum_{i \in \mathrm{trainable}} \frac{\chi_i}{\eta_i}
+    }{
+        \sum_{i \in \mathrm{trainable}} \frac{1}{\eta_i}
+    }.
+    \label{eq:lagrange_mol}
+\end{equation}
+
+This construction enforces the molecular net charge exactly by construction while still allowing the optimizer to work in the bounded latent coordinates described earlier. In practice the hardness variables are kept positive through the chosen latent-to-physical transform so that the charge solve remains well conditioned, whereas electronegativity coordinates may be lightly bounded or left effectively unbounded depending on the training setup.
+
 \subsection{Current Scope and Default Example}
 
 The repository now supports a general thermodynamic cycle with arbitrary legs, coefficients, per-leg lambda schedules, and per-leg ensembles. The default example remains ethanol hydration. In that default setup:
@@ -142,7 +201,7 @@ The repository now supports a general thermodynamic cycle with arbitrary legs, c
 \begin{itemize}
     \item the solvent leg uses an NPT expanded ensemble with a staged, charge-first and Lennard-Jones-second lambda schedule concentrated in the low-Lennard-Jones tail,
     \item the vacuum leg uses a simpler non-periodic leg with no pressure-volume term,
-    \item the optimization can jointly train Lennard-Jones parameters and partial charges. When charge training is enabled, the code uses a constrained charge-equilibration algorithm (predicting electronegativity and hardness per atom class) to solve for partial charges under exact molecular net-charge constraints before evaluating the force-field energy,
+    \item the optimization can jointly train Lennard-Jones parameters and partial charges through the constrained charge-equilibration parameterization described above,
     \item optimization is solute-only unless solvent parameters are explicitly enabled.
 \end{itemize}
 

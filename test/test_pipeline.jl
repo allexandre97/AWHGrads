@@ -213,6 +213,12 @@ end
     @test AWHGrads.line_search_residual_acceptable(FT(10.0), FT(10.9), FT(0.1))
     @test !AWHGrads.line_search_residual_acceptable(FT(10.0), FT(11.2), FT(0.1))
     @test !AWHGrads.line_search_residual_acceptable(FT(10.0), FT(10.9), FT(0.1), FT(0.8))
+    threshold = AWHGrads.line_search_acceptance_threshold(FT(0.011), FT(0.1), FT(0.214))
+    @test threshold == AWHGrads.line_search_noise_tolerance(FT(0.011), FT(0.1))
+    @test threshold > zero(FT)
+    @test AWHGrads.line_search_acceptance_threshold(zero(FT), FT(0.1), FT(1.0)) > zero(FT)
+    @test AWHGrads.line_search_residual_acceptable(FT(0.011), FT(0.001), FT(0.1), FT(0.214))
+    @test !AWHGrads.line_search_residual_acceptable(FT(0.011), FT(0.005), FT(0.1), FT(0.214))
     @test AWHGrads.default_optimization_config().max_inner_epochs == 10
 end
 

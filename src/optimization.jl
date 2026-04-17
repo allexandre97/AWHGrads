@@ -308,17 +308,42 @@ function line_search_residual_acceptable(
 end
 
 
+function line_search_acceptance_threshold(
+    error_residual::RT,
+    tolerance_fraction::TT,
+    additional_improvement_requirement::ATX,
+) where {RT <: AbstractFloat, TT <: AbstractFloat, ATX <: AbstractFloat}
+    noise_tolerance = line_search_noise_tolerance(error_residual, tolerance_fraction)
+    AT = promote_energy_analysis_type(error_residual, tolerance_fraction, additional_improvement_requirement)
+    threshold_floor = max(AT(noise_tolerance), sqrt(eps(AT)))
+    raw_threshold = abs(AT(error_residual)) + AT(noise_tolerance) - max(zero(AT), AT(additional_improvement_requirement))
+    return max(threshold_floor, raw_threshold)
+end
+
+
+function line_search_acceptance_threshold(
+    error_residual::RT,
+    tolerance_fraction::TT,
+) where {RT <: AbstractFloat, TT <: AbstractFloat}
+    return line_search_acceptance_threshold(
+        error_residual,
+        tolerance_fraction,
+        zero(promote_energy_analysis_type(error_residual, tolerance_fraction)),
+    )
+end
+
+
 function line_search_residual_acceptable(
     error_residual::RT,
     error_residual_prop::PT,
     tolerance_fraction::TT,
     additional_improvement_requirement::ATX,
 ) where {RT <: AbstractFloat, PT <: AbstractFloat, TT <: AbstractFloat, ATX <: AbstractFloat}
-    noise_tolerance = line_search_noise_tolerance(error_residual, tolerance_fraction)
     AT = promote_energy_analysis_type(error_residual, error_residual_prop, tolerance_fraction, additional_improvement_requirement)
-    acceptance_threshold = max(
-        zero(AT),
-        abs(AT(error_residual)) + noise_tolerance - AT(additional_improvement_requirement),
+    acceptance_threshold = line_search_acceptance_threshold(
+        error_residual,
+        tolerance_fraction,
+        additional_improvement_requirement,
     )
     return abs(AT(error_residual_prop)) <= acceptance_threshold
 end
@@ -726,13 +751,33 @@ function run_optimization_phase!(
         theta_prop = copy(theta_active)
         line_search_success = false
         accepted_residual = error_residual
+        accepted_alpha = zero(AT)
+        last_trial_alpha = zero(AT)
+        best_trial_alpha = zero(AT)
+        best_trial_residual = error_residual
+        best_trial_abs_residual = AT(Inf)
+        best_trial_ess_ok = false
+        best_trial_drift_ok = false
+        ls_trials_run = 0
         ess_prop = Dict{Symbol, AT}()
         accepted_pool_drifts = Dict{Symbol, NamedTuple}()
+        residual_noise_tolerance = line_search_noise_tolerance(
+            error_residual,
+            AT(opt_cfg.line_search_noise_tolerance_fraction),
+        )
+        residual_acceptance_threshold = line_search_acceptance_threshold(
+            error_residual,
+            AT(opt_cfg.line_search_noise_tolerance_fraction),
+            confidence_summary.additional_residual_requirement,
+        )
 
         # Backtracking line search enforces both residual improvement and a
         # minimum effective sample size under the proposed reweighting, together
         # with optional per-pool drift caps relative to the reference model.
         for ls_iter in 1:7
+            trial_alpha = alpha
+            last_trial_alpha = trial_alpha
+            ls_trials_run = ls_iter
             phi_prop .= phi_active .- alpha .* update_direction
             theta_prop .= map_phi_to_theta(phi_prop, theta_min, theta_max, phi_0, opt_cfg.k_sigmoid, param_families)
             drift_ok, pool_drifts_prop = pool_drift_metrics(theta_prop, theta_ref, active_pools)
@@ -768,6 +813,14 @@ function run_optimization_phase!(
             end
 
             error_residual_prop = dG_pred_prop - dG_exp
+            residual_ok = abs(error_residual_prop) <= residual_acceptance_threshold
+            if abs(error_residual_prop) < best_trial_abs_residual
+                best_trial_abs_residual = abs(error_residual_prop)
+                best_trial_residual = error_residual_prop
+                best_trial_alpha = trial_alpha
+                best_trial_ess_ok = ess_ok
+                best_trial_drift_ok = drift_ok
+            end
             drift_msg = join(
                 [
                     "$(pool.name)=σ$(round(pool_drifts_prop[pool.name].sigma_drift, digits=5))/ϵ$(round(pool_drifts_prop[pool.name].epsilon_drift, digits=5))"
@@ -782,27 +835,24 @@ function run_optimization_phase!(
                 ],
                 " | ",
             )
-            @info "    LS Iter $ls_iter (α=$(alpha)): ESS[$ess_msg] | Drift[$drift_msg] | Res = $(round(error_residual_prop, digits=3))"
+            @info "    LS Iter $ls_iter (α=$(trial_alpha)): ESS[$ess_msg] | Drift[$drift_msg] | Res = $(round(error_residual_prop, digits=3)) | Gate[ess=$(ess_ok) | drift=$(drift_ok) | residual=$(residual_ok) <= $(round(residual_acceptance_threshold, digits=4))]"
 
-            if ess_ok && drift_ok && line_search_residual_acceptable(
-                error_residual,
-                error_residual_prop,
-                AT(opt_cfg.line_search_noise_tolerance_fraction),
-                confidence_summary.additional_residual_requirement,
-            )
+            if ess_ok && drift_ok && residual_ok
                 line_search_success = true
+                accepted_alpha = trial_alpha
                 phi_active .= phi_prop
                 theta_active .= theta_prop
                 accepted_residual = error_residual_prop
                 accepted_pool_drifts = pool_drifts_prop
-                @info "    -> Line search converged."
+                @info "    -> Line search converged at α=$(accepted_alpha)."
                 break
             else
                 alpha *= AT(0.5)
             end
         end
 
-        if alpha <= AT(opt_cfg.tiny_alpha_cutoff)
+        alpha_for_tiny_check = line_search_success ? accepted_alpha : last_trial_alpha
+        if line_search_success && alpha_for_tiny_check <= AT(opt_cfg.tiny_alpha_cutoff)
             tiny_alpha_hits += 1
         else
             tiny_alpha_hits = 0
@@ -820,7 +870,7 @@ function run_optimization_phase!(
 
         norm_grad_loss = norm(grad_loss_active)
         max_grad_loss = maximum(abs.(grad_loss_active))
-        actual_max_phi_step = maximum(abs.(update_direction_train)) * alpha
+        actual_max_phi_step = line_search_success ? maximum(abs.(update_direction_train)) * accepted_alpha : zero(AT)
 
         @info "--- Current Parameter State ---"
         for i in eachindex(param_names)
@@ -830,7 +880,7 @@ function run_optimization_phase!(
         @info "--- Optimization Metrics (Epoch $inner_epoch - Joint Pools) ---"
         @info "  Prediction:  ∆G_pred = $(round(dG_pred, digits=3)) kT | Target = $(round(dG_exp, digits=3)) kT"
         @info "  Error:       Residual = $(round(error_residual, digits=3)) | Huber dL/dE = $(round(dL_dE, digits=3))"
-        @info "  Accepted:    Residual = $(round(accepted_residual, digits=3)) | Extra req = $(round(confidence_summary.additional_residual_requirement, digits=4))"
+        @info "  Accepted:    Residual = $(round(accepted_residual, digits=3)) | Extra req = $(round(confidence_summary.additional_residual_requirement, digits=4)) | Threshold = $(round(residual_acceptance_threshold, digits=4)) | step_accepted=$(line_search_success)"
         @info "  Gradients:   Norm = $(round(norm_grad_loss, digits=5)) | Max = $(round(max_grad_loss, digits=5))"
         @info "  FIM (Corr):  Raw Cond Number = $(round(fim_cond_raw, digits=2)) | Truncated Eigs = $n_truncated / $(length(vals))"
         @info "  Trust Reg.:  Confidence = $(round(confidence_summary.scale, digits=4)) | KL target = $(round(effective_kl_target, digits=4))"
@@ -839,8 +889,13 @@ function run_optimization_phase!(
             @info "  Confidence:  skipped_legs = $(join(String.(confidence_summary.skipped_legs), ","))"
         end
         @info "  KL Bound:    Est. KL = $(round(estimated_KL, digits=4)) | Target = $(round(effective_kl_target, digits=4)) | Scaling = $(round(kl_scaling, digits=4))"
-        @info "  Line Search: Converged α = $alpha"
-        @info "  Actual Step: Max ϕ ∆ = $(round(actual_max_phi_step, digits=6)) (α=$alpha)"
+        if line_search_success
+            @info "  Line Search: Converged α = $accepted_alpha | Noise tol = $(round(residual_noise_tolerance, digits=4))"
+            @info "  Actual Step: Max ϕ ∆ = $(round(actual_max_phi_step, digits=6)) (α=$accepted_alpha)"
+        else
+            @info "  Line Search: Failed after $ls_trials_run trials | Best trial α = $(best_trial_alpha) | Best residual = $(round(best_trial_residual, digits=3)) | Last tried α = $(last_trial_alpha) | Noise tol = $(round(residual_noise_tolerance, digits=4)) | Best gates[ess=$(best_trial_ess_ok) | drift=$(best_trial_drift_ok)]"
+            @info "  Actual Step: Max ϕ ∆ = $(round(actual_max_phi_step, digits=6)) (α=0.0) | Last tried α = $(last_trial_alpha)"
+        end
         @info "  Params (σ,ϵ): Min = $(round(minimum(theta_active[trainable_param_indices]), digits=5)) | Max = $(round(maximum(theta_active[trainable_param_indices]), digits=5))"
         for pool in active_pools
             clip_stat = pool_clip_stats[pool.name]
@@ -852,14 +907,20 @@ function run_optimization_phase!(
         end
         println("---------------------------------------------------\n")
 
+        if !line_search_success
+            @info "  [!] Line search accepted no trial. Triggering Phase 3 resimulation."
+            phase2_exit_reason = :line_search_fail
+            break
+        end
+
         if tiny_alpha_hits >= opt_cfg.max_tiny_alpha_hits
             @info "  [!] Repeated tiny line-search α detected ($tiny_alpha_hits consecutive epochs with α <= $(opt_cfg.tiny_alpha_cutoff)). Triggering Phase 3 resimulation."
             phase2_exit_reason = :tiny_alpha
             break
         end
 
-        if !line_search_success || actual_max_phi_step < AT(opt_cfg.min_phi_step)
-            @info "  [!] Line search failed or step vanished. Triggering Phase 3 resimulation."
+        if actual_max_phi_step < AT(opt_cfg.min_phi_step)
+            @info "  [!] Accepted line-search step vanished (Max ϕ ∆ = $(round(actual_max_phi_step, digits=6)) < min_phi_step = $(opt_cfg.min_phi_step)). Triggering Phase 3 resimulation."
             phase2_exit_reason = :step_vanish
             break
         end
@@ -873,6 +934,7 @@ function run_optimization_phase!(
     end
 
     if (
+        phase2_exit_reason == :line_search_fail ||
         phase2_exit_reason == :step_vanish ||
         phase2_exit_reason == :tiny_alpha ||
         phase2_exit_reason == :inner_epoch_cap

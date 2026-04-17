@@ -4,7 +4,7 @@
 \usepackage{amssymb}
 
 \title{Force-Field Optimization via AWH, Frozen-Bias Replay, and Information Geometry}
-\author{Alexandre Blanco Gonz\'alez}
+\author{Alexandre Blanco González}
 \date{\today}
 
 \begin{document}
@@ -16,7 +16,7 @@
 
 This document describes the optimization pipeline implemented in the current repository state. The method alternates between adaptive AWH sampling, frozen-bias readiness probes, frozen-bias production collection, and offline reweighting-based optimization of bounded force-field parameters. The key point is that the optimization gradients are \emph{not} obtained by differentiating the online AWH update rule. Instead, the adaptive AWH phase is used to construct a reliable reference ensemble. Once that reference ensemble has passed readiness checks, the bias is frozen and all thermodynamic estimators are evaluated offline from replayed frames. The idea behind using an extended ensemble as reference is to make the most out of the conformational richness that enhanced sampling simulations provide.
 
-The repository currently supports a general coefficient-weighted thermodynamic cycle. The default example is ethanol hydration, with a solvent leg and a vacuum leg, but the mathematical structure is a sum over arbitrary legs with per-leg lambda schedules, ensembles, and coefficients.
+The repository currently supports a general coefficient-weighted thermodynamic cycle. The default example is ethanol hydration, with a solvent leg and a vacuum leg, but the mathematical structure is a sum over arbitrary legs with per-leg lambda schedules, ensembles, and coefficients. The next section develops the formal replay and information-geometric derivations. The implementation section that follows then describes the concrete algorithmic choices used by the code.
 
 \input{theory}
 \input{implementation}
