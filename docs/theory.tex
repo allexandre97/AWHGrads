@@ -102,7 +102,28 @@ By definition, the corresponding reduced free energy is:
     \label{eq:ftarget}
 \end{equation}
 
-To connect $Q_{\ell,m}$ to the frozen reference ensemble, we multiply and divide the integrand in Equation \eqref{eq:qtarget} by the reference-mixture density of Equation \eqref{eq:pref_int} and obtain:
+Equation \eqref{eq:pref_int} implies the pointwise identity
+
+\begin{equation}
+    1
+    =
+    \frac{
+        \mathcal{Z}_{\mathrm{ref},\ell}
+        p_{\mathrm{ref},\ell}(\mathbf{x}, V)
+    }{
+        \mathcal{Z}_{\mathrm{mix},\ell}(\mathbf{x}, V)
+    }
+    =
+    \mathcal{Z}_{\mathrm{ref},\ell}
+    p_{\mathrm{ref},\ell}(\mathbf{x}, V)
+    \exp\left[
+        -
+        \log \mathcal{Z}_{\mathrm{mix},\ell}(\mathbf{x}, V)
+    \right].
+    \label{eq:refinsertidentity}
+\end{equation}
+
+To connect $Q_{\ell,m}$ to the frozen reference ensemble, we insert Equation \eqref{eq:refinsertidentity} into the integrand of Equation \eqref{eq:qtarget} and obtain:
 
 \begin{align}
     Q_{\ell,m}(\theta)
@@ -224,7 +245,7 @@ Because the prefactor $1/M_\ell$ is the same for every state of the same leg, th
 %
 which differs from Equation \eqref{eq:fendpointdisc} only by the additive constant $\log M_\ell$ and therefore produces the same endpoint free-energy differences.
 
-The normalized target-state replay weights used to reweight observables to the target state $m$ are
+The normalized target-state replay weights used to reweight observables to the target state $m$ are:
 
 \begin{equation}
     \overline{w}^{\mathrm{rep}}_{\ell,n,m}(\theta)
@@ -240,7 +261,7 @@ The normalized target-state replay weights used to reweight observables to the t
 %
 These are the weights implicitly formed by the current endpoint-gradient routine in the code. They replay each stored configuration frame $(\mathbf{x}_n, V_n)$ at the chosen target lambda state $m$. In practice, this replay-weight family is the one used whenever the code evaluates endpoint free energies or endpoint free-energy gradients at a chosen target state.
 
-The same machinery can be applied to every lambda state in the schedule to reconstruct a full replayed free-energy profile. Stage B readiness uses this full-profile reconstruction to compare replayed profiles against the frozen AWH profile. Optimization, however, only needs the endpoint states.
+The same machinery can be applied to every lambda state in the schedule to reconstruct a full replayed free-energy profile. Stage B readiness uses this full-profile reconstruction to compare replayed profiles against the frozen AWH profile. In the current implementation, optimization only needs the endpoint states. However, the same replay weights can also be used for more general target-state observables, as derived next.
 
 \section{Endpoint Free-Energy Gradients}
 
@@ -353,6 +374,348 @@ The code applies a Huber derivative to this residual, so the optimization gradie
     \nabla_\theta \Delta G_{\mathrm{cyc}}(\theta).
     \label{eq:lossgradtheta}
 \end{equation}
+
+\section{General Reweighted Observables}
+
+The endpoint free-energy formulas above are not the only quantities that can be estimated from the frozen reference mixture. The same replay weights of Equation \eqref{eq:omegam} also allow us to estimate an arbitrary equilibrium observable of a chosen target lambda state. This is the natural extension needed when one wishes to optimize against targets other than free energies while preserving the same frozen-bias replay framework.
+
+Let $O_{\ell,m}(\mathbf{x}, V; \theta)$ denote a scalar observable evaluated at target lambda state $m \in \Lambda_\ell$. The corresponding target-state equilibrium expectation is
+
+\begin{equation}
+    \langle O \rangle_{\ell,m}(\theta)
+    =
+    \frac{
+        \int dV \int d\mathbf{x} \,
+        O_{\ell,m}(\mathbf{x}, V; \theta)
+        \exp \left[
+            -u_\ell(\mathbf{x}, V, m; \theta)
+        \right]
+    }{
+        Q_{\ell,m}(\theta)
+    }.
+    \label{eq:obsdef}
+\end{equation}
+
+To rewrite Equation \eqref{eq:obsdef} in terms of the frozen reference ensemble, we use the same pointwise identity of Equation \eqref{eq:refinsertidentity}. Inserting it into the numerator of Equation \eqref{eq:obsdef} gives
+
+\begin{multline}
+    \int dV \int d\mathbf{x} \,
+    O_{\ell,m}(\mathbf{x}, V; \theta)
+    \exp \left[
+        -u_\ell(\mathbf{x}, V, m; \theta)
+    \right]
+    \\
+    =
+    \int dV \int d\mathbf{x} \,
+    \mathcal{Z}_{\mathrm{ref},\ell}
+    p_{\mathrm{ref},\ell}(\mathbf{x}, V)
+    O_{\ell,m}(\mathbf{x}, V; \theta)
+    \exp \left[
+        -u_\ell(\mathbf{x}, V, m; \theta)
+        -
+        \log \mathcal{Z}_{\mathrm{mix},\ell}(\mathbf{x}, V)
+    \right]
+    \\
+    =
+    \mathcal{Z}_{\mathrm{ref},\ell}
+    \mathbb{E}_{\mathrm{ref},\ell}
+    \Bigl[
+        O_{\ell,m}(\mathbf{x}, V; \theta)
+        \exp \left(
+            -u_\ell(\mathbf{x}, V, m; \theta)
+            -
+            \log \mathcal{Z}_{\mathrm{mix},\ell}(\mathbf{x}, V)
+        \right)
+    \Bigr].
+    \label{eq:obsnumref}
+\end{multline}
+
+The denominator is exactly the target-state partition function already rewritten in Equation \eqref{eq:qtargetref},
+
+\begin{equation}
+    Q_{\ell,m}(\theta)
+    =
+    \mathcal{Z}_{\mathrm{ref},\ell}
+    \mathbb{E}_{\mathrm{ref},\ell}
+    \left[
+        \exp \left(
+            -u_\ell(\mathbf{x}, V, m; \theta)
+            -
+            \log \mathcal{Z}_{\mathrm{mix},\ell}(\mathbf{x}, V)
+        \right)
+    \right].
+    \label{eq:obsdenref}
+\end{equation}
+
+Substituting Equations \eqref{eq:obsnumref} and \eqref{eq:obsdenref} into Equation \eqref{eq:obsdef} and cancelling the common factor $\mathcal{Z}_{\mathrm{ref},\ell}$ yields
+
+\begin{equation}
+    \langle O \rangle_{\ell,m}(\theta)
+    =
+    \frac{
+        \mathbb{E}_{\mathrm{ref},\ell}
+        \left[
+            O_{\ell,m}(\mathbf{x}, V; \theta)
+            \exp \left(
+                -u_\ell(\mathbf{x}, V, m; \theta)
+                -
+                \log \mathcal{Z}_{\mathrm{mix},\ell}(\mathbf{x}, V)
+            \right)
+        \right]
+    }{
+        \mathbb{E}_{\mathrm{ref},\ell}
+        \left[
+            \exp \left(
+                -u_\ell(\mathbf{x}, V, m; \theta)
+                -
+                \log \mathcal{Z}_{\mathrm{mix},\ell}(\mathbf{x}, V)
+            \right)
+        \right]
+    }.
+    \label{eq:obsref}
+\end{equation}
+
+To pass from Equation \eqref{eq:obsref} to a practical estimator, we replace the frozen-reference expectations by empirical averages over the stored frames, exactly as in Equation \eqref{eq:fendpointdisc}. For each stored frame $(\mathbf{x}_n, V_n)$, the Boltzmann factor appearing in both numerator and denominator is the unnormalized target-state replay weight of Equation \eqref{eq:am},
+%
+\[
+    w^{\mathrm{rep}}_{\ell,n,m}(\theta)
+    =
+    \exp\left[
+        -u_\ell(\mathbf{x}_n, V_n, m; \theta)
+        -
+        \log \mathcal{Z}_{\mathrm{mix}, \ell}(\mathbf{x}_n, V_n)
+    \right].
+\]
+%
+This leads to
+
+\begin{equation}
+    \langle O \rangle_{\ell,m}(\theta)
+    \approx
+    \frac{
+        \sum_{n=1}^{M_\ell}
+        O_{\ell,m}(\mathbf{x}_n, V_n; \theta)
+        w^{\mathrm{rep}}_{\ell,n,m}(\theta)
+    }{
+        \sum_{n=1}^{M_\ell}
+        w^{\mathrm{rep}}_{\ell,n,m}(\theta)
+    }.
+    \label{eq:obsdisc_unnorm}
+\end{equation}
+
+Recognizing the normalized replay weights of Equation \eqref{eq:omegam}, we then obtain the discrete replay estimator
+
+\begin{equation}
+    \widehat{O}_{\ell,m}(\theta)
+    =
+    \sum_{n=1}^{M_\ell}
+    \overline{w}^{\mathrm{rep}}_{\ell,n,m}(\theta)
+    O_{\ell,m}(\mathbf{x}_n, V_n; \theta),
+    \label{eq:obsdisc}
+\end{equation}
+%
+which approximates the exact target-state expectation $\langle O \rangle_{\ell,m}(\theta)$. Equation \eqref{eq:obsdisc} is the key replay estimator for non-free-energy targets. Any observable that can be evaluated on replayed frames at a chosen state $m$ can, in principle, be optimized in this way.
+
+\paragraph{Gradient of a replayed observable.}
+
+To differentiate Equation \eqref{eq:obsdisc}, define for brevity
+\[
+    O_{\ell,n,m}(\theta)
+    =
+    O_{\ell,m}(\mathbf{x}_n, V_n; \theta)
+\]
+and
+\[
+    W_{\ell,m}(\theta)
+    =
+    \sum_{n=1}^{M_\ell}
+    w^{\mathrm{rep}}_{\ell,n,m}(\theta).
+\]
+Then Equation \eqref{eq:obsdisc} may be written as
+
+\begin{equation}
+    \widehat{O}_{\ell,m}(\theta)
+    =
+    \frac{
+        \sum_{n=1}^{M_\ell}
+        w^{\mathrm{rep}}_{\ell,n,m}(\theta)
+        O_{\ell,n,m}(\theta)
+    }{
+        W_{\ell,m}(\theta)
+    }.
+    \label{eq:obsquotient}
+\end{equation}
+
+Differentiating Equation \eqref{eq:obsquotient} by the quotient rule gives
+
+\begin{align}
+    \nabla_\theta \widehat{O}_{\ell,m}(\theta)
+    &=
+    \frac{
+        \sum_{n=1}^{M_\ell}
+        \left[
+            \nabla_\theta
+            w^{\mathrm{rep}}_{\ell,n,m}(\theta)
+            \,
+            O_{\ell,n,m}(\theta)
+            +
+            w^{\mathrm{rep}}_{\ell,n,m}(\theta)
+            \nabla_\theta O_{\ell,n,m}(\theta)
+        \right]
+    }{
+        W_{\ell,m}(\theta)
+    }
+    \nonumber \\
+    &\qquad -
+    \frac{
+        \left[
+            \sum_{n=1}^{M_\ell}
+            w^{\mathrm{rep}}_{\ell,n,m}(\theta)
+            O_{\ell,n,m}(\theta)
+        \right]
+        \nabla_\theta W_{\ell,m}(\theta)
+    }{
+        W_{\ell,m}(\theta)^2
+    }.
+    \label{eq:obsquotientgrad}
+\end{align}
+
+From Equation \eqref{eq:am},
+
+\begin{equation}
+    \nabla_\theta
+    w^{\mathrm{rep}}_{\ell,n,m}(\theta)
+    =
+    -
+    w^{\mathrm{rep}}_{\ell,n,m}(\theta)
+    \nabla_\theta
+    u_\ell(\mathbf{x}_n, V_n, m; \theta),
+    \label{eq:obsweightgrad}
+\end{equation}
+%
+and therefore
+%
+\begin{equation}
+    \nabla_\theta W_{\ell,m}(\theta)
+    =
+    -
+    \sum_{n=1}^{M_\ell}
+    w^{\mathrm{rep}}_{\ell,n,m}(\theta)
+    \nabla_\theta
+    u_\ell(\mathbf{x}_n, V_n, m; \theta).
+    \label{eq:obsdenomgrad}
+\end{equation}
+
+Substituting Equations \eqref{eq:obsweightgrad} and \eqref{eq:obsdenomgrad} into Equation \eqref{eq:obsquotientgrad}, and then rewriting the result in terms of the normalized weights of Equation \eqref{eq:omegam}, yields
+
+\begin{align}
+    \nabla_\theta \widehat{O}_{\ell,m}(\theta)
+    &=
+    \sum_{n=1}^{M_\ell}
+    \overline{w}^{\mathrm{rep}}_{\ell,n,m}(\theta)
+    \nabla_\theta O_{\ell,n,m}(\theta)
+    \nonumber \\
+    &\qquad -
+    \sum_{n=1}^{M_\ell}
+    \overline{w}^{\mathrm{rep}}_{\ell,n,m}(\theta)
+    \left(
+        O_{\ell,n,m}(\theta)
+        -
+        \widehat{O}_{\ell,m}(\theta)
+    \right)
+    \nabla_\theta
+    u_\ell(\mathbf{x}_n, V_n, m; \theta).
+    \label{eq:obsgradred}
+\end{align}
+
+As before, the pressure-volume term does not depend on the force-field parameters, so
+
+\begin{align}
+    \nabla_\theta \widehat{O}_{\ell,m}(\theta)
+    &=
+    \sum_{n=1}^{M_\ell}
+    \overline{w}^{\mathrm{rep}}_{\ell,n,m}(\theta)
+    \nabla_\theta O_{\ell,n,m}(\theta)
+    \nonumber \\
+    &\qquad -
+    \sum_{n=1}^{M_\ell}
+    \overline{w}^{\mathrm{rep}}_{\ell,n,m}(\theta)
+    \left(
+        O_{\ell,n,m}(\theta)
+        -
+        \widehat{O}_{\ell,m}(\theta)
+    \right)
+    \beta_\ell
+    \nabla_\theta
+    U_\ell(\mathbf{x}_n, m; \theta).
+    \label{eq:obsgradtheta}
+\end{align}
+
+The first term captures any explicit parameter dependence of the observable itself. The second term is the covariance-like reweighting correction arising from the parameter dependence of the Boltzmann factor. If the observable depends only on the stored coordinates and volume, and not directly on $\theta$, then the first term vanishes and one obtains
+
+\begin{equation}
+    \nabla_\theta \widehat{O}_{\ell,m}(\theta)
+    =
+    -
+    \sum_{n=1}^{M_\ell}
+    \overline{w}^{\mathrm{rep}}_{\ell,n,m}(\theta)
+    \left(
+        O_{\ell,n,m}
+        -
+        \widehat{O}_{\ell,m}(\theta)
+    \right)
+    \beta_\ell
+    \nabla_\theta
+    U_\ell(\mathbf{x}_n, m; \theta).
+    \label{eq:obsgradthetaimplicit}
+\end{equation}
+
+This is the direct analogue, within the present frozen-AWH setting, of ensemble-reweighting gradient formulas derived for observables in a single-state reference ensemble. The crucial difference here is that the normalized weights are the AWH-aware replay weights of Equation \eqref{eq:omegam}, whose denominator uses the frozen Gibbs mixture $\mathcal{Z}_{\mathrm{mix},\ell}(\mathbf{x}, V)$ rather than a single-state reference Boltzmann factor.
+
+\paragraph{Observable-based loss terms.}
+
+Suppose now that $r \in \mathcal{R}$ indexes one observable target. Each such target is associated with a particular leg and target state, so $\widehat{O}_r(\theta)$ is shorthand for the corresponding replay estimator $\widehat{O}_{\ell_r,m_r}(\theta)$, and $\widetilde{O}_{\mathrm{exp},r}$ denotes its reference value. The corresponding residual is
+
+\begin{equation}
+    \mathcal{E}_r(\theta)
+    =
+    \widehat{O}_r(\theta)
+    -
+    \widetilde{O}_{\mathrm{exp},r}.
+    \label{eq:obsresidual}
+\end{equation}
+
+If this residual is passed through any differentiable scalar loss function $\mathcal{L}_r(\mathcal{E}_r)$, then its gradient is simply
+
+\begin{equation}
+    \nabla_\theta \mathcal{L}_r(\mathcal{E}_r(\theta))
+    =
+    \frac{d \mathcal{L}_r}{d \mathcal{E}_r}
+    \nabla_\theta \widehat{O}_r(\theta).
+    \label{eq:obslossgrad}
+\end{equation}
+
+More generally, if the total objective contains several contributions, such as free-energy-cycle terms together with observable-matching terms, one may write
+
+\begin{equation}
+    \mathcal{L}_{\mathrm{tot}}(\theta)
+    =
+    \sum_{r \in \mathcal{R}}
+    \mathcal{L}_r(\mathcal{E}_r(\theta)),
+    \label{eq:totalloss}
+\end{equation}
+
+with total gradient
+
+\begin{equation}
+    \nabla_\theta \mathcal{L}_{\mathrm{tot}}(\theta)
+    =
+    \sum_{r \in \mathcal{R}}
+    \nabla_\theta \mathcal{L}_r(\mathcal{E}_r(\theta)).
+    \label{eq:totallossgrad}
+\end{equation}
+
+Equation \eqref{eq:lossgradtheta} is therefore the currently implemented special case in which $\mathcal{R}$ contains only the thermodynamic-cycle contribution. Extending the method to new observables does not require changing the frozen-bias replay machinery itself; it only requires adding further target contributions whose predictions and gradients are computed from the same replay weights.
 
 \section{Bounded Coordinates}
 
@@ -749,7 +1112,7 @@ For NPT legs, the $P_\ell V$ term also cancels because the same pressure is used
     \label{eq:wnorm}
 \end{equation}
 %
-These normalized candidate-ensemble weights are used for optimizer-side quantities such as the effective sample size and the empirical Fisher estimate; they are not the replay weights used for endpoint free energies or endpoint gradients. A standard importance-sampling support diagnostic is the Kish-type effective sample size:
+These normalized candidate-ensemble weights are used for optimizer-side quantities such as the effective sample size and the empirical Fisher estimate; they are not the target-state replay weights used for endpoint free energies, replayed observables, or their gradients. A standard importance-sampling support diagnostic is the Kish-type effective sample size:
 
 \begin{equation}
     \mathrm{ESS}_\ell(\phi)
@@ -805,7 +1168,7 @@ where
     \label{eq:meanemp}
 \end{equation}
 
-When the cycle objective is assembled as a sum of leg contributions evaluated on separate frozen ensembles, the corresponding empirical Fisher used by the implementation is the sum of the leg contributions in the shared latent parameter space.
+When the total objective is assembled from contributions evaluated on one or more separate frozen ensembles, the corresponding empirical Fisher used by the implementation remains the sum of the leg contributions in the shared latent parameter space. Adding observable targets therefore changes the loss gradient, but not the basic score-covariance construction of the metric tensor.
 
 Because the first nonzero KL term is $\frac{1}{2} \delta \phi^\top \mathcal{I}(\phi) \delta \phi$, the optimizer uses the empirical Fisher matrix to define a trust region,
 
@@ -822,8 +1185,8 @@ Because the first nonzero KL term is $\frac{1}{2} \delta \phi^\top \mathcal{I}(\
 The empirical Fisher matrix is therefore the operator that turns the Euclidean loss gradient into a natural-gradient-like base step, after which the optimizer applies diagonal normalization, eigentruncation, and KL-target scaling before the line search. The full logic is:
 
 \begin{enumerate}
-    \item replay the frozen reference frames to obtain endpoint free energies and endpoint gradients,
-    \item assemble the latent-space loss gradient from those endpoint contributions,
+    \item replay the frozen reference frames to obtain the target predictions and their gradients,
+    \item assemble the latent-space loss gradient from those target contributions,
     \item estimate the empirical Fisher matrix from reweighted score vectors at the visited lambda states,
     \item use that Fisher matrix as the local metric tensor of the statistical manifold,
     \item bound the proposed update through the quadratic KL model in Equation \eqref{eq:kltrust}.
@@ -902,16 +1265,16 @@ The base KL target $\delta_{\mathrm{KL}}$ also determines the minimum acceptable
 %
 where $s_{\mathrm{ESS}} \in (0,1]$ is a configurable safety margin. In the current implementation, this ESS threshold is computed once from the base KL target and is not rescaled by the later confidence factor. The ESS is evaluated at the \emph{proposed} parameters on each halving step, so the line search rejects any proposal that would leave the reference ensemble with insufficient support for the candidate ensemble, independently of whether the residual has improved.
 
-The target $\delta_{\mathrm{KL}}$ is itself moderated by a confidence factor $s_{\mathrm{conf}} \in [s_{\min}, 1]$. In the implementation, this factor is obtained by comparing the optimization-relevant quantities estimated from the first and second halves of the production data, such as endpoint free energies and gradients. Large split-half disagreement is interpreted as evidence that the current replay estimates are noisy or insufficiently converged, in which case $s_{\mathrm{conf}}$ is reduced. This shrinks the trust region and makes the update more conservative. This confidence moderation is therefore an additional robustness heuristic layered on top of the KL trust region, not a separate geometric identity.
+The target $\delta_{\mathrm{KL}}$ is itself moderated by a confidence factor $s_{\mathrm{conf}} \in [s_{\min}, 1]$. In the implementation, this factor is obtained by comparing optimization-relevant quantities estimated from the first and second halves of the production data, such as target predictions and their gradients. Large split-half disagreement is interpreted as evidence that the current replay estimates are noisy or insufficiently converged, in which case $s_{\mathrm{conf}}$ is reduced. This shrinks the trust region and makes the update more conservative. This confidence moderation is therefore an additional robustness heuristic layered on top of the KL trust region, not a separate geometric identity.
 
 The empirical Fisher matrix is therefore the operator that turns the Euclidean loss gradient into a natural-gradient-like base step, after which the optimizer applies the stabilization steps described above. The full logic is:
 
 \begin{enumerate}
-    \item replay the frozen reference frames to obtain endpoint free energies and endpoint gradients,
-    \item assemble the latent-space loss gradient from those endpoint contributions,
+    \item replay the frozen reference frames to obtain the target predictions and their gradients,
+    \item assemble the latent-space loss gradient from those target contributions,
     \item estimate the empirical Fisher matrix from reweighted score vectors at the visited lambda states,
     \item use that Fisher matrix as the local metric tensor of the statistical manifold,
     \item stabilize and bound the proposed update through diagonal regularization, scale-invariant truncation, and the quadratic KL model in Equation \eqref{eq:kltrust}.
 \end{enumerate}
 %
-This is why a KL target, rather than a raw Euclidean step length, is the natural quantity to bound. A step that is small in Euclidean coordinates can still be large in distribution space if it distorts the ensemble strongly, while a step that is large in a weakly constrained coordinate may still be statistically safe. The Fisher metric captures that distinction directly. In that sense, the endpoint replay machinery determines which direction lowers the objective, whereas the empirical Fisher determines how far the optimizer can move in that direction before the induced ensemble changes too much.
+This is why a KL target, rather than a raw Euclidean step length, is the natural quantity to bound. A step that is small in Euclidean coordinates can still be large in distribution space if it distorts the ensemble strongly, while a step that is large in a weakly constrained coordinate may still be statistically safe. The Fisher metric captures that distinction directly. In that sense, the replay machinery determines which direction lowers the objective, whereas the empirical Fisher determines how far the optimizer can move in that direction before the induced ensemble changes too much.
