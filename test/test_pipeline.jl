@@ -280,7 +280,7 @@ end
         u_ref=copy(energies),
         active_bias=(f=zeros(FT, 2), log_rho=zeros(FT, 2)),
     )
-    grad_cycle, _ = AWHGrads.compute_leg_endpoint_state(
+    grad_cycle, dG_leg = AWHGrads.compute_leg_endpoint_state(
         leg,
         trainable_param_names,
         gradients,
@@ -296,11 +296,19 @@ end
         optimization_confidence_scale_strength=FT(1.0),
         optimization_confidence_residual_requirement_strength=FT(0.5),
     )
+    targets = AWHGrads.AbstractTrainingTarget[
+        AWHGrads.ResolvedCycleFreeEnergyTarget(:cycle_free_energy, 0.0, nothing, 1.0),
+    ]
     summary = AWHGrads.compute_optimization_confidence_summary(
+        targets,
         [leg],
         Dict(:solvent => energies),
         Dict(:solvent => gradients),
         Dict(:solvent => FT[]),
+        Dict(:solvent => dG_leg),
+        Dict(:solvent => grad_cycle),
+        Dict(:solvent => AWHGrads.compute_leg_log_mixture_denom(leg, FT(1.0), FT[])),
+        Dict{Symbol, Any}(),
         trainable_param_names,
         grad_cycle,
         FT(1.0),
@@ -318,6 +326,28 @@ end
     @test summary.additional_residual_requirement > 0
     @test opt_cfg.kl_target * summary.scale < opt_cfg.kl_target
     @test opt_cfg.max_phi_step_solute * summary.scale < opt_cfg.max_phi_step_solute
+end
+
+@testset "20 C defaults and production controls" begin
+    sim_cfg = AWHGrads.default_simulation_config(FT=Float64, AT=Array)
+    cycle_cfg = AWHGrads.validate_cycle_config(
+        AWHGrads.resolved_cycle_config(sim_cfg);
+        default_lambda_schedule=sim_cfg.lambda_schedule,
+        FT=sim_cfg.FT,
+    )
+    solvent_leg = only(filter(leg -> !leg.is_vacuum, cycle_cfg.legs))
+    vacuum_leg = only(filter(leg -> leg.is_vacuum, cycle_cfg.legs))
+
+    @test sim_cfg.T0 == 293.15u"K"
+    @test AWHGrads.production_segment_steps_for_leg(solvent_leg, sim_cfg) >
+          AWHGrads.production_segment_steps_for_leg(vacuum_leg, sim_cfg)
+
+    solvent_controls = AWHGrads.production_frame_selection_controls(solvent_leg, sim_cfg)
+    vacuum_controls = AWHGrads.production_frame_selection_controls(vacuum_leg, sim_cfg)
+    @test solvent_controls.min_frames == sim_cfg.production_reweight_min_frames_solv
+    @test solvent_controls.max_frames == sim_cfg.production_reweight_max_frames_solv
+    @test vacuum_controls.min_frames == sim_cfg.production_reweight_min_frames_vac
+    @test vacuum_controls.max_frames == sim_cfg.production_reweight_max_frames_vac
 end
 
 @testset "Molly dispersion correction unit stripping" begin

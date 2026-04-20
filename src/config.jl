@@ -271,13 +271,24 @@ function default_simulation_config(; FT::DataType=Float32, AT=CuArray, device_id
         AT=AT,
         nonbonded_energy_type=default_nonbonded_energy_type(FT),
         Δt=FT(1)u"fs",
-        T0=FT(310)u"K",
+        T0=FT(293.15)u"K",
         P0=FT(1)u"bar",
         lambda_schedule=FT.(range(1.0, stop=0.0, length=21)),
         awh_budget_time=FT(20)u"ns",
         awh_block_time=FT(0.5)u"ns",
         md_time_production=FT(0.5)u"ns",
+        md_time_production_solv=FT(1.0)u"ns",
+        md_time_production_vac=nothing,
         production_log_interval=100,
+        production_reweight_stride_solv=5,
+        production_reweight_stride_vac=5,
+        production_reweight_min_frames_solv=1000,
+        production_reweight_min_frames_vac=500,
+        production_reweight_max_frames_solv=3000,
+        production_reweight_max_frames_vac=1500,
+        production_discard_fraction=0.0,
+        production_segments_solv=1,
+        production_segments_vac=1,
         solute_idx=1:9,
         pdb_solv="ethanol_solv.pdb",
         pdb_vac="ethanol_vac.pdb",
@@ -314,6 +325,9 @@ function default_optimization_config(; FT::DataType=Float32)
         max_macro_epochs=30,
         max_inner_epochs=10,
         huber_delta=FT(2.0),
+        default_target_relative_tolerance=FT(0.05),
+        cycle_target_absolute_tolerance_kcal_mol=FT(0.1),
+        observable_target_absolute_tolerance=FT(1e-3),
         kl_target=FT(0.25),
         eigenvalue_tol_scale=FT(1e-3),
         min_phi_step=FT(5e-4),
@@ -670,6 +684,14 @@ function apply_simulation_config!(cfg::SimulationConfig)
     if !(0.0 <= discard_fraction < 1.0)
         throw(ArgumentError("awh_probe_discard_fraction must lie in [0, 1)."))
     end
+    production_discard_fraction = Float64(cfg.production_discard_fraction)
+    if !(0.0 <= production_discard_fraction < 1.0)
+        throw(ArgumentError("production_discard_fraction must lie in [0, 1)."))
+    end
+    cfg.production_segments_solv >= 1 ||
+        throw(ArgumentError("production_segments_solv must be at least 1."))
+    cfg.production_segments_vac >= 1 ||
+        throw(ArgumentError("production_segments_vac must be at least 1."))
 
     global FT = cfg.FT
     global AT = cfg.AT

@@ -40,6 +40,22 @@ function build_example_configs()
     lambda_schedule = Float32.(range(1.0, stop=0.0, length=21))
     dense_solvent_lambda_schedule = AWHGrads.dense_solvent_leg_lambda_schedule(base_sim.FT; lambda_scheduler=:ele_scaled)
     cycle_cfg = AWHGrads.default_cycle_config(; target_dG_kcal_mol=base_sim.dG_exp_kcal_mol, FT=base_sim.FT)
+    targets = AWHGrads.AbstractTrainingTarget[
+        AWHGrads.CycleFreeEnergyTarget(
+            name=:hydration_free_energy,
+            target_dG_kcal_mol=cycle_cfg.target_dG_kcal_mol,
+        ),
+        AWHGrads.StateObservableTarget(
+            name=:solvent_density,
+            leg=:solvent,
+            state=:coupled,
+            observable=AWHGrads.MassDensityObservable(),
+            # The reference density corresponds to liquid water at 20 C.
+            target_value=0.99815,
+            weight=1.0,
+            unit_label="g/mL",
+        ),
+    ]
 
     # Ensure the solvent leg in the cycle object matches our desired R&D sampling depth.
     for leg in cycle_cfg.legs
@@ -70,11 +86,16 @@ function build_example_configs()
         device_id=1,
         solute_idx=1:9,
         lambda_schedule=lambda_schedule,
+        T0=base_sim.FT(293.15)u"K",
         # Keep the project default mixed-precision path: Float32 dynamics with
         # Float64 nonbonded potential-energy accumulation.
         nonbonded_energy_type=AWHGrads.default_nonbonded_energy_type(base_sim.FT),
         awh_budget_time=base_sim.FT(60)u"ns",
+        md_time_production_solv=base_sim.FT(1.5)u"ns",
         production_log_interval=500,
+        production_reweight_stride_solv=3,
+        production_reweight_min_frames_solv=1500,
+        production_reweight_max_frames_solv=3000,
         awh_probe_reweight_stride_solv=2,
         awh_probe_reweight_min_frames_solv=2000,
         awh_probe_reweight_max_frames_solv=6000,
@@ -97,6 +118,7 @@ function build_example_configs()
             coverage_type=:physical,
         ),
         cycle=cycle_cfg,
+        targets=targets,
         parameter_reference_leg=:solvent,
     )
 

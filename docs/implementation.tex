@@ -76,24 +76,26 @@ Once every leg in the cycle has passed Stage B, the pipeline launches a second f
     \item the frozen bias metadata,
     \item precomputed replay neighbor data,
     \item an ensemble-evaluation cache for CPU replay,
-    \item the reference energy matrix $u_{\mathrm{ref},\ell}$ over all store frames and all lambda states.
+    \item the reference energy matrix $u_{\mathrm{ref},\ell}$ over the selected production frames and all lambda states.
 \end{itemize}
 
-These production artifacts are the only data used by the optimizer.
+These production artifacts are the only data used by the optimizer. Before replay begins, the raw frozen-bias logger is passed through a production-frame selection rule that mirrors the Stage B probe treatment: stride thinning, minimum-frame backfilling, evenly spaced maximum-frame capping, and optional leading-frame discard are all applied under the unchanged frozen bias. Every replay quantity used by optimization---including $u_{\mathrm{ref},\ell}$, endpoint free energies, observable estimates, observable gradients, and ESS diagnostics---is built on this selected frame set rather than on the denser raw logger.
+
+The production duration can also differ by leg type. In the bundled defaults, solvent-like legs use a longer frozen production segment than vacuum legs because low-frequency observables such as density are typically the noisiest optimization targets. The implementation can furthermore append multiple back-to-back production segments under the same frozen bias, which is valid because the reference mixture remains unchanged throughout the append.
 
 \subsection{Offline Optimization and Step Acceptance}
 
 The optimizer evaluates the current candidate parameter vector on the frozen production artifacts and assembles three objects:
 
 \begin{enumerate}
-    \item the coefficient-weighted cycle free energy,
-    \item the coefficient-weighted cycle gradient in latent space,
+    \item the full set of replayed target predictions,
+    \item the summed tolerance-normalized objective and its latent-space gradient,
     \item the empirical Fisher matrix in latent space.
 \end{enumerate}
 
 The per-frame force-field gradients $\nabla_\theta U_\ell(\mathbf{x}_n, i; \theta)$ required for both the cycle gradient and the empirical Fisher estimate are obtained by differentiating the Molly potential-energy function with respect to the parameter vector via reverse-mode automatic differentiation, using Enzyme. The chain-rule factor $d\theta_p/d\phi_p$ from the family-specific latent-to-physical transform is then applied to convert these $\theta$-space gradients into latent-space gradients before the Fisher and cycle-gradient assembly.
 
-The base step is formed from the replay gradient and empirical Fisher matrix derived in the theory section, then stabilized through diagonal preconditioning, eigentruncation, KL-target scaling, and a per-pool infinity-norm cap on the latent update. The per-pool cap bounds the maximum absolute latent-coordinate change within each parameter pool independently, using a configurable \texttt{max\_phi\_step} per pool; this allows, for example, a tighter cap on Lennard-Jones $\sigma$ parameters than on partial-charge parameters. These are practical numerical design choices rather than additional formal identities. The line search then proposes
+The base step is formed from the replay gradient and empirical Fisher matrix derived in the theory section, then stabilized through diagonal preconditioning, eigentruncation, KL-target scaling, and a per-pool infinity-norm cap on the latent update. The per-pool cap bounds the maximum absolute latent-coordinate change within each parameter pool independently, using a configurable \texttt{max\_phi\_step} per pool; this allows, for example, a tighter cap on Lennard-Jones $\sigma$ parameters than on partial-charge parameters. These are practical numerical design choices rather than additional formal identities. Before any update is attempted, the optimizer checks whether every target is already within its configured tolerance band; if so, that macro epoch exits immediately without taking another inner-loop step. The line search then proposes
 
 \begin{equation}
     \phi_{\mathrm{prop}}
@@ -108,35 +110,35 @@ starting from $\alpha=1$ and halving up to a fixed maximum of seven iterations u
 \begin{itemize}
     \item the effective sample size, evaluated at the \emph{proposed} parameters $\phi_{\mathrm{prop}}$, remains above the per-leg threshold for every leg,
     \item the per-pool physical parameter drift relative to the reference model remains within configured bounds for every pool,
-    \item the residual satisfies the acceptance test described below.
+    \item the normalized objective satisfies the acceptance test described below.
 \end{itemize}
 
 The ESS is recomputed at $\phi_{\mathrm{prop}}$ on each halving step, not at the current parameters; it therefore checks whether the frozen reference ensemble still provides adequate importance-sampling support for the proposed candidate ensemble. The drift check is applied to the mapped physical parameters $\theta_{\mathrm{prop}} = \theta(\phi_{\mathrm{prop}})$ and gates per-pool families independently.
 
-The residual test is not a simple monotonic decrease. Let $\tau$ be a configurable relative noise tolerance and let $r_{\mathrm{add}} \geq 0$ be the additional improvement requirement from split-half confidence (defined below). A proposal is accepted when
+The objective test is not a simple monotonic decrease. Let $\tau$ be a configurable relative noise tolerance and let $r_{\mathrm{add}} \geq 0$ be the additional improvement requirement from split-half confidence (defined below). Denote by $\mathcal{J}$ the summed weighted Huber objective in normalized-residual space. A proposal is accepted when
 
 \begin{equation}
-    |\mathcal{E}_{\mathrm{prop}}|
+    \mathcal{J}_{\mathrm{prop}}
     \leq
     \max\!\left(\varepsilon_{\mathrm{floor}},\;
-        |\mathcal{E}|
+        \mathcal{J}
         +
-        \tau \, |\mathcal{E}|
+        \tau \, \mathcal{J}
         -
         r_{\mathrm{add}}
     \right),
     \label{eq:lsaccept}
 \end{equation}
 %
-where $\mathcal{E}$ is the residual at the current parameters and $\varepsilon_{\mathrm{floor}}$ is a small positive floor derived from the noise tolerance. The window therefore widens by a fraction $\tau$ of the current residual magnitude, while $r_{\mathrm{add}}$ tightens it when production-data confidence is poor; the floor prevents the acceptance threshold from collapsing to zero. If all seven halvings are exhausted without satisfying all three conditions the line search is declared failed, which triggers an early exit from the inner optimization loop.
+where $\varepsilon_{\mathrm{floor}}$ is a small positive floor derived from the noise tolerance. The window therefore widens by a fraction $\tau$ of the current objective magnitude, while $r_{\mathrm{add}}$ tightens it when production-data confidence is poor; the floor prevents the acceptance threshold from collapsing to zero. Using $\mathcal{J}$ instead of a raw-unit residual is what keeps mixed free-energy and observable targets on a common footing. If all seven halvings are exhausted without satisfying all three conditions the line search is declared failed, which triggers an early exit from the inner optimization loop.
 
 \paragraph{Split-half confidence scaling.}
-The production artifacts are also split deterministically into first and second temporal halves. The code recomputes endpoint free energies and gradients on each half and forms three disagreement measures:
+The production artifacts are also split deterministically into first and second temporal halves. The code recomputes target predictions, normalized target losses, and gradients on each half and forms three disagreement measures:
 
 \begin{itemize}
-    \item the maximum per-leg endpoint $\Delta G$ disagreement,
-    \item the disagreement in the full cycle contribution,
-    \item the disagreement in the cycle gradient vector.
+    \item the maximum per-target prediction disagreement expressed in tolerance units,
+    \item the disagreement in the full normalized objective,
+    \item the disagreement in the objective gradient vector.
 \end{itemize}
 
 These are compressed into a confidence factor
@@ -151,7 +153,7 @@ These are compressed into a confidence factor
     \right),
 \end{equation}
 %
-where $\delta_{\max}$ is the largest disagreement signal. The same split-half analysis also adds an extra residual-improvement requirement proportional to the cycle disagreement before a line-search step is accepted.
+where $\delta_{\max}$ is the largest disagreement signal. The same split-half analysis also adds an extra objective-improvement requirement proportional to the normalized-objective disagreement before a line-search step is accepted.
 
 \paragraph{Inner-loop exits.}
 
@@ -202,7 +204,9 @@ The repository now supports a general thermodynamic cycle with arbitrary legs, c
     \item the solvent leg uses an NPT expanded ensemble with a staged, charge-first and Lennard-Jones-second lambda schedule concentrated in the low-Lennard-Jones tail,
     \item the vacuum leg uses a simpler non-periodic leg with no pressure-volume term,
     \item the optimization can jointly train Lennard-Jones parameters and partial charges through the constrained charge-equilibration parameterization described above,
+    \item the default target-mixing rule uses a $5\%$ tolerance band for both cycle free energies and replayed observables unless a target-specific tolerance is supplied explicitly,
+    \item the default thermodynamic state is $20\,^\circ\mathrm{C}$ ($293.15\,\mathrm{K}$) so that the bundled solvent-density target is evaluated at the matching temperature,
     \item optimization is solute-only unless solvent parameters are explicitly enabled.
 \end{itemize}
 
-This is therefore no longer a speculative milestone roadmap. The implemented method is a readiness-gated, frozen-bias replay pipeline with support-aware Stage B validation, bounded latent-coordinate optimization, KL-limited natural-gradient steps, and deterministic confidence moderation from split-half production artifacts.
+This is therefore no longer a speculative milestone roadmap. The implemented method is a readiness-gated, frozen-bias replay pipeline with support-aware Stage B validation, longer and thinner frozen production for noisy observables, tolerance-normalized multi-target optimization, bounded latent-coordinate updates, KL-limited natural-gradient steps, and deterministic confidence moderation from split-half production artifacts.

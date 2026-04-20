@@ -199,6 +199,50 @@ end
 time_to_steps_floor(duration) = Int(floor(uconvert(unit(Δt), duration) / Δt))
 time_to_steps_round(duration) = max(1, Int(round(uconvert(unit(Δt), duration) / Δt)))
 
+function production_duration_for_leg(
+    leg::ThermodynamicLegConfig,
+    sim_cfg::SimulationConfig,
+)
+    if leg.is_vacuum
+        return isnothing(sim_cfg.md_time_production_vac) ? sim_cfg.md_time_production : sim_cfg.md_time_production_vac
+    end
+    return isnothing(sim_cfg.md_time_production_solv) ? sim_cfg.md_time_production : sim_cfg.md_time_production_solv
+end
+
+function production_segment_steps_for_leg(
+    leg::ThermodynamicLegConfig,
+    sim_cfg::SimulationConfig,
+)
+    return max(1, time_to_steps_floor(production_duration_for_leg(leg, sim_cfg)))
+end
+
+function production_segment_count_for_leg(
+    leg::ThermodynamicLegConfig,
+    sim_cfg::SimulationConfig,
+)
+    return leg.is_vacuum ? max(1, sim_cfg.production_segments_vac) : max(1, sim_cfg.production_segments_solv)
+end
+
+function production_frame_selection_controls(
+    leg::ThermodynamicLegConfig,
+    sim_cfg::SimulationConfig,
+)
+    if leg.is_vacuum
+        return (
+            frame_stride=max(1, sim_cfg.production_reweight_stride_vac),
+            min_frames=max(2, sim_cfg.production_reweight_min_frames_vac),
+            max_frames=max(0, sim_cfg.production_reweight_max_frames_vac),
+            discard_fraction=Float64(sim_cfg.production_discard_fraction),
+        )
+    end
+    return (
+        frame_stride=max(1, sim_cfg.production_reweight_stride_solv),
+        min_frames=max(2, sim_cfg.production_reweight_min_frames_solv),
+        max_frames=max(0, sim_cfg.production_reweight_max_frames_solv),
+        discard_fraction=Float64(sim_cfg.production_discard_fraction),
+    )
+end
+
 """
     compute_standard_state_correction(cycle_cfg, FT)
 
@@ -1087,7 +1131,7 @@ end
 
 """
     collect_production_artifacts!(cycle_cfg, awh_by_leg, sys_by_leg, idxs_by_leg,
-                                  runtime, theta_active, param_names, md_steps_prod,
+                                  runtime, theta_active, param_names, sim_cfg,
                                   p0_energy_per_vol)
 
 Run the final production segment for each ready leg and package the results for
@@ -1102,7 +1146,7 @@ function collect_production_artifacts!(
     runtime::RuntimeState,
     theta_active::Vector{FT},
     param_names::Vector{String},
-    md_steps_prod::Int,
+    sim_cfg::SimulationConfig,
     p0_energy_per_vol::PT,
     eval_cfg::EnsembleEvalConfig,
 ) where {FT <: AbstractFloat, PT <: AbstractFloat}
@@ -1119,17 +1163,41 @@ function collect_production_artifacts!(
     artifacts = LegArtifacts[]
     for leg in cycle_cfg.legs
         name = leg.name
+        segment_steps = production_segment_steps_for_leg(leg, sim_cfg)
+        n_segments = production_segment_count_for_leg(leg, sim_cfg)
+        frame_controls = production_frame_selection_controls(leg, sim_cfg)
+
         # Production frames must be sampled under the exact same frozen bias that
         # the offline MBAR step later uses in its mixture denominator.
-        awh_prod, bias_data = build_frozen_bias_awh_sim(awh_by_leg[name], md_steps_prod)
+        awh_prod, bias_data = build_frozen_bias_awh_sim(awh_by_leg[name], segment_steps)
         runtime.active_bias[name] = bias_data
-        simulate!(awh_prod, md_steps_prod)
+        total_segment_steps = segment_steps * n_segments
+        for segment_idx in 1:n_segments
+            simulate!(awh_prod, segment_steps)
+            if n_segments > 1
+                @info "Production segment ($(name)): segment=$segment_idx/$n_segments | segment_steps=$segment_steps | total_steps_so_far=$(segment_idx * segment_steps) | total_ns_so_far=$(round(steps_to_ns(segment_idx * segment_steps), digits=4))"
+            end
+        end
 
         # Persist the end-of-production state so the next macro epoch can start
         # close to the current basin.
         runtime.restart_cache[name] = capture_restart_state(awh_prod)
 
-        logger_prod = get_production_logger(awh_prod, String(name))
+        logger_prod_raw = get_production_logger(awh_prod, String(name))
+        raw_frame_count = length(logger_prod_raw.active_idx_history)
+        production_selection = select_probe_frame_indices(
+            raw_frame_count;
+            frame_stride=frame_controls.frame_stride,
+            min_frames=frame_controls.min_frames,
+            max_frames=frame_controls.max_frames,
+            discard_fraction=frame_controls.discard_fraction,
+        )
+        selected_frame_indices = production_selection.retained
+        logger_prod = subset_awh_logger_frames(logger_prod_raw, selected_frame_indices)
+        selected_frame_count = length(logger_prod.active_idx_history)
+        max_frames_msg = frame_controls.max_frames > 0 ? string(frame_controls.max_frames) : "none"
+        @info "Production frame selection ($(name)): raw_frames=$raw_frame_count | selected_frames=$(length(production_selection.selected)) | retained_frames=$selected_frame_count | discard_fraction=$(round(frame_controls.discard_fraction, digits=3)) | stride=$(frame_controls.frame_stride) | min_frames=$(frame_controls.min_frames) | max_frames=$max_frames_msg"
+
         neighbors = precompute_neighbors(logger_prod, awh_prod.state.active_sys)
         eval_cache = build_ensemble_eval_cache(
             logger_prod,
@@ -1145,7 +1213,7 @@ function collect_production_artifacts!(
             idxs_by_leg[name]...;
             compute_gradients=false,
         )
-        @info "Production artifact ($(name)): frames=$(length(logger_prod.active_idx_history)) | λ_states=$(length(awh_prod.state.partition.λ_atoms)) | eval_threads=$(eval_cache.config.threads) | lambda_tile=$(eval_cache.config.lambda_tile) | eval_schedule=$(eval_cache.config.schedule)"
+        @info "Production artifact ($(name)): frames=$(selected_frame_count) | raw_frames=$raw_frame_count | segments=$n_segments | segment_steps=$segment_steps | total_steps=$total_segment_steps | total_ns=$(round(steps_to_ns(total_segment_steps), digits=4)) | λ_states=$(length(awh_prod.state.partition.λ_atoms)) | eval_threads=$(eval_cache.config.threads) | lambda_tile=$(eval_cache.config.lambda_tile) | eval_schedule=$(eval_cache.config.schedule)"
 
         push!(artifacts, LegArtifacts(
             name=name,
@@ -1163,6 +1231,9 @@ function collect_production_artifacts!(
             active_bias=bias_data,
             idxs=idxs_by_leg[name],
             eval_cache=eval_cache,
+            raw_frame_count=raw_frame_count,
+            selected_frame_indices=selected_frame_indices,
+            n_production_segments=n_segments,
         ))
     end
 
@@ -1196,6 +1267,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
         leg.name => resolve_leg_state_schedule(leg, sim_cfg.lambda_schedule, FT)
         for leg in cycle_cfg.legs
     )
+    targets = resolve_training_targets(sim_cfg, cycle_cfg, state_schedules_by_leg)
     runtime = RuntimeState()
 
     thermo_AT = default_energy_analysis_type(sim_cfg)
@@ -1203,7 +1275,6 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
 
     md_steps_budget = time_to_steps_floor(sim_cfg.awh_budget_time)
     md_steps_block = time_to_steps_round(sim_cfg.awh_block_time)
-    md_steps_prod = time_to_steps_floor(sim_cfg.md_time_production)
     md_steps_rewarm = min(
         max(1, Int(round(md_steps_budget * opt_cfg.rewarm_fraction))),
         md_steps_budget,
@@ -1264,9 +1335,6 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
         e_unit = sys_by_leg[first_leg.name].energy_units
         beta_val = thermo_AT(1.0 / ustrip(uconvert(e_unit, Unitful.R * T0)))
         p0_energy_per_vol = thermo_AT(ustrip(uconvert(e_unit, P0 * thermo_AT(1.0)u"nm^3" * Unitful.Na)))
-
-        dG_exp_physical = thermo_AT(cycle_cfg.target_dG_kcal_mol) * thermo_AT(4.184)
-        dG_exp = dG_exp_physical * beta_val
 
         readiness_result = run_readiness_loop!(
             cycle_cfg,
@@ -1357,7 +1425,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             runtime,
             theta_active,
             param_names,
-            md_steps_prod,
+            sim_cfg,
             p0_energy_per_vol,
             sim_cfg.ensemble_eval,
         )
@@ -1380,7 +1448,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             phi_0,
             beta_val,
             dG_std_corr,
-            dG_exp,
+            targets,
             opt_cfg,
         )
 
@@ -1393,7 +1461,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             ", ",
         )
 
-        @info "Macro $macro_epoch Residual Summary: Start = $(round(opt_result.macro_start_residual, digits=3)) | Best = $(round(opt_result.best_macro_residual, digits=3)) (Epoch $(opt_result.best_macro_epoch)) | End = $(round(opt_result.macro_end_residual, digits=3)) | Exit = $(opt_result.phase2_exit_reason) | AWH split-gap(max) = $(round(split_gap_max, digits=4)) kT | Parity gaps = [$parity_summary] kT"
+        @info "Macro $macro_epoch Objective Summary: Start = $(round(opt_result.macro_start_residual, digits=5)) | Best = $(round(opt_result.best_macro_residual, digits=5)) (Epoch $(opt_result.best_macro_epoch)) | End = $(round(opt_result.macro_end_residual, digits=5)) | Exit = $(opt_result.phase2_exit_reason) | AWH split-gap(max) = $(round(split_gap_max, digits=4)) kT | Parity gaps = [$parity_summary] kT"
     end
 
     runtime.phi_active = phi_active

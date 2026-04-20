@@ -34,7 +34,7 @@ FT = Float32
 AT = CuArray
 nonbonded_energy_type = default_nonbonded_energy_type(FT)
 Δt = FT(1)u"fs"
-T0 = FT(310)u"K"
+T0 = FT(293.15)u"K"
 P0 = FT(1)u"bar"
 lambda_schedule = FT.(range(1.0, stop=0.0, length=21))
 num_lambda_states = length(lambda_schedule)
@@ -49,6 +49,7 @@ include("gradients_core.jl")
 include("setup.jl")
 include("logging_utils.jl")
 include("ensemble_eval.jl")
+include("observables.jl")
 include("readiness.jl")
 include("transforms.jl")
 include("index_maps.jl")
@@ -63,6 +64,11 @@ export EnsembleEvalConfig
 export StageAReadinessPolicyConfig
 export ThermodynamicLegConfig
 export ThermodynamicCycleConfig
+export AbstractTrainingTarget
+export CycleFreeEnergyTarget
+export StateObservableTarget
+export ResolvedCycleFreeEnergyTarget
+export ResolvedStateObservableTarget
 export ParameterPoolConfig
 export ChargeTrainingConfig
 export ParameterBoundsConfig
@@ -70,6 +76,7 @@ export RuntimeState
 export LegArtifacts
 export StageAStats
 export StageBStats
+export MassDensityObservable
 export default_simulation_config
 export default_optimization_config
 export default_cycle_config
@@ -83,6 +90,7 @@ export effective_nonbonded_energy_type
 export default_energy_analysis_type
 export awh_logger_value_types
 export resolve_parameter_reference_leg
+export resolve_training_targets
 export resolve_force_field_paths
 export simulation_config_with
 export optimization_config_with

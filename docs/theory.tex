@@ -365,15 +365,37 @@ and the residual against experiment is
     \label{eq:residual}
 \end{equation}
 
-The code applies a Huber derivative to this residual, so the optimization gradient is actually:
+The implemented objective does not act on this raw residual directly. Instead, the cycle target is assigned a tolerance $s_{\mathrm{cyc}} > 0$ expressed in the same native units as the target before conversion to reduced units. By default the code uses a relative tolerance of $5\%$ of the target magnitude together with a small absolute floor. After converting the target and its tolerance into reduced units, the optimizer works with the normalized residual
 
 \begin{equation}
-    \nabla_\theta \mathcal{L}
+    z_{\mathrm{cyc}}(\theta)
     =
-    \frac{d \mathcal{L}}{d \mathcal{E}}
+    \frac{\mathcal{E}(\theta)}{s_{\mathrm{cyc}}}.
+    \label{eq:normalized_cycle_residual}
+\end{equation}
+
+Let $H_\delta(z)$ denote the Huber loss with threshold $\delta$, and let $w_{\mathrm{cyc}}$ be the dimensionless priority weight attached to the cycle target. The implemented cycle contribution to the objective is then
+
+\begin{equation}
+    \mathcal{L}_{\mathrm{cyc}}(\theta)
+    =
+    w_{\mathrm{cyc}} H_\delta\!\left(z_{\mathrm{cyc}}(\theta)\right).
+    \label{eq:cycle_huber_loss}
+\end{equation}
+
+Its gradient is
+
+\begin{equation}
+    \nabla_\theta \mathcal{L}_{\mathrm{cyc}}
+    =
+    w_{\mathrm{cyc}}
+    \frac{d H_\delta}{dz}
+    \frac{1}{s_{\mathrm{cyc}}}
     \nabla_\theta \Delta G_{\mathrm{cyc}}(\theta).
     \label{eq:lossgradtheta}
 \end{equation}
+
+The same normalization logic is later applied to observable targets, so heterogeneous quantities such as free energies and densities can be mixed without one raw unit system dominating the summed objective.
 
 \section{General Reweighted Observables}
 
@@ -685,12 +707,32 @@ Suppose now that $r \in \mathcal{R}$ indexes one observable target. Each such ta
     \label{eq:obsresidual}
 \end{equation}
 
-If this residual is passed through any differentiable scalar loss function $\mathcal{L}_r(\mathcal{E}_r)$, then its gradient is simply
+Each target is also assigned a tolerance $s_r > 0$ in its own native units. In the implemented code, $s_r$ defaults to $5\%$ of the target magnitude, again with a small absolute floor for near-zero targets, unless an explicit tolerance is supplied in the configuration. The optimizer therefore uses the normalized residual
 
 \begin{equation}
-    \nabla_\theta \mathcal{L}_r(\mathcal{E}_r(\theta))
+    z_r(\theta)
     =
-    \frac{d \mathcal{L}_r}{d \mathcal{E}_r}
+    \frac{\mathcal{E}_r(\theta)}{s_r},
+    \label{eq:obs_normalized_residual}
+\end{equation}
+
+and the weighted Huber contribution
+
+\begin{equation}
+    \mathcal{L}_r(\theta)
+    =
+    w_r H_\delta\!\left(z_r(\theta)\right),
+    \label{eq:obs_target_loss}
+\end{equation}
+
+where $w_r$ is a dimensionless priority multiplier. The corresponding gradient is
+
+\begin{equation}
+    \nabla_\theta \mathcal{L}_r(\theta)
+    =
+    w_r
+    \frac{d H_\delta}{dz_r}
+    \frac{1}{s_r}
     \nabla_\theta \widehat{O}_r(\theta).
     \label{eq:obslossgrad}
 \end{equation}
@@ -716,6 +758,8 @@ with total gradient
 \end{equation}
 
 Equation \eqref{eq:lossgradtheta} is therefore the currently implemented special case in which $\mathcal{R}$ contains only the thermodynamic-cycle contribution. Extending the method to new observables does not require changing the frozen-bias replay machinery itself; it only requires adding further target contributions whose predictions and gradients are computed from the same replay weights.
+
+This normalization also defines the default success criterion. A target is considered within specification whenever $|\mathcal{E}_r(\theta)| \le s_r$, that is, whenever its raw prediction error lies within the configured tolerance band. The optimizer therefore treats the $5\%$ band not only as a scaling convention for mixed-unit losses, but also as the default notion of per-target success.
 
 \section{Bounded Coordinates}
 

@@ -44,6 +44,9 @@ METRIC_COLORS = {
     "probe_ns": "#9c89b8",
     "residual": "#bf4342",
     "accepted_residual": "#2a9d8f",
+    "objective": "#bf4342",
+    "accepted_objective": "#2a9d8f",
+    "objective_threshold": "#6c757d",
     "prediction": "#3a86ff",
     "target": "#6c757d",
     "grad_norm": "#2d6a4f",
@@ -58,6 +61,16 @@ METRIC_COLORS = {
     "ESS": "#1d3557",
     "N_active": "#9c6644",
 }
+TARGET_PALETTE = [
+    "#3a86ff",
+    "#ef476f",
+    "#118ab2",
+    "#6a4c93",
+    "#2a9d8f",
+    "#e76f51",
+    "#ffb703",
+    "#577590",
+]
 PHASE_COLORS = {
     "Initial Rewarm": "#b8b8c6",
     "Stage A Block": "#4c78a8",
@@ -156,6 +169,17 @@ def parse_probe_ess_map(text: str) -> Dict[str, float]:
     return data
 
 
+def parse_named_value_map(text: str) -> Dict[str, float]:
+    data: Dict[str, float] = {}
+    for chunk in text.split("|"):
+        item = chunk.strip()
+        if not item or "=" not in item:
+            continue
+        name, value = item.split("=", 1)
+        data[name.strip()] = to_float(value)
+    return data
+
+
 def parse_pool_drift_map(text: str) -> Dict[str, Dict[str, float]]:
     data: Dict[str, Dict[str, float]] = {}
     for chunk in text.split("|"):
@@ -168,6 +192,53 @@ def parse_pool_drift_map(text: str) -> Dict[str, Dict[str, float]]:
             metrics[label.strip(" /")] = to_float(value)
         data[pool.strip()] = metrics
     return data
+
+
+def parse_pipe_fields(text: str, *, lowercase_keys: bool = False) -> Dict[str, str]:
+    fields: Dict[str, str] = {}
+    for chunk in text.split("|"):
+        item = chunk.strip()
+        if not item or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if lowercase_keys:
+            key = key.lower()
+        fields[key] = value.strip()
+    return fields
+
+
+def parse_gate_fields(text: str) -> Dict[str, object]:
+    fields: Dict[str, object] = {}
+    for chunk in text.split("|"):
+        item = chunk.strip()
+        if not item:
+            continue
+        if "<=" in item:
+            lhs, rhs = item.split("<=", 1)
+            lhs = lhs.strip()
+            rhs = rhs.strip()
+            if "=" in lhs:
+                key, value = lhs.split("=", 1)
+                key = key.strip()
+                fields[key] = to_bool(value)
+                fields[f"{key}_threshold"] = to_float(rhs)
+            else:
+                fields["threshold"] = to_float(rhs)
+            continue
+        if "=" in item:
+            key, value = item.split("=", 1)
+            fields[key.strip()] = to_bool(value)
+    return fields
+
+
+def split_numeric_suffix(text: str) -> Tuple[Optional[float], str]:
+    match = re.match(r"\s*([-\deE+.]+)(?:\s+(.*?))?\s*$", text)
+    if not match:
+        return None, ""
+    value = to_float(match.group(1))
+    suffix = (match.group(2) or "").strip()
+    return value, suffix
 
 
 def parse_index_list(raw: str) -> List[int]:
@@ -331,6 +402,11 @@ class OptimizationEpoch:
     target: Optional[float] = None
     residual: Optional[float] = None
     accepted_residual: Optional[float] = None
+    objective_value: Optional[float] = None
+    accepted_objective: Optional[float] = None
+    objective_threshold: Optional[float] = None
+    objective_in_band: Optional[bool] = None
+    objective_step_accepted: Optional[bool] = None
     extra_residual_requirement: Optional[float] = None
     huber_dlde: Optional[float] = None
     grad_norm: Optional[float] = None
@@ -346,6 +422,10 @@ class OptimizationEpoch:
     confidence_gradient_disagreement: Optional[float] = None
     confidence_eligible_legs: Optional[int] = None
     confidence_skipped_legs: List[str] = field(default_factory=list)
+    confidence_prediction_disagreement: Optional[float] = None
+    confidence_objective_disagreement: Optional[float] = None
+    confidence_eligible_targets: Optional[int] = None
+    confidence_skipped_targets: List[str] = field(default_factory=list)
     kl_est: Optional[float] = None
     kl_target: Optional[float] = None
     kl_scaling: Optional[float] = None
@@ -357,6 +437,7 @@ class OptimizationEpoch:
     line_search_iters: List[Dict[str, object]] = field(default_factory=list)
     parameters: Dict[str, float] = field(default_factory=dict)
     leg_metrics: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    target_metrics: Dict[str, Dict[str, object]] = field(default_factory=dict)
     line_search_converged: bool = False
 
 
@@ -414,8 +495,14 @@ class LogParser:
     )
     opt_epoch_re = re.compile(r">> Optimization Epoch: Active (?:Block|Pools) = (.+)")
     clip_re = re.compile(r"Step clipped by infinity-norm \(Scaling: ([-\deE+.]+)\)")
+    ls_iter_new_re = re.compile(
+        r"LS Iter (\d+) \(.*?=([-\deE+.]+)\): ESS\[(.*?)\](?: \| Drift\[(.*?)\])? \| Targets\[(.*?)\] \| Obj = ([-\deE+.]+) \| Gate\[(.*?)\]"
+    )
     ls_iter_re = re.compile(r"LS Iter (\d+) \(.*?=([-\deE+.]+)\): ESS\[(.*?)\](?: \| Drift\[(.*?)\])? \| Res = ([-\deE+.]+)")
     opt_metrics_re = re.compile(r"--- Optimization Metrics \(Epoch (\d+) - (?:Block:\s*)?(.+)\) ---")
+    objective_re = re.compile(
+        r"Objective:\s+value\s*=\s*([-\deE+.]+)\s+\|\s+Accepted\s*=\s*([-\deE+.]+)\s+\|\s+Extra req\s*=\s*([-\deE+.]+)\s+\|\s+Threshold\s*=\s*([-\deE+.]+)(?:\s+\|\s+in_band\s*=\s*(true|false))?\s+\|\s+step_accepted\s*=\s*(true|false)"
+    )
     prediction_re = re.compile(r"Prediction:\s+.*?=\s*([-\deE+.]+)\s*kT\s+\|\s+Target\s*=\s*([-\deE+.]+)\s*kT")
     error_re = re.compile(r"Error:\s+Residual\s*=\s*([-\deE+.]+)\s+\|\s+Huber dL/dE\s*=\s*([-\deE+.]+)")
     accepted_re = re.compile(r"Accepted:\s+Residual\s*=\s*([-\deE+.]+)\s+\|\s+Extra req\s*=\s*([-\deE+.]+)")
@@ -431,6 +518,10 @@ class LogParser:
         r"Confidence:\s+endpoint_ΔG\s*=\s*([-\deE+.]+) \| cycle\s*=\s*([-\deE+.]+) \| gradient\s*=\s*([-\deE+.]+) \| eligible_legs\s*=\s*(\d+)"
     )
     confidence_skipped_re = re.compile(r"Confidence:\s+skipped_legs\s*=\s*(.*)")
+    confidence_new_re = re.compile(
+        r"Confidence:\s+prediction\s*=\s*([-\deE+.]+) \| objective\s*=\s*([-\deE+.]+) \| gradient\s*=\s*([-\deE+.]+) \| eligible_targets\s*=\s*(\d+)"
+    )
+    confidence_skipped_new_re = re.compile(r"Confidence:\s+skipped_targets\s*=\s*(.*)")
     kl_re = re.compile(r"KL Bound:\s+Est\. KL\s*=\s*([-\deE+.]+)\s+\|\s+Target\s*=\s*([-\deE+.]+)\s+\|\s+Scaling\s*=\s*([-\deE+.]+)")
     alpha_re = re.compile(r"Line Search:\s+Converged .*?=\s*([-\deE+.]+)")
     step_re = re.compile(r"Actual Step:\s+Max .*?=\s*([-\deE+.]+)\s+\(.*?=([-\deE+.]+)\)")
@@ -976,6 +1067,21 @@ class LogParser:
                 self.current_opt_epoch.step_clipped_scaling = to_float(clip_match.group(1))
                 return
 
+            ls_iter_new_match = self.ls_iter_new_re.search(message)
+            if ls_iter_new_match:
+                iter_data = {
+                    "iter": to_int(ls_iter_new_match.group(1)),
+                    "alpha": to_float(ls_iter_new_match.group(2)),
+                    "ess": parse_probe_ess_map(ls_iter_new_match.group(3)),
+                    "targets": parse_named_value_map(ls_iter_new_match.group(5)),
+                    "objective": to_float(ls_iter_new_match.group(6)),
+                    "gate": parse_gate_fields(ls_iter_new_match.group(7)),
+                }
+                if ls_iter_new_match.group(4):
+                    iter_data["drift"] = parse_pool_drift_map(ls_iter_new_match.group(4))
+                self.current_opt_epoch.line_search_iters.append(iter_data)
+                return
+
             ls_iter_match = self.ls_iter_re.search(message)
             if ls_iter_match:
                 iter_data = {
@@ -992,7 +1098,11 @@ class LogParser:
             if "Line search converged" in message:
                 self.current_opt_epoch.line_search_converged = True
                 if self.current_opt_epoch.line_search_iters:
-                    self.current_opt_epoch.accepted_residual = self.current_opt_epoch.line_search_iters[-1]["residual"]
+                    last_iter = self.current_opt_epoch.line_search_iters[-1]
+                    if "objective" in last_iter:
+                        self.current_opt_epoch.accepted_objective = float(last_iter["objective"])
+                    if "residual" in last_iter:
+                        self.current_opt_epoch.accepted_residual = float(last_iter["residual"])
                 return
 
             if message.startswith("--- Current Parameter State ---"):
@@ -1031,6 +1141,16 @@ class LogParser:
             if prediction_match:
                 self.current_opt_epoch.prediction = to_float(prediction_match.group(1))
                 self.current_opt_epoch.target = to_float(prediction_match.group(2))
+                return
+
+            objective_match = self.objective_re.search(message)
+            if objective_match:
+                self.current_opt_epoch.objective_value = to_float(objective_match.group(1))
+                self.current_opt_epoch.accepted_objective = to_float(objective_match.group(2))
+                self.current_opt_epoch.extra_residual_requirement = to_float(objective_match.group(3))
+                self.current_opt_epoch.objective_threshold = to_float(objective_match.group(4))
+                self.current_opt_epoch.objective_in_band = to_bool(objective_match.group(5))
+                self.current_opt_epoch.objective_step_accepted = to_bool(objective_match.group(6))
                 return
 
             error_match = self.error_re.search(message)
@@ -1083,10 +1203,24 @@ class LogParser:
                 self.current_opt_epoch.confidence_eligible_legs = to_int(confidence_match.group(4))
                 return
 
+            confidence_new_match = self.confidence_new_re.search(message)
+            if confidence_new_match:
+                self.current_opt_epoch.confidence_prediction_disagreement = to_float(confidence_new_match.group(1))
+                self.current_opt_epoch.confidence_objective_disagreement = to_float(confidence_new_match.group(2))
+                self.current_opt_epoch.confidence_gradient_disagreement = to_float(confidence_new_match.group(3))
+                self.current_opt_epoch.confidence_eligible_targets = to_int(confidence_new_match.group(4))
+                return
+
             confidence_skipped_match = self.confidence_skipped_re.search(message)
             if confidence_skipped_match:
                 skipped = confidence_skipped_match.group(1).strip()
                 self.current_opt_epoch.confidence_skipped_legs = [item for item in skipped.split(",") if item]
+                return
+
+            confidence_skipped_new_match = self.confidence_skipped_new_re.search(message)
+            if confidence_skipped_new_match:
+                skipped = confidence_skipped_new_match.group(1).strip()
+                self.current_opt_epoch.confidence_skipped_targets = [item.strip() for item in skipped.split(",") if item.strip()]
                 return
 
             kl_match = self.kl_re.search(message)
@@ -1112,6 +1246,34 @@ class LogParser:
                 self.current_opt_epoch.params_min = to_float(params_match.group(1))
                 self.current_opt_epoch.params_max = to_float(params_match.group(2))
                 return
+
+            if message.startswith("Target "):
+                target_body = message[len("Target ") :]
+                if ":" in target_body:
+                    target_name, payload = target_body.split(":", 1)
+                    fields = parse_pipe_fields(payload)
+                    pred_value, pred_unit = split_numeric_suffix(fields.get("pred", ""))
+                    target_metric: Dict[str, object] = {
+                        "kind": fields.get("kind", ""),
+                        "prediction": pred_value,
+                        "unit": pred_unit,
+                        "reference": parse_optional_float(fields.get("ref", "")),
+                        "residual": parse_optional_float(fields.get("residual", "")),
+                        "weight": parse_optional_float(fields.get("weight", "")),
+                        "loss": parse_optional_float(fields.get("loss", "")),
+                        "ESS": parse_optional_float(fields.get("ESS", "")),
+                    }
+                    if "leg" in fields:
+                        target_metric["leg"] = fields["leg"]
+                    if "state" in fields:
+                        target_metric["state"] = fields["state"]
+                    target_name = target_name.strip()
+                    self.current_opt_epoch.target_metrics[target_name] = target_metric
+                    if target_metric.get("kind") == "cycle_free_energy" and self.current_opt_epoch.prediction is None:
+                        self.current_opt_epoch.prediction = pred_value
+                        self.current_opt_epoch.target = target_metric.get("reference")
+                        self.current_opt_epoch.residual = target_metric.get("residual")
+                    return
 
             leg_metric_match = self.leg_metric_re.search(message)
             if leg_metric_match:
@@ -1353,6 +1515,39 @@ def latest_cached_stage_b_event(run: RunRecord, leg: str) -> Optional[ControlEve
     return events[-1] if events else None
 
 
+def epoch_objective_value(epoch: OptimizationEpoch) -> Optional[float]:
+    return epoch.objective_value if epoch.objective_value is not None else epoch.residual
+
+
+def epoch_accepted_objective(epoch: OptimizationEpoch) -> Optional[float]:
+    return epoch.accepted_objective if epoch.accepted_objective is not None else epoch.accepted_residual
+
+
+def epoch_confidence_prediction(epoch: OptimizationEpoch) -> Optional[float]:
+    return (
+        epoch.confidence_prediction_disagreement
+        if epoch.confidence_prediction_disagreement is not None
+        else epoch.confidence_endpoint_disagreement
+    )
+
+
+def epoch_confidence_objective(epoch: OptimizationEpoch) -> Optional[float]:
+    return (
+        epoch.confidence_objective_disagreement
+        if epoch.confidence_objective_disagreement is not None
+        else epoch.confidence_cycle_disagreement
+    )
+
+
+def collect_target_names(epochs: Sequence[OptimizationEpoch]) -> List[str]:
+    names: List[str] = []
+    for epoch in epochs:
+        for name in epoch.target_metrics:
+            if name not in names:
+                names.append(name)
+    return names
+
+
 def stage_a_gate_value(snapshot: StageASnapshot, gate: str) -> int:
     if gate == "df":
         return -1 if snapshot.df_ok is None else int(bool(snapshot.df_ok))
@@ -1503,7 +1698,14 @@ def write_dashboard(path: Path, run: RunRecord) -> None:
     ax.text(x + 0.02, y + 0.06, f"Warnings: {len(run.warnings)}", fontsize=11)
     if run.optimization_epochs:
         last = run.optimization_epochs[-1]
-        ax.text(x + 0.02, y + 0.02, f"Last residual: {last.residual:.3f}" if last.residual is not None else "Last residual: -", fontsize=10, color="#555555")
+        last_metric = epoch_objective_value(last)
+        ax.text(
+            x + 0.02,
+            y + 0.02,
+            f"Last objective: {last_metric:.3f}" if last_metric is not None else "Last objective: -",
+            fontsize=10,
+            color="#555555",
+        )
 
     x, y, w, h = card_positions["notes"]
     lines: List[str] = []
@@ -1519,8 +1721,9 @@ def write_dashboard(path: Path, run: RunRecord) -> None:
         )
     if run.optimization_epochs:
         last = run.optimization_epochs[-1]
+        accepted_metric = epoch_accepted_objective(last)
         lines.append(
-            f"The most recent optimization epoch targeted pools '{last.block_name}' with accepted residual {last.accepted_residual if last.accepted_residual is not None else last.residual}."
+            f"The most recent optimization epoch targeted pools '{last.block_name}' with accepted objective {accepted_metric}."
         )
     if not lines:
         lines.append("No summary interpretation available.")
@@ -1880,7 +2083,11 @@ def write_optimization_panels(path: Path, run: RunRecord) -> None:
     if not epochs:
         return
     boundaries = macro_boundaries_from_epochs(run)
-    fig, axes = plt.subplots(3, 2, figsize=(14, 12), sharex=True)
+    target_names = collect_target_names(epochs)
+    has_target_panels = bool(target_names)
+    has_objectives = any(e.objective_value is not None for e in epochs)
+    nrows = 4 if has_target_panels else 3
+    fig, axes = plt.subplots(nrows, 2, figsize=(14, 4 * nrows), sharex=True)
     axes = axes.ravel()
 
     def add_boundaries(ax: plt.Axes) -> None:
@@ -1897,13 +2104,34 @@ def write_optimization_panels(path: Path, run: RunRecord) -> None:
     init_x = {macro: idx - 1 for macro, idx in macro_first_epoch.items()}
 
     x = [e.global_epoch_index for e in epochs]
+    objective_panel = [
+        (
+            "Objective" if has_objectives else "Residual",
+            [epoch_objective_value(e) for e in epochs] if has_objectives else [e.residual for e in epochs],
+            METRIC_COLORS["objective"] if has_objectives else METRIC_COLORS["residual"],
+        ),
+        (
+            "Accepted objective" if has_objectives else "Accepted",
+            [epoch_accepted_objective(e) for e in epochs] if has_objectives else [e.accepted_residual for e in epochs],
+            METRIC_COLORS["accepted_objective"] if has_objectives else METRIC_COLORS["accepted_residual"],
+        ),
+    ]
+    if has_objectives:
+        objective_panel.extend(
+            [
+                ("Threshold", [e.objective_threshold for e in epochs], METRIC_COLORS["objective_threshold"]),
+            ]
+        )
+    else:
+        objective_panel.extend(
+            [
+                ("Prediction", [e.prediction for e in epochs], METRIC_COLORS["prediction"]),
+                ("Target", [e.target for e in epochs], METRIC_COLORS["target"]),
+            ]
+        )
+
     plots = [
-        (axes[0], "Residuals", "kT", [
-            ("Residual", [e.residual for e in epochs], METRIC_COLORS["residual"]),
-            ("Accepted", [e.accepted_residual for e in epochs], METRIC_COLORS["accepted_residual"]),
-            ("Prediction", [e.prediction for e in epochs], METRIC_COLORS["prediction"]),
-            ("Target", [e.target for e in epochs], METRIC_COLORS["target"]),
-        ]),
+        (axes[0], "Objective" if has_objectives else "Residuals", "loss" if has_objectives else "kT", objective_panel),
         (axes[1], "Trust region", "KL / alpha / step", [
             ("Est. KL", [e.kl_est for e in epochs], METRIC_COLORS["kl_est"]),
             ("KL scaling", [e.kl_scaling for e in epochs], METRIC_COLORS["kl_scaling"]),
@@ -1929,13 +2157,27 @@ def write_optimization_panels(path: Path, run: RunRecord) -> None:
             ("Vacuum log10(N_active)", [safe_log10(e.leg_metrics.get("vacuum", {}).get("N_active")) for e in epochs], "#6d597a"),
         ]),
     ]
+    if has_target_panels:
+        target_colors = {name: TARGET_PALETTE[idx % len(TARGET_PALETTE)] for idx, name in enumerate(target_names)}
+        plots.extend(
+            [
+                (axes[6], "Per-target loss", "loss", [
+                    (f"{name} loss", [e.target_metrics.get(name, {}).get("loss") for e in epochs], target_colors[name])
+                    for name in target_names
+                ]),
+                (axes[7], "Per-target support", "ESS", [
+                    (f"{name} ESS", [e.target_metrics.get(name, {}).get("ESS") for e in epochs], target_colors[name])
+                    for name in target_names
+                ]),
+            ]
+        )
 
     for ax, title, ylabel, series_list in plots:
         apply_axis_style(ax)
         for name, values, color in series_list:
             pts = finite_xy(list(zip(x, values)))
             if pts:
-                linestyle = "--" if name in {"Prediction", "Target", "Solvent log10(N_active)", "Vacuum log10(N_active)"} else "-"
+                linestyle = "--" if name in {"Prediction", "Target", "Threshold", "Solvent log10(N_active)", "Vacuum log10(N_active)"} else "-"
                 ax.plot([a for a, _ in pts], [b for _, b in pts], color=color, linewidth=2.0, linestyle=linestyle, label=name)
         add_boundaries(ax)
         ax.set_title(title, loc="left", fontsize=13, fontweight="bold")
@@ -2341,8 +2583,10 @@ def build_report_text(run: RunRecord) -> str:
             )
     if run.optimization_epochs:
         last_epoch = run.optimization_epochs[-1]
+        final_metric = epoch_objective_value(last_epoch)
+        final_accepted = epoch_accepted_objective(last_epoch)
         lines.append(
-            f"final_optimization_epoch: global={last_epoch.global_epoch_index} macro={last_epoch.macro_index} residual={last_epoch.residual} accepted_residual={last_epoch.accepted_residual}"
+            f"final_optimization_epoch: global={last_epoch.global_epoch_index} macro={last_epoch.macro_index} objective={final_metric} accepted_objective={final_accepted}"
         )
         lines.append(f"tracked_parameters: {len(last_epoch.parameters)}")
     if run.warnings:

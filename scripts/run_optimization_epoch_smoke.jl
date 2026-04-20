@@ -266,9 +266,8 @@ function main(; dry_run::Bool=false, enable_charge_training::Bool=true, run_opti
         thermo_AT = AWHGrads.default_energy_analysis_type(sim_cfg)
         dG_std_corr = AWHGrads.compute_standard_state_correction(cycle_cfg, thermo_AT)
         p0_energy_per_vol = thermo_AT(ustrip(uconvert(sys_base.energy_units, AWHGrads.P0 * thermo_AT(1.0)u"nm^3" * Unitful.Na)))
-        dG_exp_physical = thermo_AT(cycle_cfg.target_dG_kcal_mol) * thermo_AT(4.184)
-        dG_exp = dG_exp_physical * beta_val
         state_schedule = state_schedules_by_leg[leg.name]
+        targets = AWHGrads.resolve_training_targets(sim_cfg, cycle_cfg, state_schedules_by_leg)
         leg_artifacts = [
             AWHGrads.LegArtifacts(
                 name=leg.name,
@@ -308,7 +307,7 @@ function main(; dry_run::Bool=false, enable_charge_training::Bool=true, run_opti
             pstate.phi_0,
             beta_val,
             dG_std_corr,
-            dG_exp,
+            targets,
             opt_cfg,
         )
         println("Optimization phase finished.")

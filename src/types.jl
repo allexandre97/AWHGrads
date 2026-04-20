@@ -111,6 +111,59 @@ Base.@kwdef struct ThermodynamicCycleConfig
     target_dG_kcal_mol::Float64 = -5.01
 end
 
+abstract type AbstractTrainingTarget end
+
+"""
+    CycleFreeEnergyTarget
+
+Objective term that matches the coefficient-weighted thermodynamic-cycle free
+energy assembled from the configured legs. When `target_dG_kcal_mol` is left as
+`nothing`, the cycle-level target stored on `ThermodynamicCycleConfig` is used.
+"""
+Base.@kwdef struct CycleFreeEnergyTarget <: AbstractTrainingTarget
+    name::Symbol = :cycle_free_energy
+    target_dG_kcal_mol::Union{Nothing, Float64} = nothing
+    tolerance_kcal_mol::Union{Nothing, Float64} = nothing
+    weight::Float64 = 1.0
+end
+
+"""
+    StateObservableTarget
+
+Objective term that matches a scalar observable evaluated on one replayed
+physical state of one thermodynamic leg. The observable itself is any callable
+that accepts a replayed `Molly.System` and returns a scalar.
+"""
+Base.@kwdef struct StateObservableTarget{O, S, T <: Real} <: AbstractTrainingTarget
+    name::Symbol
+    leg::Symbol
+    state::S = :coupled
+    observable::O
+    target_value::T
+    tolerance::Union{Nothing, Float64} = nothing
+    weight::Float64 = 1.0
+    unit_label::String = ""
+end
+
+struct ResolvedCycleFreeEnergyTarget <: AbstractTrainingTarget
+    name::Symbol
+    target_dG_kcal_mol::Float64
+    tolerance_kcal_mol::Union{Nothing, Float64}
+    weight::Float64
+end
+
+struct ResolvedStateObservableTarget{O, T <: Real} <: AbstractTrainingTarget
+    name::Symbol
+    leg::Symbol
+    state_idx::Int
+    state_label::Symbol
+    observable::O
+    target_value::T
+    tolerance::Union{Nothing, Float64}
+    weight::Float64
+    unit_label::String
+end
+
 """
     ParameterPoolConfig
 
@@ -204,15 +257,26 @@ Base.@kwdef struct SimulationConfig
 
     # Integrator timestep and thermodynamic state.
     Δt = Float32(1)u"fs"
-    T0 = Float32(310)u"K"
+    T0 = Float32(293.15)u"K"
     P0 = Float32(1)u"bar"
     lambda_schedule = Float32.(range(1.0, stop=0.0, length=21))
 
     # Macro-cycle timing.
     awh_budget_time = Float32(20)u"ns"
     awh_block_time = Float32(1.0)u"ns"
-    md_time_production = Float32(0.1)u"ns"
+    md_time_production = Float32(0.5)u"ns"
+    md_time_production_solv = Float32(1.0)u"ns"
+    md_time_production_vac = nothing
     production_log_interval::Int = 100
+    production_reweight_stride_solv::Int = 5
+    production_reweight_stride_vac::Int = 5
+    production_reweight_min_frames_solv::Int = 1000
+    production_reweight_min_frames_vac::Int = 500
+    production_reweight_max_frames_solv::Int = 3000
+    production_reweight_max_frames_vac::Int = 1500
+    production_discard_fraction::Float64 = 0.0
+    production_segments_solv::Int = 1
+    production_segments_vac::Int = 1
 
     # Solute atoms whose nonbonded parameters are coupled to λ.
     solute_idx = 1:9
@@ -235,6 +299,7 @@ Base.@kwdef struct SimulationConfig
     # New user-facing configuration for non-hardcoded systems/cycles.
     force_field::ForceFieldConfig = ForceFieldConfig()
     cycle::Union{Nothing, ThermodynamicCycleConfig} = nothing
+    targets::Union{Nothing, AbstractVector} = nothing
     parameter_reference_leg::Union{Nothing, Symbol} = nothing
     parameter_pools::Vector{ParameterPoolConfig} = ParameterPoolConfig[]
     charge_training::ChargeTrainingConfig = ChargeTrainingConfig()
@@ -256,6 +321,9 @@ Base.@kwdef struct OptimizationConfig
     max_macro_epochs::Int = 30
     max_inner_epochs::Int = 10
     huber_delta = Float32(2.0)
+    default_target_relative_tolerance = Float32(0.05)
+    cycle_target_absolute_tolerance_kcal_mol = Float32(0.1)
+    observable_target_absolute_tolerance = Float32(1e-3)
 
     # Trust-region / natural-gradient step sizing.
     kl_target = Float32(0.25)
@@ -383,6 +451,9 @@ Base.@kwdef mutable struct LegArtifacts
     active_bias::Any = nothing
     idxs::Any = nothing
     eval_cache::Any = nothing
+    raw_frame_count::Int = 0
+    selected_frame_indices::Vector{Int} = Int[]
+    n_production_segments::Int = 1
 end
 
 """

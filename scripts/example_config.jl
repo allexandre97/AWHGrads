@@ -26,6 +26,21 @@ parameter_pools = [
 # default path defined on the cycle itself.
 lambda_schedule = Float32.(range(1.0, stop=0.0, length=21))
 custom_cycle = AWHGrads.default_cycle_config(; target_dG_kcal_mol=-5.01, FT=base_sim.FT)
+targets = AWHGrads.AbstractTrainingTarget[
+    AWHGrads.CycleFreeEnergyTarget(
+        name=:hydration_free_energy,
+        target_dG_kcal_mol=custom_cycle.target_dG_kcal_mol,
+    ),
+    AWHGrads.StateObservableTarget(
+        name=:solvent_density,
+        leg=:solvent,
+        state=:coupled,
+        observable=AWHGrads.MassDensityObservable(),
+        target_value=0.99815,
+        weight=1.0,
+        unit_label="g/mL",
+    ),
+]
 
 sim_cfg = AWHGrads.simulation_config_with(
     base_sim;
@@ -33,6 +48,7 @@ sim_cfg = AWHGrads.simulation_config_with(
     lambda_schedule=lambda_schedule,
     nonbonded_energy_type=AWHGrads.default_nonbonded_energy_type(base_sim.FT),
     cycle=custom_cycle,
+    targets=targets,
     solute_idx=1:9,
     parameter_pools=parameter_pools,
     force_field=AWHGrads.ForceFieldConfig(
