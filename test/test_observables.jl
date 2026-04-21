@@ -115,6 +115,15 @@ end
             tolerance=0.02,
             unit_label="g/mL",
         ),
+        AWHGrads.StateObservableTarget(
+            name=:solvent_dielectric,
+            leg=:solvent,
+            state=:coupled,
+            observable=AWHGrads.DielectricConstantObservable(),
+            target_value=80.35,
+            tolerance=0.5,
+            unit_label="epsilon_r",
+        ),
     ]
     sim_cfg_targets = AWHGrads.simulation_config_with(
         sim_cfg;
@@ -127,15 +136,21 @@ end
         state_schedules_by_leg,
     )
 
-    @test length(resolved_targets) == 2
+    @test length(resolved_targets) == 3
     cycle_target = only(filter(target -> target isa AWHGrads.ResolvedCycleFreeEnergyTarget, resolved_targets))
     @test cycle_target.tolerance_kcal_mol == 0.25
-    density_target = only(filter(target -> target isa AWHGrads.ResolvedStateObservableTarget, resolved_targets))
+    density_target = only(filter(target -> target isa AWHGrads.ResolvedStateObservableTarget && target.name == :solvent_density, resolved_targets))
     @test density_target.leg == :solvent
     @test density_target.state_idx == state_schedules_by_leg[:solvent].coupled_state_idx
     @test density_target.unit_label == "g/mL"
     @test density_target.target_value == 0.99815
     @test density_target.tolerance == 0.02
+    dielectric_target = only(filter(target -> target isa AWHGrads.ResolvedStateObservableTarget && target.name == :solvent_dielectric, resolved_targets))
+    @test dielectric_target.leg == :solvent
+    @test dielectric_target.state_label == :coupled
+    @test dielectric_target.target_value == 80.35
+    @test dielectric_target.tolerance == 0.5
+    @test dielectric_target.unit_label == "epsilon_r"
 end
 
 @testset "density example config uses generic targets" begin
@@ -157,16 +172,20 @@ end
         state_schedules_by_leg,
     )
 
-    @test length(resolved_targets) == 2
+    @test length(resolved_targets) == 3
     @test any(target -> target isa AWHGrads.ResolvedCycleFreeEnergyTarget, resolved_targets)
-    density_target = only(filter(target -> target isa AWHGrads.ResolvedStateObservableTarget, resolved_targets))
+    density_target = only(filter(target -> target isa AWHGrads.ResolvedStateObservableTarget && target.name == :solvent_density, resolved_targets))
     @test density_target.name == :solvent_density
     @test density_target.leg == :solvent
     @test density_target.state_label == :coupled
     @test density_target.target_value == 0.99815
+    dielectric_target = only(filter(target -> target isa AWHGrads.ResolvedStateObservableTarget && target.name == :solvent_dielectric, resolved_targets))
+    @test dielectric_target.leg == :solvent
+    @test dielectric_target.state_label == :coupled
+    @test dielectric_target.target_value == 80.35
 end
 
-@testset "target tolerances default to 5 percent with floors" begin
+@testset "target tolerances default to 0.1 percent with floors" begin
     opt_cfg = AWHGrads.default_optimization_config(FT=Float64)
     cycle_target = AWHGrads.ResolvedCycleFreeEnergyTarget(
         :cycle_free_energy,
@@ -175,7 +194,7 @@ end
         1.0,
     )
     cycle_tol = AWHGrads.target_tolerance_value(cycle_target, 1.0, opt_cfg, Float64)
-    @test isapprox(cycle_tol, 0.05 * abs(cycle_target.target_dG_kcal_mol) * 4.184; rtol=1e-8)
+    @test isapprox(cycle_tol, 0.001 * abs(cycle_target.target_dG_kcal_mol) * 4.184; rtol=1e-8)
 
     zero_observable_target = AWHGrads.ResolvedStateObservableTarget(
         :zero_observable,
@@ -234,8 +253,8 @@ end
         Float64,
     )
 
-    @test isapprox(loss_small.normalized_residual, 0.8; atol=1e-10)
-    @test isapprox(loss_large.normalized_residual, 0.8; atol=1e-10)
+    @test isapprox(loss_small.normalized_residual, 40.0; atol=1e-10)
+    @test isapprox(loss_large.normalized_residual, 40.0; atol=1e-10)
     @test isapprox(loss_small.loss, loss_large.loss; atol=1e-10)
 end
 
@@ -262,6 +281,66 @@ end
 
     density = AWHGrads.MassDensityObservable()(sys)
     @test isapprox(density, 0.97858413; rtol=1e-5, atol=1e-6)
+end
+
+@testset "dielectric constant observable estimator matches dipole-fluctuation formula" begin
+    FT = Float64
+    trainable_param_names = ["atom_c3_σ"]
+    leg = AWHGrads.LegArtifacts(
+        name=:solvent,
+        coefficient=FT(1.0),
+        include_pv=false,
+        n_states=2,
+        coupled_state_idx=1,
+        decoupled_state_idx=2,
+        logger_prod=(active_idx_history=[1, 1],),
+        u_ref=FT[
+            0.0  1.0;
+            0.0  1.0;
+        ],
+        active_bias=(f=zeros(FT, 2), log_rho=zeros(FT, 2)),
+    )
+    observable = AWHGrads.DielectricConstantObservable()
+    energies = copy(leg.u_ref)
+    energy_gradients_phi = Dict(
+        "atom_c3_σ" => zeros(FT, size(energies)),
+    )
+    dipole_sq_values = FT[1.0, 9.0]
+    dipole_sq_gradients_phi = Dict("atom_c3_σ" => FT[0.0, 0.0])
+    dipole_component_values = (
+        FT[1.0, 3.0],
+        FT[0.0, 0.0],
+        FT[0.0, 0.0],
+    )
+    dipole_component_gradients_phi = (
+        Dict("atom_c3_σ" => FT[0.0, 0.0]),
+        Dict("atom_c3_σ" => FT[0.0, 0.0]),
+        Dict("atom_c3_σ" => FT[0.0, 0.0]),
+    )
+    volumes = FT[2.0, 4.0]
+    log_mixture_denom = AWHGrads.compute_leg_log_mixture_denom(leg, FT(1.0), FT[])
+
+    dielectric_grad, dielectric_prediction, state_ess = AWHGrads.compute_leg_dielectric_constant_estimate(
+        leg,
+        observable,
+        trainable_param_names,
+        energy_gradients_phi,
+        dipole_sq_values,
+        dipole_sq_gradients_phi,
+        dipole_component_values,
+        dipole_component_gradients_phi,
+        energies,
+        log_mixture_denom,
+        1,
+        FT(1.0),
+        volumes;
+        compute_gradients=true,
+    )
+
+    expected_prediction = 1 + (4 * π / 3) * observable.coulomb_const * ((5.0 - 4.0) / 3.0)
+    @test isapprox(dielectric_prediction, expected_prediction; rtol=1e-12, atol=1e-12)
+    @test state_ess == 2.0
+    @test dielectric_grad == [0.0]
 end
 
 @testset "replayed Molly.System observables compile and differentiate" begin
@@ -296,6 +375,22 @@ end
 
     @test isfinite(obs_value)
     @test all(isfinite, grads)
+
+    dipole_observable = sys -> sum(abs2, Molly.dipole_moment(sys))
+    dipole_grads = zeros(eltype(params), length(params))
+    dipole_value = AWHGrads.evaluate_frame_observable_gradients(
+        dipole_observable,
+        template,
+        coords,
+        box,
+        first(fixture.neighbors),
+        params,
+        dipole_grads,
+        idxs...,
+    )
+
+    @test isfinite(dipole_value)
+    @test all(isfinite, dipole_grads)
 
     sigma_idx = findfirst(name -> occursin("_σ", name), fixture.pstate.param_names)
     @test !isnothing(sigma_idx)
@@ -340,4 +435,89 @@ end
     @test haskey(value_grads, fixture.pstate.param_names[sigma_idx])
     @test all(isfinite, values)
     @test all(isfinite, value_grads[fixture.pstate.param_names[sigma_idx]])
+end
+
+@testset "state observable targets support non-gradient proposal evaluation" begin
+    fixture = build_observable_eval_fixture(; prod_steps=1)
+    leg_cfg = only(fixture.cycle_cfg.legs)
+    idxs = fixture.pstate.idxs_by_leg[leg_cfg.name]
+    eval_cache = AWHGrads.build_ensemble_eval_cache(
+        fixture.logger_prod,
+        fixture.neighbors,
+        fixture.awh_prod,
+        fixture.sys_base,
+        fixture.sim_cfg.ensemble_eval,
+    )
+
+    params = copy(fixture.pstate.theta_active)
+    u_ref, _ = AWHGrads.evaluate_ensemble(
+        eval_cache,
+        params,
+        fixture.pstate.param_names,
+        idxs...;
+        compute_gradients=false,
+    )
+    leg = AWHGrads.LegArtifacts(
+        name=leg_cfg.name,
+        coefficient=fixture.sim_cfg.FT(leg_cfg.coefficient),
+        include_pv=leg_cfg.include_pv,
+        p0_energy_per_vol=zero(fixture.sim_cfg.FT),
+        n_states=length(fixture.state_schedule.lambda),
+        coupled_state_idx=fixture.state_schedule.coupled_state_idx,
+        decoupled_state_idx=fixture.state_schedule.decoupled_state_idx,
+        logger_prod=fixture.logger_prod,
+        u_ref=u_ref,
+        active_bias=fixture.bias_data,
+        idxs=idxs,
+        eval_cache=eval_cache,
+    )
+    observable = sys -> sum(atom.σ for atom in sys.atoms)
+    target = AWHGrads.ResolvedStateObservableTarget(
+        :sigma_sum,
+        leg_cfg.name,
+        fixture.state_schedule.coupled_state_idx,
+        :coupled,
+        observable,
+        0.0,
+        nothing,
+        1.0,
+        "arb",
+    )
+    log_mixture_denom = AWHGrads.compute_leg_log_mixture_denom(leg, fixture.sim_cfg.FT(1.0), fixture.sim_cfg.FT[])
+
+    gradient, prediction, state_ess, cache = AWHGrads.evaluate_resolved_state_observable_target(
+        target,
+        leg,
+        u_ref,
+        Dict{String, Matrix{fixture.sim_cfg.FT}}(),
+        log_mixture_denom,
+        fixture.sim_cfg.FT[],
+        params,
+        fixture.pstate.param_names,
+        fixture.pstate.trainable_param_names,
+        nothing,
+        fixture.sim_cfg.FT(1.0);
+        compute_gradients=false,
+    )
+
+    @test cache isa AWHGrads.ScalarStateObservableCache
+    @test length(gradient) == length(fixture.pstate.trainable_param_names)
+    @test all(iszero, gradient)
+    @test isfinite(prediction)
+    @test isfinite(state_ess)
+    @test state_ess > zero(state_ess)
+    @test_throws ArgumentError AWHGrads.evaluate_resolved_state_observable_target(
+        target,
+        leg,
+        u_ref,
+        Dict{String, Matrix{fixture.sim_cfg.FT}}(),
+        log_mixture_denom,
+        fixture.sim_cfg.FT[],
+        params,
+        fixture.pstate.param_names,
+        fixture.pstate.trainable_param_names,
+        nothing,
+        fixture.sim_cfg.FT(1.0);
+        compute_gradients=true,
+    )
 end

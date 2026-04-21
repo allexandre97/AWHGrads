@@ -278,7 +278,7 @@ function compute_weights_and_ess(
     volumes::AbstractVector{VT} = BT[],
     P0::PT = zero(BT)
 ) where {ETC <: AbstractFloat, ETR <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat, PT <: AbstractFloat}
-    
+
     M = length(active_lambda_idx)
     if size(energies_current, 1) != M
         throw(ArgumentError("compute_weights_and_ess expected energies_current to have $M rows, got $(size(energies_current, 1))."))

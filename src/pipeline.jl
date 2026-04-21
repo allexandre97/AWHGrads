@@ -1213,6 +1213,14 @@ function collect_production_artifacts!(
             idxs_by_leg[name]...;
             compute_gradients=false,
         )
+        active_idx_history = copy(eval_cache.active_idx_history)
+        n_base = FT(awh_prod.initial_sampl_n + awh_prod.state.N_eff)
+        eval_cache = compact_ensemble_eval_cache(eval_cache)
+        logger_prod_artifact = isnothing(eval_cache.frame_cache) ? logger_prod : (active_idx_history=active_idx_history,)
+        # Once the frame/template caches and restart snapshot are materialized, the
+        # full frozen-production logger graph is redundant and keeps a large amount
+        # of memory live across macro epochs.
+        clear_awh_logger_histories!(awh_prod)
         @info "Production artifact ($(name)): frames=$(selected_frame_count) | raw_frames=$raw_frame_count | segments=$n_segments | segment_steps=$segment_steps | total_steps=$total_segment_steps | total_ns=$(round(steps_to_ns(total_segment_steps), digits=4)) | λ_states=$(length(awh_prod.state.partition.λ_atoms)) | eval_threads=$(eval_cache.config.threads) | lambda_tile=$(eval_cache.config.lambda_tile) | eval_schedule=$(eval_cache.config.schedule)"
 
         push!(artifacts, LegArtifacts(
@@ -1223,18 +1231,28 @@ function collect_production_artifacts!(
             n_states=length(state_schedules_by_leg[name].lambda),
             coupled_state_idx=state_schedules_by_leg[name].coupled_state_idx,
             decoupled_state_idx=state_schedules_by_leg[name].decoupled_state_idx,
-            awh_prod=awh_prod,
-            logger_prod=logger_prod,
-            neighbors=neighbors,
+            awh_prod=nothing,
+            logger_prod=logger_prod_artifact,
+            neighbors=nothing,
             u_ref=u_ref,
-            sys_base=sys_by_leg[name],
+            sys_base=nothing,
             active_bias=bias_data,
             idxs=idxs_by_leg[name],
             eval_cache=eval_cache,
+            active_idx_history=active_idx_history,
+            n_base=n_base,
             raw_frame_count=raw_frame_count,
             selected_frame_indices=selected_frame_indices,
             n_production_segments=n_segments,
         ))
+
+        logger_prod_raw = nothing
+        logger_prod = nothing
+        logger_prod_artifact = nothing
+        neighbors = nothing
+        eval_cache = nothing
+        awh_prod = nothing
+        # GC.gc(true)
     end
 
     sync_runtime_aliases!(runtime)
@@ -1430,7 +1448,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
             sim_cfg.ensemble_eval,
         )
 
-        GC.gc()
+        # GC.gc()
 
         opt_result = run_optimization_phase!(
             phi_active,
@@ -1462,6 +1480,7 @@ function run_pipeline(; sim_cfg::SimulationConfig=default_simulation_config(), o
         )
 
         @info "Macro $macro_epoch Objective Summary: Start = $(round(opt_result.macro_start_residual, digits=5)) | Best = $(round(opt_result.best_macro_residual, digits=5)) (Epoch $(opt_result.best_macro_epoch)) | End = $(round(opt_result.macro_end_residual, digits=5)) | Exit = $(opt_result.phase2_exit_reason) | AWH split-gap(max) = $(round(split_gap_max, digits=4)) kT | Parity gaps = [$parity_summary] kT"
+        GC.gc(true)
     end
 
     runtime.phi_active = phi_active

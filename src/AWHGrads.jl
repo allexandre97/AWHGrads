@@ -77,6 +77,7 @@ export LegArtifacts
 export StageAStats
 export StageBStats
 export MassDensityObservable
+export DielectricConstantObservable
 export default_simulation_config
 export default_optimization_config
 export default_cycle_config

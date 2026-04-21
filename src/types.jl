@@ -131,8 +131,10 @@ end
     StateObservableTarget
 
 Objective term that matches a scalar observable evaluated on one replayed
-physical state of one thermodynamic leg. The observable itself is any callable
-that accepts a replayed `Molly.System` and returns a scalar.
+physical state of one thermodynamic leg. Most observables are simple callables
+that accept a replayed `Molly.System` and return a scalar, but the optimization
+layer also exposes observable-specific dispatch hooks for richer targets that
+combine multiple reweighted moments internally.
 """
 Base.@kwdef struct StateObservableTarget{O, S, T <: Real} <: AbstractTrainingTarget
     name::Symbol
@@ -321,9 +323,9 @@ Base.@kwdef struct OptimizationConfig
     max_macro_epochs::Int = 30
     max_inner_epochs::Int = 10
     huber_delta = Float32(2.0)
-    default_target_relative_tolerance = Float32(0.05)
-    cycle_target_absolute_tolerance_kcal_mol = Float32(0.1)
-    observable_target_absolute_tolerance = Float32(1e-3)
+    default_target_relative_tolerance = Float32(0.001)
+    cycle_target_absolute_tolerance_kcal_mol = Float32(1e-3)
+    observable_target_absolute_tolerance = Float32(1e-4)
 
     # Trust-region / natural-gradient step sizing.
     kl_target = Float32(0.25)
@@ -451,6 +453,8 @@ Base.@kwdef mutable struct LegArtifacts
     active_bias::Any = nothing
     idxs::Any = nothing
     eval_cache::Any = nothing
+    active_idx_history::Vector{Int} = Int[]
+    n_base::Any = nothing
     raw_frame_count::Int = 0
     selected_frame_indices::Vector{Int} = Int[]
     n_production_segments::Int = 1

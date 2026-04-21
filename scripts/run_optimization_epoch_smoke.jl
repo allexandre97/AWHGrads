@@ -6,7 +6,7 @@
 # 3) clone a frozen-bias production segment for 0.1 ns
 # 4) collect at least 500 production frames
 # 5) warm up the exact Enzyme gradient path on one cached frame/template
-# 6) benchmark `evaluate_ensemble(...; compute_gradients=true)`
+# 6) precompute the reference reduced potentials needed by optimization
 # 7) run one actual optimization phase on the same frozen-bias artifact
 #
 # This script exists to exercise and profile the expensive optimization replay
@@ -41,6 +41,17 @@ function charge_enabled_smoke_parameter_pools(pool_cfgs::Vector{AWHGrads.Paramet
     ]
 end
 
+function example_training_targets(sim_cfg)
+    raw_targets = sim_cfg.targets
+    isnothing(raw_targets) &&
+        throw(ArgumentError("Expected the full example config to define explicit training targets."))
+
+    isempty(raw_targets) &&
+        throw(ArgumentError("Expected the full example config to define at least one training target."))
+
+    return AWHGrads.AbstractTrainingTarget[raw_targets...]
+end
+
 function solvent_only_cycle_from_example(cycle_cfg)
     solvent_leg = only(filter(leg -> leg.name == :solvent, cycle_cfg.legs))
     return AWHGrads.ThermodynamicCycleConfig(
@@ -63,10 +74,11 @@ end
 function build_optimization_smoke_configs(; enable_charge_training::Bool=true)
     sim_cfg, opt_cfg = build_example_configs()
     FT = sim_cfg.FT
+    training_targets = example_training_targets(sim_cfg)
 
-    awh_time = FT(0.1)u"ns"
-    production_time = FT(0.1)u"ns"
-    min_frames = 500
+    awh_time = FT(0.05)u"ns"
+    production_time = FT(0.01)u"ns"
+    min_frames = 50
     awh_steps = AWHGrads.time_to_steps_floor(awh_time)
     production_steps = AWHGrads.time_to_steps_floor(production_time)
     production_log_interval = production_interval_for_min_frames(production_steps, min_frames)
@@ -85,8 +97,9 @@ function build_optimization_smoke_configs(; enable_charge_training::Bool=true)
         production_log_interval=production_log_interval,
         parameter_pools=parameter_pools,
         charge_training=charge_training_cfg,
+        targets=training_targets,
         ensemble_eval=AWHGrads.EnsembleEvalConfig(
-            threads=min(Threads.nthreads(), 8),
+            threads=min(Threads.nthreads(), 32),
             lambda_tile=4,
             schedule=:dynamic,
             cache_unitless_frames=true,
@@ -130,6 +143,7 @@ function main(; dry_run::Bool=false, enable_charge_training::Bool=true, run_opti
     println("  Eval lambda tile: ", sim_cfg.ensemble_eval.lambda_tile)
     println("  Eval schedule: ", sim_cfg.ensemble_eval.schedule)
     println("  Charge training enabled: ", sim_cfg.charge_training.enabled)
+    println("  Training targets: ", join(string.(getfield.(sim_cfg.targets, :name)), ", "))
     println("  Optimization phase enabled: ", run_optimization)
 
     if dry_run
@@ -215,54 +229,34 @@ function main(; dry_run::Bool=false, enable_charge_training::Bool=true, run_opti
     println("  Eval cache build time: ", round(cache_elapsed, digits=3), " s")
     println("  Cached template count: ", isnothing(eval_cache.template_cache) ? 0 : length(eval_cache.template_cache))
 
-    coords, box = AWHGrads.ensemble_eval_frame_state(eval_cache, 1)
-    warmup_grads = zeros(FT, length(pstate.theta_active))
-    println("Warming up Enzyme on one cached frame/template...")
-    warmup_elapsed = @elapsed warmup_energy = AWHGrads.evaluate_frame_gradients(
-        first(eval_cache.template_cache),
-        coords,
-        box,
-        first(neighbors),
-        copy(pstate.theta_active),
-        warmup_grads,
-        idxs...,
-    )
-    println("  Warmup wall time: ", round(warmup_elapsed, digits=3), " s")
-    println("  Warmup energy: ", warmup_energy)
-
-    GC.gc()
-
-    println("Running full gradient ensemble evaluation...")
-    eval_stats = @timed AWHGrads.evaluate_ensemble(
-        eval_cache,
-        pstate.theta_active,
-        pstate.param_names,
-        idxs...;
-        compute_gradients=true,
-    )
-    energies, gradients = eval_stats.value
+    warmup_elapsed = 0.0
+    println("Skipping standalone Enzyme warmup; the optimization phase will compile the gradient path.")
 
     frame_state_evals = frame_count * λ_states
-    grad_entry_count = sum(length, values(gradients))
-    eval_rate = eval_stats.time > 0 ? frame_state_evals / eval_stats.time : Inf
-
-    println("Gradient ensemble evaluation finished.")
-    println("  Eval wall time: ", round(eval_stats.time, digits=3), " s")
-    println("  Eval GC time: ", round(eval_stats.gctime, digits=3), " s")
-    println("  Eval allocations: ", round(eval_stats.bytes / 2.0^30, digits=3), " GiB")
     println("  Frame-state evaluations: ", frame_state_evals)
-    println("  Throughput: ", round(eval_rate, digits=3), " frame-states/s")
-    println("  Energy matrix size: ", size(energies))
-    println("  Gradient matrices: ", length(gradients))
-    println("  Gradient scalar entries: ", grad_entry_count)
     println("  Frozen bias states stored: ", length(bias_data.f))
 
+    reference_energy_elapsed = 0.0
+    reference_energies = nothing
     optimization_elapsed = 0.0
     optimization_result = nothing
     phi_optimized = nothing
     theta_optimized = nothing
 
     if run_optimization
+        println("Precomputing reference ensemble energies for optimization...")
+        reference_energy_elapsed = @elapsed begin
+            reference_energies, _ = AWHGrads.evaluate_ensemble(
+                eval_cache,
+                pstate.theta_active,
+                pstate.param_names,
+                idxs...;
+                compute_gradients=false,
+            )
+        end
+        println("  Reference-energy wall time: ", round(reference_energy_elapsed, digits=3), " s")
+        println("  Reference-energy matrix size: ", size(reference_energies))
+
         thermo_AT = AWHGrads.default_energy_analysis_type(sim_cfg)
         dG_std_corr = AWHGrads.compute_standard_state_correction(cycle_cfg, thermo_AT)
         p0_energy_per_vol = thermo_AT(ustrip(uconvert(sys_base.energy_units, AWHGrads.P0 * thermo_AT(1.0)u"nm^3" * Unitful.Na)))
@@ -280,7 +274,7 @@ function main(; dry_run::Bool=false, enable_charge_training::Bool=true, run_opti
                 awh_prod=awh_prod,
                 logger_prod=logger_prod,
                 neighbors=neighbors,
-                u_ref=energies,
+                u_ref=reference_energies,
                 sys_base=sys_base,
                 active_bias=bias_data,
                 idxs=idxs,
@@ -327,10 +321,7 @@ function main(; dry_run::Bool=false, enable_charge_training::Bool=true, run_opti
         neighbor_elapsed_s=neighbors_elapsed,
         cache_elapsed_s=cache_elapsed,
         warmup_elapsed_s=warmup_elapsed,
-        eval_elapsed_s=eval_stats.time,
-        eval_gc_s=eval_stats.gctime,
-        eval_alloc_bytes=eval_stats.bytes,
-        eval_rate=eval_rate,
+        reference_energy_elapsed_s=reference_energy_elapsed,
         charge_training_enabled=sim_cfg.charge_training.enabled,
         optimization_elapsed_s=optimization_elapsed,
         optimization_exit_reason=isnothing(optimization_result) ? nothing : optimization_result.phase2_exit_reason,

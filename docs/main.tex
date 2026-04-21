@@ -2,6 +2,8 @@
 \usepackage[a4paper]{geometry}
 \usepackage{amsmath}
 \usepackage{amssymb}
+\usepackage{array}
+\usepackage[numbers,sort&compress]{natbib}
 
 \title{Force-Field Optimization via AWH, Frozen-Bias Replay, and Information Geometry}
 \author{Alexandre Blanco González}
@@ -16,9 +18,12 @@
 
 This document describes the optimization pipeline implemented in the current repository state. The method alternates between adaptive AWH sampling, frozen-bias readiness probes, frozen-bias production collection, and offline reweighting-based optimization of bounded force-field parameters. The key point is that the optimization gradients are \emph{not} obtained by differentiating the online AWH update rule. Instead, the adaptive AWH phase is used to construct a reliable reference ensemble. Once that reference ensemble has passed readiness checks, the bias is frozen and all thermodynamic estimators are evaluated offline from replayed frames. The idea behind using an extended ensemble as reference is to make the most out of the conformational richness that enhanced sampling simulations provide. In the current implementation, optimization targets are mixed through tolerance-normalized losses rather than raw-unit residual sums, and the default thermodynamic state is $20\,^\circ\mathrm{C}$ ($293.15\,\mathrm{K}$) so that the bundled density target is consistent with the simulation condition.
 
-The repository currently supports a general coefficient-weighted thermodynamic cycle. The default example is ethanol hydration, with a solvent leg and a vacuum leg, but the mathematical structure is a sum over arbitrary legs with per-leg lambda schedules, ensembles, and coefficients. The next section develops the formal replay and information-geometric derivations. The implementation section that follows then describes the concrete algorithmic choices used by the code.
+The repository currently supports a general coefficient-weighted thermodynamic cycle. The default example is ethanol hydration, with a solvent leg and a vacuum leg, but the mathematical structure is a sum over arbitrary legs with per-leg lambda schedules, ensembles, and coefficients. Conceptually, the replay estimator layer is closest to BAR/MBAR reweighting \citep{bennett1976bar,shirts2008mbar}, the sampling layer to AWH \citep{lidmar2012awh,lindahl2014awh}, the optimization baseline to reweighting-driven force-field fitting such as ForceBalance \citep{wang2014forcebalance}, and the step metric to natural-gradient and KL-trust-region methods \citep{amari1998natural,schulman2015trpo}. The next section develops the formal replay and information-geometric derivations. The implementation section that follows then describes the concrete algorithmic choices used by the code.
 
 \input{theory}
 \input{implementation}
+
+\bibliographystyle{plainnat}
+\bibliography{references}
 
 \end{document}

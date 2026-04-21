@@ -55,6 +55,16 @@ function build_example_configs()
             weight=1.0,
             unit_label="g/mL",
         ),
+        AWHGrads.StateObservableTarget(
+            name=:solvent_dielectric,
+            leg=:solvent,
+            state=:coupled,
+            observable=AWHGrads.DielectricConstantObservable(),
+            # The reference dielectric constant corresponds to liquid water at 20 C.
+            target_value=80.35,
+            weight=1.0,
+            unit_label="epsilon_r",
+        ),
     ]
 
     # Ensure the solvent leg in the cycle object matches our desired R&D sampling depth.

@@ -205,13 +205,14 @@ end
 
     @test length(sim_cfg.cycle.legs) == 1
     @test only(sim_cfg.cycle.legs).name == :solvent
-    @test bench_cfg.awh_time == sim_cfg.FT(0.1)u"ns"
-    @test sim_cfg.md_time_production == sim_cfg.FT(0.1)u"ns"
+    @test bench_cfg.awh_time == sim_cfg.FT(0.05)u"ns"
+    @test sim_cfg.md_time_production == sim_cfg.FT(0.01)u"ns"
     @test sim_cfg.production_log_interval == fld(prod_steps, bench_cfg.min_frames)
     @test bench_cfg.expected_frames >= bench_cfg.min_frames
     @test sim_cfg.ensemble_eval.lambda_tile == 4
     @test sim_cfg.ensemble_eval.progress
     @test sim_cfg.charge_training.enabled
+    @test getfield.(sim_cfg.targets, :name) == [:hydration_free_energy, :solvent_density, :solvent_dielectric]
     inserted_region_pool = only(filter(pool -> pool.name == :inserted_region, sim_cfg.parameter_pools))
     @test :charge_chi in inserted_region_pool.trainable_families
     @test :charge_eta in inserted_region_pool.trainable_families

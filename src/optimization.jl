@@ -1,17 +1,31 @@
 """
     leg_volumes(leg, FT)
 
-Return the production-frame volumes for a leg when a `pV` correction is part of
-that leg's free-energy definition.
+Return the production-frame volumes for a leg when they are available. Infinite
+boundary legs return an empty vector.
 """
 function leg_volumes(leg::LegArtifacts, ::Type{FT}) where {FT <: AbstractFloat}
-    if !leg.include_pv
-        return FT[]
-    end
     if !isnothing(leg.eval_cache) && !isnothing(leg.eval_cache.frame_cache)
         return FT.(leg.eval_cache.frame_cache.volumes)
     end
+    if !hasproperty(leg.logger_prod, :volume_history)
+        return FT[]
+    end
     return FT.(ustrip.(leg.logger_prod.volume_history))
+end
+
+@inline function leg_active_idx_history(leg::LegArtifacts)
+    if !isempty(leg.active_idx_history)
+        return leg.active_idx_history
+    end
+    return leg.logger_prod.active_idx_history
+end
+
+@inline function leg_base_sampling_count(leg::LegArtifacts, ::Type{AT}) where {AT <: AbstractFloat}
+    if !isnothing(leg.n_base)
+        return AT(leg.n_base)
+    end
+    return AT(leg.awh_prod.initial_sampl_n + leg.awh_prod.state.N_eff)
 end
 
 function evaluate_leg_ensemble(
@@ -56,7 +70,8 @@ function compute_leg_weights_and_ess(
     volumes::AbstractVector{VT};
     frame_indices::Union{Nothing, AbstractVector{Int}}=nothing,
 ) where {ET <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat}
-    idx_history = isnothing(frame_indices) ? leg.logger_prod.active_idx_history : leg.logger_prod.active_idx_history[frame_indices]
+    active_idx_history = leg_active_idx_history(leg)
+    idx_history = isnothing(frame_indices) ? active_idx_history : active_idx_history[frame_indices]
     energies_local = isnothing(frame_indices) ? energies_current : @view energies_current[frame_indices, :]
     u_ref_local = isnothing(frame_indices) ? leg.u_ref : @view leg.u_ref[frame_indices, :]
     volumes_local = leg.include_pv && !isnothing(frame_indices) ? volumes[frame_indices] : volumes
@@ -97,7 +112,8 @@ function compute_leg_endpoint_state(
     compute_gradients::Bool=true,
     frame_indices::Union{Nothing, AbstractVector{Int}}=nothing,
 ) where {ET <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat}
-    idx_history = isnothing(frame_indices) ? leg.logger_prod.active_idx_history : leg.logger_prod.active_idx_history[frame_indices]
+    active_idx_history = leg_active_idx_history(leg)
+    idx_history = isnothing(frame_indices) ? active_idx_history : active_idx_history[frame_indices]
     energies_local = isnothing(frame_indices) ? energies_current : @view energies_current[frame_indices, :]
     u_ref_local = isnothing(frame_indices) ? leg.u_ref : @view leg.u_ref[frame_indices, :]
     gradients_phi_local = isnothing(frame_indices) ? gradients_phi : Dict(
@@ -677,6 +693,351 @@ function compute_leg_state_observable_estimate(
     return observable_gradient, observable_prediction, ess
 end
 
+function observable_gradients_theta_to_phi(
+    observable_gradients_theta::AbstractDict{String, <:AbstractVector{FT}},
+    param_names::Vector{String},
+    chain_rule_multiplier::AbstractVector{FT},
+) where {FT <: AbstractFloat}
+    observable_gradients_phi = Dict{String, Vector{FT}}()
+    for (idx, p_key) in enumerate(param_names)
+        haskey(observable_gradients_theta, p_key) ||
+            throw(ArgumentError("Observable gradient cache is missing parameter `$p_key`."))
+        observable_gradients_phi[p_key] = observable_gradients_theta[p_key] .* chain_rule_multiplier[idx]
+    end
+    return observable_gradients_phi
+end
+
+struct ScalarStateObservableCache{V, G}
+    values::V
+    gradients_phi::G
+end
+
+struct DielectricConstantObservableCache{V, G1, V3, G3}
+    dipole_sq_values::V
+    dipole_sq_gradients_phi::G1
+    dipole_component_values::V3
+    dipole_component_gradients_phi::G3
+end
+
+"""
+    build_state_observable_cache(observable, leg, params, param_names,
+                                 chain_rule_multiplier, state_idx;
+                                 compute_gradients=true)
+
+Build and return the per-frame cache needed to estimate one state observable
+target. Custom observable types can extend this method to cache richer
+statistics than a single scalar frame value while still participating in the
+generic optimization pipeline.
+"""
+function build_state_observable_cache(
+    observable,
+    leg::LegArtifacts,
+    params::Vector{FT},
+    param_names::Vector{String},
+    chain_rule_multiplier,
+    state_idx::Int;
+    compute_gradients::Bool=true,
+) where {FT <: AbstractFloat}
+    obs_values, obs_grads_theta = evaluate_leg_state_observable(
+        leg,
+        params,
+        param_names,
+        observable,
+        state_idx;
+        compute_gradients=compute_gradients,
+    )
+    if compute_gradients && isnothing(chain_rule_multiplier)
+        throw(ArgumentError("State-observable gradient evaluation requires a chain-rule multiplier."))
+    end
+    obs_grads_phi = compute_gradients ?
+        observable_gradients_theta_to_phi(obs_grads_theta, param_names, chain_rule_multiplier) :
+        Dict{String, Vector{FT}}()
+    return ScalarStateObservableCache(obs_values, obs_grads_phi)
+end
+
+function build_state_observable_cache(
+    observable::DielectricConstantObservable,
+    leg::LegArtifacts,
+    params::Vector{FT},
+    param_names::Vector{String},
+    chain_rule_multiplier,
+    state_idx::Int;
+    compute_gradients::Bool=true,
+) where {FT <: AbstractFloat}
+    dielectric_data = evaluate_leg_state_dielectric_observable(
+        leg,
+        params,
+        param_names,
+        state_idx;
+        compute_gradients=compute_gradients,
+    )
+    if compute_gradients && isnothing(chain_rule_multiplier)
+        throw(ArgumentError("State-observable gradient evaluation requires a chain-rule multiplier."))
+    end
+    dipole_sq_gradients_phi = compute_gradients ?
+        observable_gradients_theta_to_phi(
+            dielectric_data.dipole_sq_gradients_theta,
+            param_names,
+            chain_rule_multiplier,
+        ) :
+        Dict{String, Vector{FT}}()
+    dipole_component_gradients_phi = compute_gradients ?
+        ntuple(3) do component_idx
+            observable_gradients_theta_to_phi(
+                dielectric_data.dipole_component_gradients_theta[component_idx],
+                param_names,
+                chain_rule_multiplier,
+            )
+        end :
+        ntuple(_ -> Dict{String, Vector{FT}}(), 3)
+
+    return DielectricConstantObservableCache(
+        dielectric_data.dipole_sq_values,
+        dipole_sq_gradients_phi,
+        dielectric_data.dipole_component_values,
+        dipole_component_gradients_phi,
+    )
+end
+
+@inline state_observable_cache_frame_count(cache::ScalarStateObservableCache) = length(cache.values)
+@inline state_observable_cache_frame_count(cache::DielectricConstantObservableCache) = length(cache.dipole_sq_values)
+
+"""
+    compute_state_observable_estimate_from_cache(observable, leg,
+                                                 trainable_param_names,
+                                                 energy_gradients_phi, cache,
+                                                 energies_current,
+                                                 log_mixture_denom,
+                                                 state_idx, beta_val, volumes;
+                                                 compute_gradients=true,
+                                                 frame_indices=nothing)
+
+Reduce the cached per-frame observable data into a prediction, gradient, and
+ESS under the current state reweighting. Custom observable types can extend
+this method to define nonlinear observables of multiple weighted moments
+without introducing control-flow branching in the optimizer.
+"""
+function compute_state_observable_estimate_from_cache(
+    observable,
+    leg::LegArtifacts,
+    trainable_param_names::Vector{String},
+    energy_gradients_phi,
+    cache::ScalarStateObservableCache,
+    energies_current::AbstractMatrix{ET},
+    log_mixture_denom::AbstractVector{DT},
+    state_idx::Int,
+    beta_val::BT,
+    volumes::AbstractVector{VT};
+    compute_gradients::Bool=true,
+    frame_indices::Union{Nothing, AbstractVector{Int}}=nothing,
+) where {ET <: AbstractFloat, DT <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat}
+    return compute_leg_state_observable_estimate(
+        leg,
+        trainable_param_names,
+        energy_gradients_phi,
+        cache.values,
+        cache.gradients_phi,
+        energies_current,
+        log_mixture_denom,
+        state_idx,
+        beta_val,
+        volumes;
+        compute_gradients=compute_gradients,
+        frame_indices=frame_indices,
+    )
+end
+
+function compute_state_observable_estimate_from_cache(
+    observable::DielectricConstantObservable,
+    leg::LegArtifacts,
+    trainable_param_names::Vector{String},
+    energy_gradients_phi,
+    cache::DielectricConstantObservableCache,
+    energies_current::AbstractMatrix{ET},
+    log_mixture_denom::AbstractVector{DT},
+    state_idx::Int,
+    beta_val::BT,
+    volumes::AbstractVector{VT};
+    compute_gradients::Bool=true,
+    frame_indices::Union{Nothing, AbstractVector{Int}}=nothing,
+) where {ET <: AbstractFloat, DT <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat}
+    return compute_leg_dielectric_constant_estimate(
+        leg,
+        observable,
+        trainable_param_names,
+        energy_gradients_phi,
+        cache.dipole_sq_values,
+        cache.dipole_sq_gradients_phi,
+        cache.dipole_component_values,
+        cache.dipole_component_gradients_phi,
+        energies_current,
+        log_mixture_denom,
+        state_idx,
+        beta_val,
+        volumes;
+        compute_gradients=compute_gradients,
+        frame_indices=frame_indices,
+    )
+end
+
+@inline function dielectric_constant_prefactor(
+    observable::DielectricConstantObservable,
+    beta_val::BT,
+    ::Type{AT},
+) where {BT <: AbstractFloat, AT <: AbstractFloat}
+    return AT(4 * π / 3) * AT(observable.coulomb_const) * AT(beta_val)
+end
+
+@inline function dielectric_dipole_fluctuation(
+    mean_dipole_sq::SQ,
+    mean_dipole_components,
+    ::Type{AT},
+) where {SQ <: AbstractFloat, AT <: AbstractFloat}
+    fluctuation = AT(mean_dipole_sq)
+    @inbounds for component in mean_dipole_components
+        component_AT = AT(component)
+        fluctuation -= component_AT * component_AT
+    end
+    return fluctuation
+end
+
+function compute_leg_dielectric_constant_estimate(
+    leg::LegArtifacts,
+    observable::DielectricConstantObservable,
+    trainable_param_names::Vector{String},
+    energy_gradients_phi,
+    dipole_sq_values::AbstractVector{OV},
+    dipole_sq_gradients_phi,
+    dipole_component_values,
+    dipole_component_gradients_phi,
+    energies_current::AbstractMatrix{ET},
+    log_mixture_denom::AbstractVector{DT},
+    state_idx::Int,
+    beta_val::BT,
+    volumes::AbstractVector{VT};
+    compute_gradients::Bool=true,
+    frame_indices::Union{Nothing, AbstractVector{Int}}=nothing,
+) where {OV <: AbstractFloat, ET <: AbstractFloat, DT <: AbstractFloat, BT <: AbstractFloat, VT <: AbstractFloat}
+    isempty(volumes) &&
+        throw(ArgumentError("DielectricConstantObservable requires finite per-frame volumes."))
+
+    grad_dipole_sq, mean_dipole_sq, ess = compute_leg_state_observable_estimate(
+        leg,
+        trainable_param_names,
+        energy_gradients_phi,
+        dipole_sq_values,
+        dipole_sq_gradients_phi,
+        energies_current,
+        log_mixture_denom,
+        state_idx,
+        beta_val,
+        volumes;
+        compute_gradients=compute_gradients,
+        frame_indices=frame_indices,
+    )
+    zero_volume_gradients = Dict{String, Vector{VT}}()
+    grad_volume, mean_volume, _ = compute_leg_state_observable_estimate(
+        leg,
+        trainable_param_names,
+        energy_gradients_phi,
+        volumes,
+        zero_volume_gradients,
+        energies_current,
+        log_mixture_denom,
+        state_idx,
+        beta_val,
+        volumes;
+        compute_gradients=compute_gradients,
+        frame_indices=frame_indices,
+    )
+    mean_volume > zero(mean_volume) ||
+        throw(ArgumentError("DielectricConstantObservable requires a positive mean volume, got $mean_volume."))
+
+    mean_dipole_components = zeros(promote_energy_analysis_type(mean_dipole_sq, mean_volume, beta_val), 3)
+    dipole_component_gradients = [similar(grad_dipole_sq) for _ in 1:3]
+    for component_idx in 1:3
+        grad_component, mean_component, _ = compute_leg_state_observable_estimate(
+            leg,
+            trainable_param_names,
+            energy_gradients_phi,
+            dipole_component_values[component_idx],
+            dipole_component_gradients_phi[component_idx],
+            energies_current,
+            log_mixture_denom,
+            state_idx,
+            beta_val,
+            volumes;
+            compute_gradients=compute_gradients,
+            frame_indices=frame_indices,
+        )
+        mean_dipole_components[component_idx] = mean_component
+        dipole_component_gradients[component_idx] = grad_component
+    end
+
+    AT = promote_energy_analysis_type(
+        mean_dipole_sq,
+        mean_volume,
+        beta_val,
+        observable.coulomb_const,
+    )
+    fluctuation = dielectric_dipole_fluctuation(mean_dipole_sq, mean_dipole_components, AT)
+    prefactor = dielectric_constant_prefactor(observable, beta_val, AT)
+    prediction = one(AT) + prefactor * fluctuation / AT(mean_volume)
+
+    gradient = zeros(AT, length(trainable_param_names))
+    if compute_gradients
+        fluctuation_gradient = AT.(grad_dipole_sq)
+        @inbounds for component_idx in 1:3
+            fluctuation_gradient .-= AT(2) .* AT(mean_dipole_components[component_idx]) .* AT.(dipole_component_gradients[component_idx])
+        end
+        gradient .= prefactor .* (
+            fluctuation_gradient ./ AT(mean_volume) .-
+            fluctuation .* AT.(grad_volume) ./ (AT(mean_volume) * AT(mean_volume))
+        )
+    end
+
+    return gradient, prediction, ess
+end
+
+function evaluate_resolved_state_observable_target(
+    target::ResolvedStateObservableTarget,
+    leg::LegArtifacts,
+    leg_energies_current,
+    leg_energy_gradients_phi,
+    leg_log_mixture_denom,
+    leg_volumes,
+    params::Vector{FT},
+    param_names::Vector{String},
+    trainable_param_names::Vector{String},
+    chain_rule_multiplier,
+    beta_val::BT;
+    compute_gradients::Bool=true,
+) where {FT <: AbstractFloat, BT <: AbstractFloat}
+    cache = build_state_observable_cache(
+        target.observable,
+        leg,
+        params,
+        param_names,
+        chain_rule_multiplier,
+        target.state_idx;
+        compute_gradients=compute_gradients,
+    )
+    grad_target, prediction, state_ess = compute_state_observable_estimate_from_cache(
+        target.observable,
+        leg,
+        trainable_param_names,
+        leg_energy_gradients_phi,
+        cache,
+        leg_energies_current,
+        leg_log_mixture_denom,
+        target.state_idx,
+        beta_val,
+        leg_volumes;
+        compute_gradients=compute_gradients,
+    )
+    return grad_target, prediction, state_ess, cache
+end
+
 function cycle_prediction_and_gradient_from_leg_cache(
     leg_artifacts::Vector{LegArtifacts},
     leg_endpoint_value_cache,
@@ -723,7 +1084,7 @@ function evaluate_training_targets(
     objective_gradient = compute_gradients ? zeros(AT, length(trainable_param_names)) : zeros(AT, 0)
     observable_target_cache = Dict{Symbol, Any}()
 
-    for target in targets
+    for (n, target) in enumerate(targets)
         if target isa ResolvedCycleFreeEnergyTarget
             grad_target, prediction = cycle_prediction_and_gradient_from_leg_cache(
                 leg_artifacts,
@@ -768,33 +1129,18 @@ function evaluate_training_targets(
             )
         elseif target isa ResolvedStateObservableTarget
             leg = leg_artifacts_by_name[target.leg]
-            obs_values, obs_grads_theta = evaluate_leg_state_observable(
+            grad_target, prediction, state_ess, cache = evaluate_resolved_state_observable_target(
+                target,
                 leg,
+                leg_energies_cache[leg.name],
+                leg_grads_phi[leg.name],
+                leg_log_mixture_denom_cache[leg.name],
+                leg_volumes_cache[leg.name],
                 params,
                 param_names,
-                target.observable,
-                target.state_idx;
-                compute_gradients=compute_gradients,
-            )
-
-            obs_grads_phi = Dict{String, Vector{FT}}()
-            if compute_gradients
-                for (idx, p_key) in enumerate(param_names)
-                    obs_grads_phi[p_key] = obs_grads_theta[p_key] .* chain_rule_multiplier[idx]
-                end
-            end
-
-            grad_target, prediction, state_ess = compute_leg_state_observable_estimate(
-                leg,
                 trainable_param_names,
-                leg_grads_phi[leg.name],
-                obs_values,
-                obs_grads_phi,
-                leg_energies_cache[leg.name],
-                leg_log_mixture_denom_cache[leg.name],
-                target.state_idx,
-                beta_val,
-                leg_volumes_cache[leg.name];
+                chain_rule_multiplier,
+                beta_val;
                 compute_gradients=compute_gradients,
             )
             target_value = target_reference_value(target, beta_val, AT)
@@ -811,13 +1157,7 @@ function evaluate_training_targets(
                 objective_gradient .+= target_loss_eval.derivative .* grad_target
             end
 
-            observable_target_cache[target.name] = (
-                leg_name=target.leg,
-                state_idx=target.state_idx,
-                state_label=target.state_label,
-                values=obs_values,
-                gradients_phi=obs_grads_phi,
-            )
+            observable_target_cache[target.name] = cache
 
             push!(
                 target_evaluations,
@@ -1007,7 +1347,8 @@ function compute_optimization_confidence_summary(
                 continue
             end
 
-            frame_split = split_half_frame_indices(length(cache.values), opt_cfg.optimization_confidence_min_frames)
+            n_frames = state_observable_cache_frame_count(cache)
+            frame_split = split_half_frame_indices(n_frames, opt_cfg.optimization_confidence_min_frames)
             if isnothing(frame_split)
                 push!(skipped_targets, target.name)
                 continue
@@ -1016,12 +1357,12 @@ function compute_optimization_confidence_summary(
             eligible_targets += 1
             leg = leg_artifacts_by_name[target.leg]
             first_half, second_half = frame_split
-            grad_half_1, prediction_half_1, _ = compute_leg_state_observable_estimate(
+            grad_half_1, prediction_half_1, _ = compute_state_observable_estimate_from_cache(
+                target.observable,
                 leg,
                 trainable_param_names,
                 leg_grads_phi[leg.name],
-                cache.values,
-                cache.gradients_phi,
+                cache,
                 leg_energies_cache[leg.name],
                 leg_log_mixture_denom_cache[leg.name],
                 target.state_idx,
@@ -1030,12 +1371,12 @@ function compute_optimization_confidence_summary(
                 compute_gradients=true,
                 frame_indices=first_half,
             )
-            grad_half_2, prediction_half_2, _ = compute_leg_state_observable_estimate(
+            grad_half_2, prediction_half_2, _ = compute_state_observable_estimate_from_cache(
+                target.observable,
                 leg,
                 trainable_param_names,
                 leg_grads_phi[leg.name],
-                cache.values,
-                cache.gradients_phi,
+                cache,
                 leg_energies_cache[leg.name],
                 leg_log_mixture_denom_cache[leg.name],
                 target.state_idx,
@@ -1173,12 +1514,12 @@ function run_optimization_phase!(
     ess_thresholds = Dict{Symbol, AT}()
     N_base = Dict{Symbol, AT}()
     for leg in leg_artifacts
-        M_leg = AT(length(leg.logger_prod.active_idx_history))
+        M_leg = AT(length(leg_active_idx_history(leg)))
         if M_leg <= zero(AT)
             throw(ArgumentError("Leg $(leg.name) has no production frames."))
         end
         ess_thresholds[leg.name] = M_leg * ess_threshold_ratio
-        N_base[leg.name] = AT(leg.awh_prod.initial_sampl_n + leg.awh_prod.state.N_eff)
+        N_base[leg.name] = leg_base_sampling_count(leg, AT)
     end
 
     tiny_alpha_hits = 0
@@ -1210,7 +1551,6 @@ function run_optimization_phase!(
         leg_endpoint_gradient_cache = Dict{Symbol, Vector{AT}}()
 
         ess_threshold_broken = false
-
         for leg in leg_artifacts
             u_eval, grads_eval_theta = evaluate_leg_ensemble(
                 leg,
@@ -1230,7 +1570,7 @@ function run_optimization_phase!(
             _, ess_leg = compute_leg_weights_and_ess(leg, u_eval, beta_val, volumes)
             ess_current[leg.name] = ess_leg
 
-            M_leg = AT(length(leg.logger_prod.active_idx_history))
+            M_leg = AT(length(leg_active_idx_history(leg)))
             N_active[leg.name] = N_base[leg.name] * (ess_leg / M_leg)
 
             if ess_leg < ess_thresholds[leg.name]
@@ -1239,13 +1579,15 @@ function run_optimization_phase!(
             end
 
             w_norm_leg, _ = compute_leg_weights_and_ess(leg, u_eval, beta_val, volumes)
+
             _, fim_leg = compute_empirical_gradients_and_fim(
                 trainable_param_names,
                 grads_eval_phi,
                 w_norm_leg,
-                leg.logger_prod.active_idx_history,
+                leg_active_idx_history(leg),
                 beta_val,
             )
+
             fim_joint .+= fim_leg
 
             leg_energies_cache[leg.name] = u_eval

@@ -40,6 +40,15 @@ targets = AWHGrads.AbstractTrainingTarget[
         weight=1.0,
         unit_label="g/mL",
     ),
+    AWHGrads.StateObservableTarget(
+        name=:solvent_dielectric,
+        leg=:solvent,
+        state=:coupled,
+        observable=AWHGrads.DielectricConstantObservable(),
+        target_value=80.35,
+        weight=1.0,
+        unit_label="epsilon_r",
+    ),
 ]
 
 sim_cfg = AWHGrads.simulation_config_with(

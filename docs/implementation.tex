@@ -1,17 +1,22 @@
 \section{Implemented Pipeline}
 
-This section describes the concrete algorithmic design used by the current code. Unlike the theory section, which derives replay estimators and the local Fisher geometry, the present section focuses on operational choices: readiness checks, probe growth policy, production collection, numerical stabilization, and acceptance logic.
+This section describes the concrete algorithmic design used by the current code. Unlike the theory section, which derives replay estimators and the local Fisher geometry, the present section focuses on operational choices: readiness checks, probe growth policy, production collection, numerical stabilization, and acceptance logic. At the software level, the current sampling and replay machinery is built on Molly, and the reverse-mode parameter derivatives are obtained with Enzyme \citep{greener2024molly,moses2020enzyme}.
 
-The current code organizes the method as a macro-epoch loop. At the beginning of each macro epoch, the pipeline constructs one AWH simulation per thermodynamic leg with the current physical parameters. Restart coordinates and velocities may be reused from the previous macro epoch. The AWH bias is reused only when restart continuity is preserved; a cold restart from the input structure does not reuse a previous bias profile. For each leg, the macro epoch proceeds through four stages:
+The current code organizes the method as a macro-epoch loop. At the beginning of each macro epoch, the pipeline constructs one AWH simulation per thermodynamic leg with the current physical parameters. Restart coordinates and velocities may be reused from the previous macro epoch. The AWH bias is reused only when restart continuity is preserved; a cold restart from the input structure does not reuse a previous bias profile. For each leg, the macro epoch follows the control flow summarized below.
+
+The optimizer never consumes data from an actively adapting AWH bias. The following summary is the only authoritative end-to-end control-flow description in this document; the later subsections expand individual stages rather than introducing a second competing summary.
+
+\subsection{Authoritative Control-Flow Summary}
+\label{sec:authoritative_control_flow}
 
 \begin{enumerate}
-    \item optional rewarm of a reused simulation state,
-    \item readiness-gated AWH sampling,
-    \item frozen-bias production collection,
-    \item offline optimization from the frozen production artifacts.
+    \item \textbf{Stage A.} Advance each adapting AWH leg in blocks until the cheap readiness checks pass for the required stable streak.
+    \item \textbf{Stage B.} Clone the current leg into a frozen-bias probe, select probe frames, rebuild replay templates, and require split convergence together with support-aware replay/AWH parity.
+    \item \textbf{Frozen production.} Once every leg passes Stage B, launch frozen-bias production segments and apply the production frame-selection rules before any estimator is assembled.
+    \item \textbf{Offline replay.} Evaluate the selected frames under the current Hamiltonians to assemble endpoint free energies, state observables, latent-space gradients, candidate-ensemble weights, and ESS diagnostics.
+    \item \textbf{Trust-region base step.} Build the empirical Fisher metric, apply any reference-penalty diagonal regularization, use Jacobi preconditioning and eigentruncation, and scale the base step to the KL target.
+    \item \textbf{Line search and acceptance.} Backtrack on the proposed update until candidate-ensemble ESS, per-pool drift bounds, and the tolerance-normalized objective test all pass; otherwise keep the best accepted state and return to fresh resimulation.
 \end{enumerate}
-%
-The optimizer never consumes data from an actively adapting AWH bias.
 
 \subsection{Stage A: Cheap Readiness Screening}
 
@@ -83,6 +88,171 @@ These production artifacts are the only data used by the optimizer. Before repla
 
 The production duration can also differ by leg type. In the bundled defaults, solvent-like legs use a longer frozen production segment than vacuum legs because low-frequency observables such as density are typically the noisiest optimization targets. The implementation can furthermore append multiple back-to-back production segments under the same frozen bias, which is valid because the reference mixture remains unchanged throughout the append.
 
+\subsection{Configuring User Targets and Observables}
+
+The pipeline is intended to be configured directly from user code rather than
+only through the bundled hydration example. At the outermost level, a run is
+defined by a thermodynamic cycle, a simulation configuration, an optimization
+configuration, and an optional list of explicit training targets:
+
+\begin{enumerate}
+    \item define the legs in \texttt{ThermodynamicCycleConfig},
+    \item choose the trainable parameter pools and numerical settings in \texttt{SimulationConfig} and \texttt{OptimizationConfig},
+    \item populate \texttt{sim\_cfg.targets} with any mix of cycle free-energy targets and state-observable targets,
+    \item call \texttt{run\_pipeline(; sim\_cfg=..., opt\_cfg=...)}.
+\end{enumerate}
+
+\paragraph{Default and explicit target lists.}
+
+If \texttt{sim\_cfg.targets} is left as \texttt{nothing}, the code constructs a
+single default \texttt{CycleFreeEnergyTarget} from
+\texttt{cycle.target\_dG\_kcal\_mol}. Supplying an explicit target list replaces
+that default and allows arbitrary mixtures of:
+
+\begin{itemize}
+    \item \texttt{CycleFreeEnergyTarget}, which matches the full
+    coefficient-weighted thermodynamic-cycle free energy assembled from all
+    configured legs,
+    \item \texttt{StateObservableTarget}, which matches one replayed observable
+    evaluated on one physical state of one named leg.
+\end{itemize}
+
+The following configuration pattern is the intended user-facing entry point:
+
+\begin{verbatim}
+cycle_cfg = AWHGrads.ThermodynamicCycleConfig(
+    legs=[solvent_leg, vacuum_leg],
+    include_standard_state_correction=true,
+    target_dG_kcal_mol=-5.01,
+)
+
+targets = AWHGrads.AbstractTrainingTarget[
+    AWHGrads.CycleFreeEnergyTarget(
+        name=:hydration_free_energy,
+        target_dG_kcal_mol=cycle_cfg.target_dG_kcal_mol,
+        tolerance_kcal_mol=0.05,
+        weight=1.0,
+    ),
+    AWHGrads.StateObservableTarget(
+        name=:solvent_density,
+        leg=:solvent,
+        state=:coupled,
+        observable=AWHGrads.MassDensityObservable(),
+        target_value=0.99815,
+        tolerance=0.02,
+        weight=1.0,
+        unit_label="g/mL",
+    ),
+]
+
+sim_cfg = AWHGrads.simulation_config_with(
+    AWHGrads.default_simulation_config();
+    cycle=cycle_cfg,
+    targets=targets,
+    parameter_pools=parameter_pools,
+)
+
+opt_cfg = AWHGrads.default_optimization_config()
+runtime = AWHGrads.run_pipeline(; sim_cfg=sim_cfg, opt_cfg=opt_cfg)
+\end{verbatim}
+
+\paragraph{What a state observable target means.}
+
+A \texttt{StateObservableTarget} is always tied to:
+
+\begin{itemize}
+    \item one leg name, e.g. \texttt{:solvent},
+    \item one physical state selector, either \texttt{:coupled},
+    \texttt{:decoupled}, or an explicit state index,
+    \item one observable object or callable,
+    \item one scalar reference value, tolerance, weight, and display label.
+\end{itemize}
+
+Operationally, the pipeline replays each retained frozen-bias production frame
+under the requested lambda state, rebuilds a CPU replay \texttt{Molly.System}
+for that state, evaluates the observable on that replayed system, and then
+reweights those per-frame values with the same frozen reference mixture used by
+the free-energy estimators. This is why cycle free energies and arbitrary state
+observables can appear in one joint objective: both are derived from the same
+selected frozen-bias production frames, the same replay Hamiltonians, and the
+same state-conditioned importance weights.
+
+\paragraph{Simple custom observables.}
+
+For the common case, a user does not need to modify the pipeline internals at
+all. Any callable that accepts the replayed \texttt{Molly.System} and returns a
+finite scalar \texttt{Real} can be used directly as the \texttt{observable}
+field of a \texttt{StateObservableTarget}. A minimal example is:
+
+\begin{verbatim}
+struct SoluteChargeObservable
+    atom_idxs::Vector{Int}
+end
+
+function (obs::SoluteChargeObservable)(sys)
+    return sum(Molly.charges(sys)[i] for i in obs.atom_idxs)
+end
+
+targets = AWHGrads.AbstractTrainingTarget[
+    AWHGrads.StateObservableTarget(
+        name=:solute_charge_sum,
+        leg=:solvent,
+        state=:coupled,
+        observable=SoluteChargeObservable(collect(1:9)),
+        target_value=0.0,
+        tolerance=0.01,
+        unit_label="e",
+    ),
+]
+\end{verbatim}
+
+The implementation evaluates such observables frame-by-frame on the replayed
+system, differentiates the per-frame observable value with respect to the
+parameter vector when needed, and then combines those per-frame values with the
+reweighting correction that accounts for the change in state weights. The user
+therefore only provides the observable itself; replay, Enzyme differentiation,
+state reweighting, ESS tracking, normalization by tolerance, and line-search
+acceptance are all handled by the generic optimizer.
+
+\paragraph{Structured observables that need custom replay reduction.}
+
+Some observables are not naturally represented as ``one scalar per frame and
+then take a weighted mean.'' The dielectric constant is the current example:
+its prediction depends on the weighted combination of
+$\langle \mu^2 \rangle$, $\langle \mu \rangle$, and $\langle V \rangle$ rather
+than on a single scalar frame observable. To keep the optimizer general, the
+code exposes observable-specific dispatch hooks instead of hard-coding such
+logic into the pipeline control flow.
+
+Users who need a more structured observable can extend the following methods
+for their own observable type:
+
+\begin{itemize}
+    \item \texttt{validate\_state\_observable\_target(observable, target\_name, leg\_cfg)} for target-level validation,
+    \item \texttt{build\_state\_observable\_cache(observable, leg, params, param\_names, chain\_rule\_multiplier, state\_idx; compute\_gradients=true)} to define what per-frame quantities should be replayed and cached,
+    \item \texttt{compute\_state\_observable\_estimate\_from\_cache(observable, leg, \\trainable\_param\_names, energy\_gradients\_phi, cache, energies\_current, log\_mixture\_denom, state\_idx, beta\_val, volumes; \\compute\_gradients=true, frame\_indices=nothing)} to reduce that cache into a prediction, gradient, and ESS,
+    \item \texttt{state\_observable\_cache\_frame\_count(cache)} so that split-half confidence analysis can partition the cached observable data without knowing its internal representation.
+\end{itemize}
+
+In other words, a user who needs only a simple replayed scalar should supply a
+callable and stop there, while a user who needs a composite ensemble observable
+should extend these observable hooks for a custom observable type. The
+surrounding machinery---target resolution, frozen-bias production, target loss
+assembly, split-half confidence scaling, line search, and trust-region
+moderation---remains unchanged.
+
+\paragraph{Mixed-target optimization.}
+
+Free energies and observables can be combined freely in one run. The optimizer
+places them on a common footing by converting every target residual into
+``tolerance units'' before applying the weighted Huber loss. Consequently, the
+free-energy target may be in \(\mathrm{kcal/mol}\), a density target in
+\(\mathrm{g/mL}\), a dielectric target in dimensionless relative permittivity,
+and any user-defined observable in arbitrary units, provided each target is
+given a meaningful tolerance. This normalization is what makes the pipeline a
+general multi-target replay optimizer rather than a hydration-free-energy
+special case.
+
 \subsection{Offline Optimization and Step Acceptance}
 
 The optimizer evaluates the current candidate parameter vector on the frozen production artifacts and assembles three objects:
@@ -93,7 +263,7 @@ The optimizer evaluates the current candidate parameter vector on the frozen pro
     \item the empirical Fisher matrix in latent space.
 \end{enumerate}
 
-The per-frame force-field gradients $\nabla_\theta U_\ell(\mathbf{x}_n, i; \theta)$ required for both the cycle gradient and the empirical Fisher estimate are obtained by differentiating the Molly potential-energy function with respect to the parameter vector via reverse-mode automatic differentiation, using Enzyme. The chain-rule factor $d\theta_p/d\phi_p$ from the family-specific latent-to-physical transform is then applied to convert these $\theta$-space gradients into latent-space gradients before the Fisher and cycle-gradient assembly.
+The per-frame force-field gradients $\nabla_\theta U_\ell(\mathbf{x}_n, i; \theta)$ required for both the cycle gradient and the empirical Fisher estimate are obtained by differentiating the Molly potential-energy function with respect to the parameter vector via reverse-mode automatic differentiation, using Enzyme \citep{moses2020enzyme}. The chain-rule factor $d\theta_p/d\phi_p$ from the family-specific latent-to-physical transform is then applied to convert these $\theta$-space gradients into latent-space gradients before the Fisher and cycle-gradient assembly.
 
 The base step is formed from the replay gradient and empirical Fisher matrix derived in the theory section, then stabilized through diagonal preconditioning, eigentruncation, KL-target scaling, and a per-pool infinity-norm cap on the latent update. The per-pool cap bounds the maximum absolute latent-coordinate change within each parameter pool independently, using a configurable \texttt{max\_phi\_step} per pool; this allows, for example, a tighter cap on Lennard-Jones $\sigma$ parameters than on partial-charge parameters. These are practical numerical design choices rather than additional formal identities. Before any update is attempted, the optimizer checks whether every target is already within its configured tolerance band; if so, that macro epoch exits immediately without taking another inner-loop step. The line search then proposes
 
@@ -141,7 +311,7 @@ The production artifacts are also split deterministically into first and second 
     \item the disagreement in the objective gradient vector.
 \end{itemize}
 
-These are compressed into a confidence factor
+This is an implementation heuristic: split-half disagreement is used as a noise proxy for insufficiently reliable production data, not as a proof of correctness. It is conservative because it can catch obvious instability, but it can still miss structured long-timescale correlation. More formal block/bootstrap or replica-aware uncertainty estimators are natural future replacements rather than current behavior. These disagreement signals are compressed into a confidence factor
 
 \begin{equation}
     s_{\mathrm{conf}}
@@ -204,7 +374,7 @@ The repository now supports a general thermodynamic cycle with arbitrary legs, c
     \item the solvent leg uses an NPT expanded ensemble with a staged, charge-first and Lennard-Jones-second lambda schedule concentrated in the low-Lennard-Jones tail,
     \item the vacuum leg uses a simpler non-periodic leg with no pressure-volume term,
     \item the optimization can jointly train Lennard-Jones parameters and partial charges through the constrained charge-equilibration parameterization described above,
-    \item the default target-mixing rule uses a $5\%$ tolerance band for both cycle free energies and replayed observables unless a target-specific tolerance is supplied explicitly,
+    \item the default target-mixing rule uses a $0.1\%$ tolerance band for both cycle free energies and replayed observables unless a target-specific tolerance is supplied explicitly,
     \item the default thermodynamic state is $20\,^\circ\mathrm{C}$ ($293.15\,\mathrm{K}$) so that the bundled solvent-density target is evaluated at the matching temperature,
     \item optimization is solute-only unless solvent parameters are explicitly enabled.
 \end{itemize}

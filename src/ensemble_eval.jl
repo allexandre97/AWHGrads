@@ -282,6 +282,15 @@ function build_ensemble_eval_cache(
     cfg = normalized_ensemble_eval_config(eval_cfg)
     frame_cache = cfg.cache_unitless_frames ? build_ensemble_eval_frame_cache(logger) : nothing
     template_cache = cfg.cache_unitless_templates ? build_unitless_lambda_templates(awh_sim_prod, sys_base) : nothing
+    active_idx_history = Int.(logger.active_idx_history)
+    num_lambda = isnothing(template_cache) ? length(awh_sim_prod.state.partition.λ_atoms) : length(template_cache)
+    energy_type = if !isempty(logger.potential_energy_history)
+        typeof(ustrip(first(logger.potential_energy_history)))
+    elseif !isnothing(template_cache) && !isempty(template_cache)
+        Molly.nonbonded_energy_type(first(template_cache))
+    else
+        typeof(first(awh_sim_prod.state.f))
+    end
     return (
         logger=logger,
         neighbors=neighbors,
@@ -291,7 +300,40 @@ function build_ensemble_eval_cache(
         template_cache=template_cache,
         has_infinite_boundary=Molly.has_infinite_boundary(sys_base.boundary),
         infinite_boundary=sys_base.boundary,
+        active_idx_history=active_idx_history,
+        frame_count=length(active_idx_history),
+        num_lambda=num_lambda,
+        energy_type=energy_type,
         config=cfg,
+    )
+end
+
+"""
+    compact_ensemble_eval_cache(eval_cache)
+
+Drop source objects that are redundant once the unitless frame/template caches
+have been materialized. This keeps optimization artifacts from retaining the
+full production logger and frozen AWH simulation graph alongside the replay
+cache.
+"""
+function compact_ensemble_eval_cache(eval_cache)
+    logger = isnothing(eval_cache.frame_cache) ? eval_cache.logger : nothing
+    awh_sim_prod = isnothing(eval_cache.template_cache) ? eval_cache.awh_sim_prod : nothing
+    sys_base = isnothing(eval_cache.template_cache) ? eval_cache.sys_base : nothing
+    return (
+        logger=logger,
+        neighbors=eval_cache.neighbors,
+        awh_sim_prod=awh_sim_prod,
+        sys_base=sys_base,
+        frame_cache=eval_cache.frame_cache,
+        template_cache=eval_cache.template_cache,
+        has_infinite_boundary=eval_cache.has_infinite_boundary,
+        infinite_boundary=eval_cache.infinite_boundary,
+        active_idx_history=eval_cache.active_idx_history,
+        frame_count=eval_cache.frame_count,
+        num_lambda=eval_cache.num_lambda,
+        energy_type=eval_cache.energy_type,
+        config=eval_cache.config,
     )
 end
 
@@ -303,6 +345,7 @@ function ensemble_eval_frame_state(eval_cache, frame_idx::Int)
         end
         vol = eval_cache.frame_cache.volumes[frame_idx]
     else
+        isnothing(eval_cache.logger) && throw(ArgumentError("Ensemble-eval cache has no frame cache and no source logger; cannot reconstruct replay frame state."))
         coords = ustrip.(eval_cache.logger.coords_history[frame_idx])
         if eval_cache.has_infinite_boundary
             return coords, eval_cache.infinite_boundary
@@ -318,6 +361,7 @@ function ensemble_eval_template_tile(eval_cache, tile_indices)
     if !isnothing(eval_cache.template_cache)
         return eval_cache.template_cache[tile_indices]
     end
+    isnothing(eval_cache.awh_sim_prod) && throw(ArgumentError("Ensemble-eval cache has no template cache and no source AWH simulation; cannot rebuild λ-state templates."))
     return build_unitless_lambda_templates(eval_cache.awh_sim_prod, eval_cache.sys_base, tile_indices)
 end
 
@@ -451,20 +495,12 @@ function _evaluate_ensemble_impl(eval_cache,
                                  params::Vector{FT}, param_names::Vector{String},
                                  atom_idxs, pairwise_idxs, specific_idxs, general_idxs;
                                  compute_gradients::Bool)
-    logger = eval_cache.logger
     neighbors = eval_cache.neighbors
-    awh_sim_prod = eval_cache.awh_sim_prod
-    num_frames = length(logger.active_idx_history)
-    num_lambda = length(awh_sim_prod.state.partition.λ_atoms)
+    num_frames = eval_cache.frame_count
+    num_lambda = eval_cache.num_lambda
     num_params = length(params)  
 
-    energy_type = if !isempty(logger.potential_energy_history)
-        typeof(ustrip(first(logger.potential_energy_history)))
-    elseif !isnothing(eval_cache.template_cache) && !isempty(eval_cache.template_cache)
-        Molly.nonbonded_energy_type(first(eval_cache.template_cache))
-    else
-        FT
-    end
+    energy_type = eval_cache.energy_type
     energies = zeros(energy_type, num_frames, num_lambda)
     gradients_raw = compute_gradients ? [zeros(FT, num_frames, num_lambda) for _ in 1:num_params] : nothing
 

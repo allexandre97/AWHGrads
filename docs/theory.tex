@@ -11,6 +11,36 @@ The optimization gradients in the current code are not obtained by differentiati
 
 Throughout this section, $i \in \Lambda_\ell$ denotes a generic lambda-state index, $m \in \Lambda_\ell$ denotes a target lambda state to which the stored frames are reweighted, and $n$ indexes stored frames from the frozen reference trajectory. Target-state quantities are indexed by $m$ in subscripts, while $m$ appears as a function argument only when indicating evaluation at that same lambda state.
 
+\begin{table}[t]
+    \centering
+    \small
+    \caption{Core notation used in the replay and optimizer derivations.}
+    \label{tab:notation}
+    \begin{tabular}{|>{\raggedright\arraybackslash}p{2.1cm}|>{\raggedright\arraybackslash}p{2.6cm}|>{\raggedright\arraybackslash}p{8.3cm}|}
+        \hline
+        Symbol & Role & Meaning in the current implementation \\
+        \hline
+        $\ell$ & leg index & One thermodynamic leg of the configured cycle. \\
+        \hline
+        $m$ & target state & Lambda state at which a replayed free energy or observable is evaluated. \\
+        \hline
+        $i_n$ & visited state & Lambda state visited by stored frame $n$ in the frozen reference trajectory. \\
+        \hline
+        $n$ & frame index & Stored frame index after the probe or production frame-selection rules. \\
+        \hline
+        $\theta$ & physical parameters & Trainable force-field parameters in their physical units. \\
+        \hline
+        $\phi$ & latent parameters & Optimizer coordinates mapped into physical parameters through $\theta = T(\phi)$. \\
+        \hline
+        $g_{\mathrm{ref},\ell}(i)$ & frozen Gibbs weights & Frozen AWH free-energy estimate plus the fixed target-state log weight for state $i$. \\
+        \hline
+        $\overline{w}^{\mathrm{rep}}_{\ell,n,m}$ & replay weights & Target-state weights used for endpoint free energies, endpoint gradients, and state-conditioned observables. \\
+        \hline
+        $\overline{w}^{\mathrm{ens}}_{\ell,n}$ & candidate-ensemble weights & Candidate-ensemble weights used for optimizer-side ESS and empirical Fisher estimates. \\
+        \hline
+    \end{tabular}
+\end{table}
+
 Consider one thermodynamic leg $\ell$ with lambda states $i \in \Lambda_\ell$, inverse temperature $\beta_\ell$, and, for NPT legs, pressure $P_\ell$. The reduced potential of state $i$ at parameters $\theta$ is defined as:
 
 \begin{equation}
@@ -76,6 +106,8 @@ Here
     \sum_{i\in\Lambda_\ell}{\exp\left[g_{\mathrm{ref},\ell}(i) - u_{\mathrm{ref},\ell}(\mathbf{x}, V, i)\right]}
 \]
 is the pointwise mixture normalizer obtained by summing over lambda states at fixed $(\mathbf{x}, V)$. It is not a global partition function; rather, it is the local normalizing factor that appears when the frozen extended ensemble is marginalized over the lambda coordinate.
+
+This pointwise normalizer is the same extended-ensemble denominator that appears in MBAR-style estimators \citep{bennett1976bar,shirts2008mbar}: at fixed $(\mathbf{x}, V)$ one sums over all states using reduced potentials and log state weights, then uses that denominator to normalize the contribution of any chosen target state. What is standard here is the denominator structure itself. What is specific to the present method is that the state weights are frozen AWH Gibbs weights, the data come from frozen-bias production, and the resulting replay estimators feed a later natural-gradient-like optimizer rather than a standalone free-energy postprocessor.
 
 \section{Replay Reweighting to an Arbitrary Lambda State}
 
@@ -365,7 +397,7 @@ and the residual against experiment is
     \label{eq:residual}
 \end{equation}
 
-The implemented objective does not act on this raw residual directly. Instead, the cycle target is assigned a tolerance $s_{\mathrm{cyc}} > 0$ expressed in the same native units as the target before conversion to reduced units. By default the code uses a relative tolerance of $5\%$ of the target magnitude together with a small absolute floor. After converting the target and its tolerance into reduced units, the optimizer works with the normalized residual
+The implemented objective does not act on this raw residual directly. Instead, the cycle target is assigned a tolerance $s_{\mathrm{cyc}} > 0$ expressed in the same native units as the target before conversion to reduced units. By default the code uses a relative tolerance of $0.1\%$ of the target magnitude together with a small absolute floor. After converting the target and its tolerance into reduced units, the optimizer works with the normalized residual
 
 \begin{equation}
     z_{\mathrm{cyc}}(\theta)
@@ -707,7 +739,7 @@ Suppose now that $r \in \mathcal{R}$ indexes one observable target. Each such ta
     \label{eq:obsresidual}
 \end{equation}
 
-Each target is also assigned a tolerance $s_r > 0$ in its own native units. In the implemented code, $s_r$ defaults to $5\%$ of the target magnitude, again with a small absolute floor for near-zero targets, unless an explicit tolerance is supplied in the configuration. The optimizer therefore uses the normalized residual
+Each target is also assigned a tolerance $s_r > 0$ in its own native units. In the implemented code, $s_r$ defaults to $0.1\%$ of the target magnitude, again with a small absolute floor for near-zero targets, unless an explicit tolerance is supplied in the configuration. The optimizer therefore uses the normalized residual
 
 \begin{equation}
     z_r(\theta)
@@ -759,7 +791,7 @@ with total gradient
 
 Equation \eqref{eq:lossgradtheta} is therefore the currently implemented special case in which $\mathcal{R}$ contains only the thermodynamic-cycle contribution. Extending the method to new observables does not require changing the frozen-bias replay machinery itself; it only requires adding further target contributions whose predictions and gradients are computed from the same replay weights.
 
-This normalization also defines the default success criterion. A target is considered within specification whenever $|\mathcal{E}_r(\theta)| \le s_r$, that is, whenever its raw prediction error lies within the configured tolerance band. The optimizer therefore treats the $5\%$ band not only as a scaling convention for mixed-unit losses, but also as the default notion of per-target success.
+This normalization also defines the default success criterion. A target is considered within specification whenever $|\mathcal{E}_r(\theta)| \le s_r$, that is, whenever its raw prediction error lies within the configured tolerance band. The optimizer therefore treats the $0.1\%$ band not only as a scaling convention for mixed-unit losses, but also as the default notion of per-target success.
 
 \section{Bounded Coordinates}
 
@@ -1227,16 +1259,7 @@ Because the first nonzero KL term is $\frac{1}{2} \delta \phi^\top \mathcal{I}(\
 \end{equation}
 
 The empirical Fisher matrix is therefore the operator that turns the Euclidean loss gradient into a natural-gradient-like base step, after which the optimizer applies diagonal normalization, eigentruncation, and KL-target scaling before the line search. The full logic is:
-
-\begin{enumerate}
-    \item replay the frozen reference frames to obtain the target predictions and their gradients,
-    \item assemble the latent-space loss gradient from those target contributions,
-    \item estimate the empirical Fisher matrix from reweighted score vectors at the visited lambda states,
-    \item use that Fisher matrix as the local metric tensor of the statistical manifold,
-    \item bound the proposed update through the quadratic KL model in Equation \eqref{eq:kltrust}.
-\end{enumerate}
-%
-This is why a KL target, rather than a raw Euclidean step length, is the natural quantity to bound. A step that is small in Euclidean coordinates can still be large in distribution space if it distorts the ensemble strongly, while a step that is large in a weakly constrained coordinate may still be statistically safe. The Fisher metric captures that distinction directly.
+The end-to-end control flow is summarized once, in implementation Section~\ref{sec:authoritative_control_flow}; the role of the present theory section is only to justify why the Fisher/KL pair is the right local geometry for that control flow. This is why a KL target, rather than a raw Euclidean step length, is the natural quantity to bound. A step that is small in Euclidean coordinates can still be large in distribution space if it distorts the ensemble strongly, while a step that is large in a weakly constrained coordinate may still be statistically safe. The Fisher metric captures that distinction directly.
 
 The derivations in this section establish the replay estimators and the local KL geometry used by the optimizer. They do not, by themselves, fix pragmatic choices such as Stage B readiness gates, diagonal preconditioning, eigentruncation thresholds, confidence moderation, or line-search acceptance logic. Those are algorithmic design choices of the current implementation. The next section summarizes the current postprocessing and step-control pipeline used to turn the empirical Fisher estimate into a robust update.
 
@@ -1300,25 +1323,23 @@ The optimizer next imposes a trust-region bound in distribution space. Because t
 
 The notation $\alpha_{\mathrm{KL}}$ distinguishes this static rescaling from the separate halving factor $\alpha \in \{1, \tfrac{1}{2}, \tfrac{1}{4}, \ldots\}$ used by the backtracking line search described in the implementation section. Both are applied in sequence: $\Delta\phi_{\mathrm{base}}$ is first rescaled by $\alpha_{\mathrm{KL}}$ to produce a KL-bounded base step, and the line search then multiplies by $\alpha$ until residual and support conditions are satisfied.
 
-The base KL target $\delta_{\mathrm{KL}}$ also determines the minimum acceptable effective sample size checked on each line-search step. A parameter change with predicted KL divergence equal to $\delta_{\mathrm{KL}}$ reduces the Kish ESS of the reference ensemble by a factor of approximately $\exp(-2\delta_{\mathrm{KL}})$. The per-leg ESS threshold is therefore set to
+The base KL target $\delta_{\mathrm{KL}}$ also determines the minimum acceptable effective sample size checked on each line-search step. A parameter change with predicted KL divergence equal to $\delta_{\mathrm{KL}}$ reduces the Kish ESS of the reference ensemble by a factor of approximately $\exp(-2\delta_{\mathrm{KL}})$. A short local justification is useful here. Let $r(\phi)$ denote the candidate-to-reference importance ratio, normalized so that $\mathbb{E}_{\mathrm{ref}}[r]=1$. Under the same local Gaussian-cumulant approximation that underlies the quadratic KL model, $\log r$ has mean approximately $-\delta_{\mathrm{KL}}$ and variance approximately $2\delta_{\mathrm{KL}}$. This implies
+
+\begin{equation}
+    \mathrm{CV}^2(r)
+    \approx
+    \exp\!\left(2\delta_{\mathrm{KL}}\right) - 1,
+\end{equation}
+%
+so the Kish identity $\mathrm{ESS} \approx M_\ell /(1+\mathrm{CV}^2(r))$ gives the local rule of thumb $\mathrm{ESS} \approx M_\ell \exp(-2\delta_{\mathrm{KL}})$. The implementation uses that relation as an approximate support-calibration heuristic rather than as an exact theorem. The per-leg ESS threshold is therefore set to
 
 \begin{equation}
     \mathrm{ESS}_{\min,\ell} = s_{\mathrm{ESS}} \cdot M_\ell \cdot \exp\!\left(-2\delta_{\mathrm{KL}}\right),
     \label{eq:essthreshold}
 \end{equation}
 %
-where $s_{\mathrm{ESS}} \in (0,1]$ is a configurable safety margin. In the current implementation, this ESS threshold is computed once from the base KL target and is not rescaled by the later confidence factor. The ESS is evaluated at the \emph{proposed} parameters on each halving step, so the line search rejects any proposal that would leave the reference ensemble with insufficient support for the candidate ensemble, independently of whether the residual has improved.
+where $s_{\mathrm{ESS}} \in (0,1]$ is a configurable safety margin absorbing higher-order departures from the local KL picture, finite-sample noise, and temporal correlation between stored frames. In the current implementation, this ESS threshold is computed once from the base KL target and is not rescaled by the later confidence factor. The ESS is evaluated at the \emph{proposed} parameters on each halving step, so the line search rejects any proposal that would leave the reference ensemble with insufficient support for the candidate ensemble, independently of whether the residual has improved.
 
-The target $\delta_{\mathrm{KL}}$ is itself moderated by a confidence factor $s_{\mathrm{conf}} \in [s_{\min}, 1]$. In the implementation, this factor is obtained by comparing optimization-relevant quantities estimated from the first and second halves of the production data, such as target predictions and their gradients. Large split-half disagreement is interpreted as evidence that the current replay estimates are noisy or insufficiently converged, in which case $s_{\mathrm{conf}}$ is reduced. This shrinks the trust region and makes the update more conservative. This confidence moderation is therefore an additional robustness heuristic layered on top of the KL trust region, not a separate geometric identity.
+The target $\delta_{\mathrm{KL}}$ is itself moderated by a confidence factor $s_{\mathrm{conf}} \in [s_{\min}, 1]$. In the implementation, this factor is obtained by comparing optimization-relevant quantities estimated from the first and second halves of the production data, such as target predictions and their gradients. Large split-half disagreement is interpreted as a noise proxy rather than as a proof that the current replay estimates are correct or incorrect, in which case $s_{\mathrm{conf}}$ is reduced. This shrinks the trust region and makes the update more conservative. This confidence moderation is therefore an additional robustness heuristic layered on top of the KL trust region, not a separate geometric identity. More formal uncertainty estimates, such as block/bootstrap or replica-aware diagnostics, are natural future replacements for this heuristic but are not yet part of the current code.
 
-The empirical Fisher matrix is therefore the operator that turns the Euclidean loss gradient into a natural-gradient-like base step, after which the optimizer applies the stabilization steps described above. The full logic is:
-
-\begin{enumerate}
-    \item replay the frozen reference frames to obtain the target predictions and their gradients,
-    \item assemble the latent-space loss gradient from those target contributions,
-    \item estimate the empirical Fisher matrix from reweighted score vectors at the visited lambda states,
-    \item use that Fisher matrix as the local metric tensor of the statistical manifold,
-    \item stabilize and bound the proposed update through diagonal regularization, scale-invariant truncation, and the quadratic KL model in Equation \eqref{eq:kltrust}.
-\end{enumerate}
-%
-This is why a KL target, rather than a raw Euclidean step length, is the natural quantity to bound. A step that is small in Euclidean coordinates can still be large in distribution space if it distorts the ensemble strongly, while a step that is large in a weakly constrained coordinate may still be statistically safe. The Fisher metric captures that distinction directly. In that sense, the replay machinery determines which direction lowers the objective, whereas the empirical Fisher determines how far the optimizer can move in that direction before the induced ensemble changes too much.
+The empirical Fisher matrix is therefore the operator that turns the Euclidean loss gradient into a natural-gradient-like base step, after which the optimizer applies the stabilization steps described above. The implementation details are summarized in Section~\ref{sec:authoritative_control_flow}; this theory section only fixes the geometric interpretation of those steps, not the practical readiness or line-search heuristics layered on top of them. This is why a KL target, rather than a raw Euclidean step length, is the natural quantity to bound. A step that is small in Euclidean coordinates can still be large in distribution space if it distorts the ensemble strongly, while a step that is large in a weakly constrained coordinate may still be statistically safe. The Fisher metric captures that distinction directly. In that sense, the replay machinery determines which direction lowers the objective, whereas the empirical Fisher determines how far the optimizer can move in that direction before the induced ensemble changes too much.
